@@ -7,12 +7,27 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-install-project --no-dev --no-editable --compile-bytecode
 
+# The project itself is installed separately, because installing it runs
+# `setuptools.build_meta` and `uv sync` has no way to constrain that build. The
+# distributions published from CI pin the backend against this same hashed file
+# (#654); without this the image would resolve setuptools fresh from PyPI in the
+# one job that holds the Docker Hub credentials. `--no-deps` keeps the runtime
+# dependencies exactly as the frozen lock installed them above, so this adds the
+# project and nothing else.
 COPY . .
-RUN uv sync --frozen --no-dev --no-editable --compile-bytecode
+RUN uv pip install --python /app/.venv/bin/python --no-deps --compile-bytecode \
+    --build-constraints build-constraints.txt .
 
 
 # -- Stage 2: Production runtime --
 FROM python:3.13.13-slim-bookworm@sha256:355bfa66770995d7e9a0da4b3473b44d0cb451f6b56f5615ad9c39e3c4eca03f
+
+# The official MCP Registry proves ownership of an image by pulling its config
+# and comparing Config.Labels["io.modelcontextprotocol.server.name"] to the name
+# in server.json. A LABEL instruction is what writes that; a manifest annotation
+# is a different surface it never reads. It has to be on the runtime stage,
+# because the builder's labels never ship.
+LABEL io.modelcontextprotocol.server.name="io.github.stickerdaniel/linkedin-mcp-server"
 
 RUN useradd -m -s /bin/bash pwuser
 

@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 
@@ -7,6 +9,8 @@ def reset_singletons():
     from linkedin_mcp_server.bootstrap import reset_bootstrap_for_testing
     from linkedin_mcp_server.config import reset_config
     from linkedin_mcp_server.daemon_liveness import reset_liveness_for_testing
+    from linkedin_mcp_server.debug_trace import reset_trace_state_for_testing
+    from linkedin_mcp_server.logging_config import teardown_trace_logging
     from linkedin_mcp_server.drivers.browser import reset_browser_for_testing
     from linkedin_mcp_server.profile_lease import reset_leases_for_testing
     from linkedin_mcp_server.server_role import reset_process_role_for_testing
@@ -25,6 +29,15 @@ def reset_singletons():
     # from process state. Left standing, one OWNER would refuse logins in every
     # test after it, in a suite where most never mention a role.
     reset_process_role_for_testing()
+    # The trace directory is derived from the profile root and cached, so a
+    # test pointing USER_DATA_DIR at its tmp_path otherwise leaves every later
+    # test on this worker writing into a directory pytest has removed. The log
+    # handler holds the same path independently of that cache and has to be
+    # unbound with it, or records keep landing in the previous test's
+    # directory while a fresh one is resolved. `keep_traces` because removing
+    # a directory is a test's own business, not this fixture's.
+    teardown_trace_logging(keep_traces=True)
+    reset_trace_state_for_testing()
     yield
     reset_bootstrap_for_testing()
     reset_browser_for_testing()
@@ -34,6 +47,8 @@ def reset_singletons():
     reset_config()
     reset_process_role_for_testing()
     reset_liveness_for_testing()
+    teardown_trace_logging(keep_traces=True)
+    reset_trace_state_for_testing()
 
 
 @pytest.fixture(autouse=True)
@@ -176,3 +191,46 @@ def mock_context():
     ctx = MagicMock()
     ctx.report_progress = AsyncMock()
     return ctx
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Fail a test that leaves ``sys.stdout`` or ``sys.stderr`` unusable.
+
+    A test that closes one of them breaks every test that runs after it in the
+    same process, and the traceback lands on the innocent one. The failure
+    reads as unrelated: ``uvicorn`` asks ``sys.stdout.isatty()`` while building
+    its log config, so a closed stream surfaces as ``Unable to configure
+    formatter 'default'`` in a daemon test.
+
+    Under pytest's own capturing every test gets a fresh ``sys.stdout``, which
+    repairs the damage before anything can trip over it. CI runs with ``-s``,
+    where nothing repairs it, so this class of defect passes locally and fails
+    there. The usual cause is ``capsys`` in the signature of a test that also
+    monkeypatches ``sys.stdout``: ``capsys`` installs the object that
+    ``monkeypatch`` then records as the one to restore, tears down first, and
+    closes it, so the undo reinstalls a closed stream.
+
+    Checked on the teardown report rather than in a fixture, because a fixture
+    cannot see what the teardown of another fixture did after it, and reported
+    against the test that caused it rather than raised from a hook, which would
+    abort the whole session as an internal error.
+    """
+    report = yield
+    if call.when != "teardown" or report.get_result().failed:
+        return
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        try:
+            stream.write("")
+            stream.flush()
+        except Exception as exc:  # noqa: BLE001 - any failure is the same defect
+            result = report.get_result()
+            result.outcome = "failed"
+            result.longrepr = (
+                f"{item.nodeid} left sys.{name} unusable "
+                f"({type(exc).__name__}: {exc}). Every later test in this "
+                f"process would print into it. A `capsys` argument on a test "
+                f"that also monkeypatches sys.{name} is the usual cause."
+            )
+            return
