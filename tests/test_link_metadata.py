@@ -2,6 +2,7 @@
 
 from urllib.parse import quote
 
+from linkedin_mcp_server.scraping.fields import PERSON_SECTIONS
 from linkedin_mcp_server.scraping.link_metadata import (
     RawReference,
     build_references,
@@ -427,6 +428,23 @@ class TestBuildReferences:
         assert references[0]["url"] == "/company/test-0/"
         assert references[-1]["url"] == "/company/test-11/"
 
+    def test_search_results_cap_can_be_disabled(self):
+        raw: list[RawReference] = [
+            {
+                "href": f"https://www.linkedin.com/jobs/view/{idx}/",
+                "text": f"Job {idx}",
+            }
+            for idx in range(20)
+        ]
+
+        capped = build_references(raw, "search_results")
+        uncapped = build_references(raw, "search_results", apply_cap=False)
+
+        assert len(capped) == 15
+        assert capped[-1]["url"] == "/jobs/view/14/"
+        assert len(uncapped) == 20
+        assert uncapped[-1]["url"] == "/jobs/view/19/"
+
     def test_caps_jobs_section_more_tightly(self):
         raw: list[RawReference] = [
             {
@@ -528,6 +546,70 @@ class TestBuildReferences:
                 "context": "job posting",
             }
         ]
+
+    def test_uses_person_detail_section_contexts(self):
+        """certifications, skills and projects joined PERSON_SECTIONS after
+        this table was written, so their references carried no context while
+        every sibling detail section named itself."""
+        for section in ("certifications", "skills", "projects"):
+            references = build_references(
+                [
+                    {
+                        "href": "https://www.linkedin.com/company/aws/",
+                        "text": "Amazon Web Services",
+                    }
+                ],
+                section,
+            )
+
+            assert references == [
+                {
+                    "kind": "company",
+                    "url": "/company/aws/",
+                    "text": "Amazon Web Services",
+                    "context": section,
+                }
+            ]
+
+    def test_uses_employees_context_for_company_people_pages(self):
+        references = build_references(
+            [
+                {
+                    "href": "https://www.linkedin.com/in/stickerdaniel/",
+                    "text": "Daniel Sticker",
+                }
+            ],
+            "employees",
+        )
+
+        assert references == [
+            {
+                "kind": "person",
+                "url": "/in/stickerdaniel/",
+                "text": "Daniel Sticker",
+                "context": "employees",
+            }
+        ]
+
+    def test_every_person_section_gives_its_references_a_context(self):
+        """Nothing tied the context table to the section table, which is how
+        three sections reached main without an entry. A context-less reference
+        also scores below every duplicate that has one, so it loses cross-page
+        dedupe ties it should win."""
+        raw: list[RawReference] = [
+            {
+                "href": "https://www.linkedin.com/company/aws/",
+                "text": "Amazon Web Services",
+            }
+        ]
+
+        missing = [
+            section
+            for section in PERSON_SECTIONS
+            if "context" not in build_references(raw, section)[0]
+        ]
+
+        assert missing == []
 
     def test_does_not_treat_lookalike_domains_as_linkedin(self):
         references = build_references(

@@ -29,7 +29,14 @@ async def job_ids(page, *, scoped: bool = False) -> list[str]:
     return result["ids"]
 
 
-pytestmark = pytest.mark.browser_dom
+#: CI uses ``--dist loadgroup``. Keep every test that launches Chromium on one
+#: worker so browser startups cannot compete with the DOM cases' wall-clock
+#: timers.
+#: Without that distribution mode the group mark is inert.
+pytestmark = [
+    pytest.mark.browser_dom,
+    pytest.mark.xdist_group("browser_runtime"),
+]
 
 
 def sidebar(
@@ -196,12 +203,23 @@ async def dom_page():
 
 class TestSidebarScroll:
     async def test_loads_full_page_on_a_slow_connection(self, dom_page):
-        """A batch slower than the old fixed 0.5s sleep must not end the loop."""
-        await dom_page.set_content(sidebar(total=25, batch=5, delays=[800]))
+        """A batch slower than the old fixed 0.5s sleep must not end the loop.
 
-        await scroll_job_sidebar(dom_page, settle_timeout=0.6)
+        Every batch is slower than ``settle_timeout``, so the first wait of
+        each round has to miss and the confirmation round at the full timeout
+        is what buys the batch. The margin that leaves is what the numbers are
+        chosen for: the budget is wall-clock while the batch is a page timer,
+        so a runner that starves the page's event loop slips the timer without
+        slowing the budget. At 800ms against ``settle_timeout=0.6``, each
+        of four growth batches had 400ms of configured slack, which failed
+        once in CI. At 1200ms against 1.0, two growth batches still require
+        the confirmation round while doubling that slack.
+        """
+        await dom_page.set_content(sidebar(total=15, batch=5, delays=[1200]))
 
-        assert await cards(dom_page) == 25
+        await scroll_job_sidebar(dom_page, settle_timeout=1.0)
+
+        assert await cards(dom_page) == 15
 
     async def test_loads_full_page_on_a_fast_connection(self, dom_page):
         """Without scrolling the rail stays at its initial five cards."""
@@ -694,3 +712,131 @@ class TestSidebarScroll:
         # 1.5s, having seen nothing and scrolled nothing.
         assert elapsed >= 0.9
         assert await rail_cards(dom_page) == 1
+
+
+class TestRedesignedCards:
+    """The cards LinkedIn's `/jobs/search-results` renders.
+
+    They carry no permalink at all: the job id exists only in a
+    ``componentkey`` attribute. A selector and an id rule that know just the
+    anchor find nothing on such a page, which is what returned an empty
+    ``job_ids`` beside a text listing real jobs.
+    """
+
+    async def test_reads_the_redesigned_card(self, dom_page):
+        await dom_page.set_content(
+            "<main>"
+            "<div componentkey='job-card-component-ref-111'>One</div>"
+            "<div componentkey='job-card-component-ref-222'>Two</div>"
+            "</main>"
+        )
+
+        assert await job_ids(dom_page) == ["111", "222"]
+
+    async def test_one_job_counted_once_across_both_card_shapes(self, dom_page):
+        """A page mid-migration renders both, and they are the same job."""
+        await dom_page.set_content(
+            "<main>"
+            "<a href='https://www.linkedin.com/jobs/view/111/'>One</a>"
+            "<div componentkey='job-card-component-ref-111'>One again</div>"
+            "<div componentkey='job-card-component-ref-222'>Two</div>"
+            "</main>"
+        )
+
+        assert await job_ids(dom_page) == ["111", "222"]
+
+    async def test_scrolls_a_lazily_growing_redesigned_rail(self, dom_page):
+        """The broadened selector belongs to scrolling as well as reading.
+
+        A direct `_JOB_IDS_JS` test stays green if the sidebar wait or scroll
+        quietly returns to legacy anchors. The redesigned page then reads its
+        initial cards correctly but never loads the batch behind them.
+        """
+        await dom_page.set_content(
+            """
+            <main>
+              <div id="rail" style="overflow-y:scroll;height:80px">
+                <div componentkey="job-card-component-ref-111"
+                     style="height:40px">One</div>
+                <div componentkey="job-card-component-ref-222"
+                     style="height:40px">Two</div>
+                <div componentkey="job-card-component-ref-333"
+                     style="height:40px">Three</div>
+              </div>
+            </main>
+            <script>
+              const rail = document.getElementById('rail');
+              let loaded = false;
+              rail.addEventListener('scroll', () => {
+                if (loaded) return;
+                loaded = true;
+                setTimeout(() => {
+                  for (const id of ['444', '555']) {
+                    const card = document.createElement('div');
+                    card.setAttribute(
+                      'componentkey', `job-card-component-ref-${id}`
+                    );
+                    card.style.height = '40px';
+                    card.textContent = id;
+                    rail.appendChild(card);
+                  }
+                }, 60);
+              });
+            </script>
+            """
+        )
+
+        await scroll_job_sidebar(
+            dom_page,
+            settle_timeout=0.25,
+            poll_interval=0.02,
+            min_budget=0.1,
+            deadline=2.0,
+        )
+
+        assert await job_ids(dom_page, scoped=True) == [
+            "111",
+            "222",
+            "333",
+            "444",
+            "555",
+        ]
+
+    async def test_an_unrelated_componentkey_is_not_a_job(self, dom_page):
+        """The prefix is anchored, so a key merely containing it is ignored."""
+        await dom_page.set_content(
+            "<main>"
+            "<div componentkey='job-card-component-ref-111'>One</div>"
+            "<div componentkey='sidebar-job-card-component-ref-999'>Not one</div>"
+            "<div componentkey='job-card-component-ref-noise'>Not one either</div>"
+            "</main>"
+        )
+
+        assert await job_ids(dom_page) == ["111"]
+
+    async def test_the_rail_is_found_by_redesigned_cards_alone(self, dom_page):
+        """The rail is picked by counting ids, so both sides need the rule.
+
+        Teaching only the extraction loop about `componentkey` leaves the
+        pick counting zero ids everywhere, and a scoped read then falls back
+        to the whole document. This asserts the scoped read, which is the
+        one that goes through the pick.
+        """
+        await dom_page.set_content(
+            "<body style='margin:0'>"
+            "<div id='rail' style='overflow-y:scroll;height:80px'>"
+            "<div componentkey='job-card-component-ref-111'"
+            " style='height:40px'>One</div>"
+            "<div componentkey='job-card-component-ref-222'"
+            " style='height:40px'>Two</div>"
+            "<div componentkey='job-card-component-ref-333'"
+            " style='height:40px'>Three</div>"
+            "</div>"
+            "<div id='pane' style='overflow-y:scroll;height:40px'>"
+            "<div componentkey='job-card-component-ref-999'"
+            " style='height:80px'>Detail</div>"
+            "</div>"
+            "</body>"
+        )
+
+        assert await job_ids(dom_page, scoped=True) == ["111", "222", "333"]

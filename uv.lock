@@ -1,6 +1,6 @@
 version = 1
 revision = 3
-requires-python = ">=3.12, <3.15"
+requires-python = ">=3.12.4, <3.15"
 
 [[package]]
 name = "aiofile"
@@ -1040,7 +1040,7 @@ wheels = [
 
 [[package]]
 name = "mcp-server-linkedin"
-version = "4.23.1"
+version = "4.23.3"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -1049,6 +1049,7 @@ dependencies = [
     { name = "packaging" },
     { name = "patchright" },
     { name = "python-dotenv" },
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "rich" },
 ]
 
@@ -1067,11 +1068,12 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "cryptography", specifier = ">=48.0.1" },
-    { name = "fastmcp", specifier = ">=3.4.4" },
+    { name = "fastmcp", specifier = ">=3.4.4,<4" },
     { name = "inquirer", specifier = ">=3.4.0" },
     { name = "packaging", specifier = ">=26.2" },
     { name = "patchright", specifier = ">=1.55.0" },
     { name = "python-dotenv", specifier = ">=1.1.1" },
+    { name = "pywin32", marker = "sys_platform == 'win32'", specifier = ">=312" },
     { name = "rich", specifier = ">=15.0.0" },
 ]
 

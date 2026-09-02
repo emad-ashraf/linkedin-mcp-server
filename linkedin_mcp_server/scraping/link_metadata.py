@@ -79,13 +79,18 @@ _SECTION_CONTEXTS = {
     "interests": "interests",
     "honors": "honors",
     "languages": "languages",
+    "certifications": "certifications",
+    "skills": "skills",
+    "projects": "projects",
     "contact_info": "contact info",
+    "employees": "employees",
     "job_posting": "job posting",
     "inbox": "inbox",
     "conversation": "conversation",
 }
 
 _DEFAULT_REFERENCE_CAP = 12
+_SEARCH_RESULTS_REFERENCE_CAP = 15
 _REFERENCE_CAPS = {
     "main_profile": 12,
     "about": 12,
@@ -94,9 +99,13 @@ _REFERENCE_CAPS = {
     "interests": 12,
     "honors": 12,
     "languages": 12,
+    "certifications": 12,
+    "skills": 12,
+    "projects": 12,
     "posts": 12,
     "jobs": 8,
-    "search_results": 15,
+    "employees": 12,
+    "search_results": _SEARCH_RESULTS_REFERENCE_CAP,
     "job_posting": 8,
     "contact_info": 8,
     "inbox": 30,
@@ -165,9 +174,13 @@ def _first_company_urn_from_query(query: str) -> str | None:
 def build_references(
     raw_references: list[RawReference],
     section_name: str,
+    *,
+    apply_cap: bool = True,
 ) -> list[Reference]:
     """Filter and normalize raw DOM anchors into compact references."""
-    cap = _REFERENCE_CAPS.get(section_name, _DEFAULT_REFERENCE_CAP)
+    cap = (
+        _REFERENCE_CAPS.get(section_name, _DEFAULT_REFERENCE_CAP) if apply_cap else None
+    )
     normalized_references: list[Reference] = []
 
     for raw in raw_references:
