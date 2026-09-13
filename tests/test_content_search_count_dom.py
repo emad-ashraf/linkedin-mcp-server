@@ -1,6 +1,6 @@
 """Browser-DOM tests for the content-search result count.
 
-The unit suite mocks ``page.evaluate``, so ``_CONTENT_SEARCH_COUNT_JS`` never
+The unit suite mocks ``page.evaluate``, so ``CONTENT_SEARCH_COUNT_JS`` never
 executes there. These tests run it against a synthetic ``<main>`` in headless
 chromium. The fixtures drive a synthetic container, so they are a claim about
 the algorithm and not about LinkedIn's markup: the ancestor chain of a live
@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 from patchright.async_api import async_playwright
 
-from linkedin_mcp_server.scraping.extractor import _CONTENT_SEARCH_COUNT_JS
+from linkedin_mcp_server.scraping.capture import CONTENT_SEARCH_COUNT_JS
 
 #: CI uses ``--dist loadgroup``. Keep every test that launches Chromium on one
 #: worker so browser startups cannot compete with the DOM cases' wall-clock
@@ -76,11 +76,11 @@ class TestContentSearchCount:
         """Ten anchors in one ``<li>`` are one card, not ten."""
         await dom_page.set_content(results("li"))
 
-        assert await dom_page.evaluate(_CONTENT_SEARCH_COUNT_JS) == 2
+        assert await dom_page.evaluate(CONTENT_SEARCH_COUNT_JS) == 2
 
     async def test_without_a_card_boundary_distinct_hrefs_stand_in(self, dom_page):
         """No ``li``/``article`` ancestor: the count is the old one, eleven
         distinct hrefs, which over-counts rather than returning zero."""
         await dom_page.set_content(results(None))
 
-        assert await dom_page.evaluate(_CONTENT_SEARCH_COUNT_JS) == 11
+        assert await dom_page.evaluate(CONTENT_SEARCH_COUNT_JS) == 11

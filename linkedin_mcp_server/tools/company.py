@@ -18,8 +18,8 @@ from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
 from linkedin_mcp_server.error_handler import raise_tool_error
 from linkedin_mcp_server.scraping import parse_company_sections
-from linkedin_mcp_server.scraping.extractor import (
-    _RATE_LIMITED_MSG,
+from linkedin_mcp_server.scraping.contracts import (
+    RATE_LIMITED_SECTION_TEXT,
     FilterValidationError,
     rate_limited_section_error,
 )
@@ -146,11 +146,11 @@ def register_company_tools(
             sections: dict[str, str] = {}
             references: dict[str, list[Reference]] = {}
             section_errors: dict[str, dict[str, Any]] = {}
-            if extracted.text and extracted.text != _RATE_LIMITED_MSG:
+            if extracted.text and extracted.text != RATE_LIMITED_SECTION_TEXT:
                 sections["posts"] = extracted.text
                 if extracted.references:
                     references["posts"] = extracted.references
-            elif extracted.text == _RATE_LIMITED_MSG:
+            elif extracted.text == RATE_LIMITED_SECTION_TEXT:
                 section_errors["posts"] = rate_limited_section_error()
             elif extracted.error:
                 section_errors["posts"] = extracted.error

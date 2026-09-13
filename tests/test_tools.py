@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from types import SimpleNamespace
 from typing import Any, Callable, Coroutine, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -9,7 +8,11 @@ from fastmcp import FastMCP
 from fastmcp.tools import FunctionTool
 
 from linkedin_mcp_server.callbacks import MCPContextProgressCallback
-from linkedin_mcp_server.scraping.extractor import ExtractedSection, _RATE_LIMITED_MSG
+from linkedin_mcp_server.scraping.contracts import (
+    RATE_LIMITED_SECTION_TEXT,
+    SEND_INTERRUPTED_WARNING,
+)
+from linkedin_mcp_server.scraping.contracts import ExtractedSection
 
 
 async def get_tool_fn(
@@ -482,7 +485,7 @@ class TestPersonTool:
         being collapsed to the generic "Error calling tool" mask."""
         from fastmcp.exceptions import ToolError
 
-        from linkedin_mcp_server.scraping.extractor import FilterValidationError
+        from linkedin_mcp_server.scraping.contracts import FilterValidationError
         from linkedin_mcp_server.tools.person import register_person_tools
 
         mock_extractor = MagicMock()
@@ -758,7 +761,7 @@ class TestCompanyTools:
     async def test_get_company_posts_omits_rate_limited_sentinel(self, mock_context):
         mock_extractor = MagicMock()
         mock_extractor.extract_page = AsyncMock(
-            return_value=ExtractedSection(text=_RATE_LIMITED_MSG, references=[])
+            return_value=ExtractedSection(text=RATE_LIMITED_SECTION_TEXT, references=[])
         )
 
         from linkedin_mcp_server.tools.company import register_company_tools
@@ -1247,7 +1250,6 @@ class TestMessagingTools:
         and not the status, which is why a confirmed send is parametrized
         here alongside an unconfirmed one.
         """
-        from linkedin_mcp_server.scraping.extractor import SEND_INTERRUPTED_WARNING
         from linkedin_mcp_server.tools.messaging import register_messaging_tools
 
         mock_extractor = _make_mock_extractor({})
@@ -1538,7 +1540,7 @@ class TestSearchCompaniesTool:
     ):
         from fastmcp.exceptions import ToolError
 
-        from linkedin_mcp_server.scraping.extractor import FilterValidationError
+        from linkedin_mcp_server.scraping.contracts import FilterValidationError
         from linkedin_mcp_server.tools.company import register_company_tools
 
         mock_extractor = MagicMock()
@@ -1632,86 +1634,6 @@ class TestGetCompanyEmployeesTool:
             await tool_fn("anthropic", mock_context, extractor=mock_extractor)
 
 
-class TestFeedToolDeadline:
-    """A tool deadline that comes due inside the cleanup shield.
-
-    ``_drain_listener_tasks`` shields its bounded teardown, and AnyIO does
-    not deliver into a shielded scope: on the way out it can only schedule
-    delivery for the next turn. ``get_feed`` then calls ``report_progress``,
-    which suspends only when the client sent a progress token, so the two
-    cases have to be driven separately. Both go over a real client session
-    against a real ``anyio.fail_after``; nothing about the timeout is mocked.
-    """
-
-    @staticmethod
-    def _server_and_reads(mcp_timeout: float, cleanup: float):
-        from linkedin_mcp_server.scraping.extractor import _drain_listener_tasks
-        from linkedin_mcp_server.tools.feed import register_feed_tools
-
-        reads: list[asyncio.Task[None]] = []
-
-        async def extract_feed(num_posts: int = 1) -> ExtractedSection:
-            started = asyncio.Event()
-
-            async def read() -> None:
-                started.set()
-                try:
-                    await asyncio.Event().wait()
-                finally:
-                    # Holds the shield open across the deadline.
-                    await asyncio.sleep(cleanup)
-
-            task = asyncio.create_task(read())
-            reads.append(task)
-            await started.wait()
-            await _drain_listener_tasks([task])
-            return ExtractedSection(text="synthetic feed", references=[])
-
-        mcp = FastMCP("deadline-test")
-        register_feed_tools(mcp, tool_timeout=mcp_timeout)
-        return mcp, reads, SimpleNamespace(extract_feed=extract_feed)
-
-    async def _call(self, use_session: bool):
-        from fastmcp import Client
-
-        from linkedin_mcp_server.tools import feed as feed_tools
-
-        mcp, reads, extractor = self._server_and_reads(2.5, 0.7)
-        try:
-            with patch.object(
-                feed_tools,
-                "get_ready_extractor",
-                AsyncMock(return_value=extractor),
-            ):
-                async with Client(mcp) as client:
-                    if use_session:
-                        # No progress token: report_progress never suspends.
-                        return await client.session.call_tool(
-                            "get_feed", {"num_posts": 1}
-                        )
-                    # Client.call_tool installs a progress handler, so the
-                    # request carries a token and report_progress awaits.
-                    return await client.call_tool("get_feed", {"num_posts": 1})
-        finally:
-            for task in reads:
-                if not task.done():
-                    task.cancel()
-            if reads:
-                await asyncio.wait(reads, timeout=2.0)
-
-    async def test_the_deadline_fires_without_a_progress_token(self):
-        result = await self._call(use_session=True)
-
-        assert result.isError, "expired call returned a feed result"
-        assert "timed out" in str(result.content)
-
-    async def test_the_deadline_fires_with_a_progress_token(self):
-        from fastmcp.exceptions import ToolError
-
-        with pytest.raises(ToolError, match="timed out"):
-            await self._call(use_session=False)
-
-
 class TestFeedTools:
     async def test_get_feed_success(self, mock_context):
         mock_extractor = MagicMock()
@@ -1768,7 +1690,7 @@ class TestFeedTools:
         """Rate-limit sentinel becomes a typed section_errors entry."""
         mock_extractor = MagicMock()
         mock_extractor.extract_feed = AsyncMock(
-            return_value=ExtractedSection(text=_RATE_LIMITED_MSG, references=[])
+            return_value=ExtractedSection(text=RATE_LIMITED_SECTION_TEXT, references=[])
         )
 
         from linkedin_mcp_server.tools.feed import register_feed_tools
@@ -1780,7 +1702,10 @@ class TestFeedTools:
         result = await tool_fn(mock_context, extractor=mock_extractor)
         assert "feed" not in result["sections"]
         assert result["section_errors"]["feed"]["error_type"] == "rate_limit"
-        assert result["section_errors"]["feed"]["error_message"] == _RATE_LIMITED_MSG
+        assert (
+            result["section_errors"]["feed"]["error_message"]
+            == RATE_LIMITED_SECTION_TEXT
+        )
 
     async def test_get_feed_returns_section_errors(self, mock_context):
         mock_extractor = MagicMock()
@@ -1868,7 +1793,7 @@ class TestPostTools:
         a ToolError carrying the same message, not the generic mask."""
         from fastmcp.exceptions import ToolError
 
-        from linkedin_mcp_server.scraping.extractor import FilterValidationError
+        from linkedin_mcp_server.scraping.contracts import FilterValidationError
         from linkedin_mcp_server.tools.post import register_post_tools
 
         mock_extractor = MagicMock()

@@ -1,0 +1,2072 @@
+"""Tests for the person-profile scraping owner."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, call, patch
+
+import importlib.util
+import logging
+
+import pytest
+from patchright._impl._errors import TargetClosedError
+
+from linkedin_mcp_server.callbacks import ProgressCallback
+from linkedin_mcp_server.company_cache import CompanyCache
+from linkedin_mcp_server.core.exceptions import (
+    AuthenticationError,
+    InvalidReferenceError,
+    LinkedInScraperException,
+    ProxyConnectionError,
+)
+from linkedin_mcp_server.scraping import person as person_module
+from linkedin_mcp_server.scraping import search_pages as search_pages_module
+from linkedin_mcp_server.scraping import text as text_module
+from linkedin_mcp_server.scraping.capture import CaptureMode, SectionCapture
+from linkedin_mcp_server.scraping.content import PageContentReader
+from linkedin_mcp_server.scraping.contracts import (
+    RATE_LIMITED_SECTION_TEXT,
+    ExtractedSection,
+    FilterValidationError,
+)
+from linkedin_mcp_server.scraping.facets import FacetResolver
+from linkedin_mcp_server.scraping.link_metadata import Reference
+from linkedin_mcp_server.scraping.navigation import PageNavigator
+from linkedin_mcp_server.scraping.person import PersonScraper
+from linkedin_mcp_server.scraping.profile_page import ProfilePageReader
+from linkedin_mcp_server.scraping.session import ScrapingSession
+
+
+def _scraper(page, *, message_target: Any = None) -> PersonScraper:
+    """Wire the person owner the way the facade does.
+
+    The top-card read the profile URN comes from belongs to the facade until
+    the message sender owns it, so the default here is what a page with no
+    resolvable action answers: no target, and therefore no URN.
+    """
+    session = ScrapingSession(page)
+    navigator = PageNavigator(session)
+    capture = SectionCapture(session, navigator, PageContentReader(session))
+
+    async def read_message_target() -> Any:
+        return SimpleNamespace(target=message_target)
+
+    return PersonScraper(
+        session,
+        navigator,
+        capture,
+        ProfilePageReader(session, read_message_target),
+        FacetResolver(session, navigator, capture),
+    )
+
+
+def extracted(
+    text: str,
+    references: list[Reference] | None = None,
+    error: dict | None = None,
+) -> ExtractedSection:
+    """Create an ExtractedSection for tests."""
+    return ExtractedSection(text=text, references=references or [], error=error)
+
+
+def _results(scraper, *pages: ExtractedSection):
+    """Patch the results-page capture with one page per positional argument."""
+    return patch.object(
+        scraper._capture,
+        "capture",
+        new_callable=AsyncMock,
+        side_effect=list(pages) if len(pages) > 1 else None,
+        return_value=pages[0] if len(pages) == 1 else None,
+    )
+
+
+def _sleep():
+    return patch(
+        "linkedin_mcp_server.scraping.session.asyncio.sleep", new_callable=AsyncMock
+    )
+
+
+def _identity_jitter():
+    """Neutralise the session's pause jitter so a delay is readable."""
+    return patch(
+        "linkedin_mcp_server.scraping.session.jitter",
+        side_effect=lambda base, *a, **kw: base,
+    )
+
+
+class TestScrapePersonUrls:
+    """Test that scrape_person visits the correct URLs per section set."""
+
+    async def test_baseline_always_included(self, mock_page):
+        """Passing only experience still visits main profile."""
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("text"),
+            ) as mock_extract,
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("testuser", {"experience"})
+
+        urls = [call.args[0] for call in mock_extract.call_args_list]
+        assert "main_profile" in result["sections"]
+        assert any(u.endswith("/in/testuser/") for u in urls)
+        assert any("/details/experience/" in u for u in urls)
+
+    async def test_basic_info_only_visits_main_profile(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("profile text"),
+            ) as mock_extract,
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("testuser", {"main_profile"})
+
+        urls = [call.args[0] for call in mock_extract.call_args_list]
+        assert len(urls) == 1
+        assert urls[0].endswith("/in/testuser/")
+        assert set(result["sections"]) == {"main_profile"}
+
+    async def test_a_pasted_profile_link_reaches_the_canonical_profile_url(
+        self, mock_page
+    ):
+        """A URL argument must be reduced before it becomes a path segment.
+
+        Without this the navigation target is
+        https://www.linkedin.com/in/https://de.linkedin.com/in/testuser, which
+        LinkedIn does not serve, and the tool reports that page as a profile.
+        """
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("profile text"),
+            ) as mock_extract,
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person(
+                "https://de.linkedin.com/in/testuser", {"main_profile"}
+            )
+
+        urls = [call.args[0] for call in mock_extract.call_args_list]
+        assert urls == ["https://www.linkedin.com/in/testuser/"]
+        assert result["url"] == "https://www.linkedin.com/in/testuser/"
+
+    async def test_a_dot_segment_value_never_reaches_a_navigation(self, mock_page):
+        # A browser resolves ../ away before the request, so this would open the
+        # feed and return it as a profile.
+        scraper = _scraper(mock_page)
+        with patch.object(
+            scraper._capture, "capture", new_callable=AsyncMock
+        ) as mock_extract:
+            with pytest.raises(LinkedInScraperException):
+                await scraper.scrape_person("testuser/../../feed", {"main_profile"})
+        mock_extract.assert_not_called()
+
+    async def test_an_already_encoded_username_is_not_encoded_twice(self, mock_page):
+        """get_my_profile hands over the username exactly this way.
+
+        It reads the segment out of page.url after the /in/me/ redirect, and a
+        browser reports that path percent-encoded. Escaping it again turns %D0
+        into %25D0, which is a different profile path, so the own-profile scrape
+        of any member with a non-ASCII vanity would navigate somewhere else.
+        """
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("profile text"),
+            ) as mock_extract,
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await scraper.scrape_person(
+                "%D0%B0%D0%BD%D0%B4%D1%80%D0%B5%D0%B9", {"main_profile"}
+            )
+
+        urls = [call.args[0] for call in mock_extract.call_args_list]
+        assert urls == [
+            "https://www.linkedin.com/in/%D0%B0%D0%BD%D0%B4%D1%80%D0%B5%D0%B9/"
+        ]
+
+    async def test_scrape_person_returns_section_errors(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                side_effect=[
+                    extracted("profile text"),
+                    extracted("", error={"issue_template_path": "/tmp/issue.md"}),
+                ],
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("testuser", {"posts"})
+
+        assert result["sections"]["main_profile"] == "profile text"
+        assert (
+            result["section_errors"]["posts"]["issue_template_path"] == "/tmp/issue.md"
+        )
+
+    async def test_experience_education_visits_correct_urls(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("text"),
+            ) as mock_extract,
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person(
+                "testuser", {"main_profile", "experience", "education"}
+            )
+
+        urls = [call.args[0] for call in mock_extract.call_args_list]
+        assert len(urls) == 3
+        assert any(u.endswith("/in/testuser/") for u in urls)
+        assert any("/details/experience/" in u for u in urls)
+        assert any("/details/education/" in u for u in urls)
+        assert set(result["sections"]) == {"main_profile", "experience", "education"}
+
+    async def test_all_sections_visit_all_urls(self, mock_page):
+        scraper = _scraper(mock_page)
+        all_sections = {
+            "main_profile",
+            "experience",
+            "education",
+            "interests",
+            "honors",
+            "languages",
+            "certifications",
+            "skills",
+            "projects",
+            "contact_info",
+            "posts",
+        }
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("text"),
+            ) as mock_extract,
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted("contact text"),
+            ) as mock_overlay,
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("testuser", all_sections)
+
+        page_urls = [call.args[0] for call in mock_extract.call_args_list]
+        overlay_urls = [call.args[0] for call in mock_overlay.call_args_list]
+        all_urls = page_urls + overlay_urls
+        # 10 full-page sections + 1 overlay (contact_info)
+        assert len(page_urls) == 10
+        assert len(overlay_urls) == 1
+        assert [
+            capture_call.kwargs["plan"].mode
+            for capture_call in mock_extract.call_args_list
+        ] == [CaptureMode.STANDARD, *([CaptureMode.DETAILS] * 8), CaptureMode.ACTIVITY]
+        assert mock_overlay.call_args.kwargs["plan"].mode is CaptureMode.OVERLAY
+        # Verify each expected suffix was navigated
+        assert any(u.endswith("/in/testuser/") for u in all_urls)
+        assert any("/details/experience/" in u for u in all_urls)
+        assert any("/details/education/" in u for u in all_urls)
+        assert any("/details/interests/" in u for u in all_urls)
+        assert any("/details/honors/" in u for u in all_urls)
+        assert any("/details/languages/" in u for u in all_urls)
+        assert any("/details/certifications/" in u for u in all_urls)
+        assert any("/details/skills/" in u for u in all_urls)
+        assert any("/details/projects/" in u for u in all_urls)
+        assert any("/overlay/contact-info/" in u for u in overlay_urls)
+        assert any("/recent-activity/all/" in u for u in all_urls)
+        assert set(result["sections"]) == all_sections
+
+    async def test_posts_visits_recent_activity(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("Post 1\nPost 2"),
+            ) as mock_extract,
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("test-user", {"posts"})
+
+        urls = [call.args[0] for call in mock_extract.call_args_list]
+        assert any("/recent-activity/all/" in url for url in urls)
+        assert "posts" in result["sections"]
+
+    async def test_certifications_visits_details_page(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("Python for Data Science\nIBM"),
+            ) as mock_extract,
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("test-user", {"certifications"})
+
+        urls = [call.args[0] for call in mock_extract.call_args_list]
+        assert any("/details/certifications/" in url for url in urls)
+        assert "certifications" in result["sections"]
+
+    async def test_skills_visits_details_page(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("Python\nData Analysis"),
+            ) as mock_extract,
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("test-user", {"skills"})
+
+        urls = [call.args[0] for call in mock_extract.call_args_list]
+        assert any("/details/skills/" in url for url in urls)
+        assert "skills" in result["sections"]
+
+    async def test_projects_visits_details_page(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("Portfolio Website\nBuilt with React"),
+            ) as mock_extract,
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("test-user", {"projects"})
+
+        urls = [call.args[0] for call in mock_extract.call_args_list]
+        assert any("/details/projects/" in url for url in urls)
+        assert "projects" in result["sections"]
+
+    async def test_scrape_person_passes_max_scrolls(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("text"),
+            ) as mock_extract,
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await scraper.scrape_person("test-user", {"certifications"}, max_scrolls=15)
+
+        assert [
+            capture_call.kwargs["plan"].mode
+            for capture_call in mock_extract.call_args_list
+        ] == [CaptureMode.STANDARD, CaptureMode.DETAILS]
+        for capture_call in mock_extract.call_args_list:
+            assert capture_call.kwargs["plan"].max_scrolls == 15
+
+    async def test_runtime_section_table_patch_controls_order_suffix_and_plans(
+        self, mock_page
+    ):
+        table = {
+            "main_profile": ("/patched-root/", False),
+            "contact_info": ("/patched-overlay/", True),
+            "experience": ("/patched-details/", False),
+            "posts": ("/patched-activity/", False),
+            "custom": ("/patched-custom/", False),
+        }
+        scraper = _scraper(mock_page)
+        calls = []
+
+        async def record_capture(url, section_name, plan):
+            calls.append((url, section_name, plan))
+            return extracted("page text")
+
+        async def record_overlay(url, section_name, plan):
+            calls.append((url, section_name, plan))
+            return extracted("overlay text")
+
+        with (
+            patch.object(person_module, "PERSON_SECTIONS", table),
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                side_effect=record_capture,
+            ),
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                side_effect=record_overlay,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("testuser", set(table), max_scrolls=13)
+
+        assert [section_name for _url, section_name, _plan in calls] == list(table)
+        assert [
+            url.removeprefix("https://www.linkedin.com/in/testuser")
+            for url, _section_name, _plan in calls
+        ] == [suffix for suffix, _is_overlay in table.values()]
+        assert [plan.mode for _url, _section_name, plan in calls] == [
+            CaptureMode.STANDARD,
+            CaptureMode.OVERLAY,
+            CaptureMode.DETAILS,
+            CaptureMode.ACTIVITY,
+            CaptureMode.STANDARD,
+        ]
+        assert [plan.max_scrolls for _url, _section_name, plan in calls] == [
+            13,
+            13,
+            13,
+            13,
+            13,
+        ]
+        assert list(result["sections"]) == list(table)
+
+
+class TestScrapePersonSectionOutcomes:
+    """What one section's result does to the walk and to the response."""
+
+    async def test_references_are_grouped_by_section(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                side_effect=[
+                    extracted(
+                        "profile text",
+                        [
+                            {
+                                "kind": "person",
+                                "url": "/in/testuser/",
+                                "text": "Test User",
+                            }
+                        ],
+                    ),
+                    extracted(
+                        "post text",
+                        [
+                            {
+                                "kind": "article",
+                                "url": "/pulse/test-post/",
+                                "text": "Test post",
+                            }
+                        ],
+                    ),
+                ],
+            ),
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("testuser", {"posts"})
+
+        assert result["references"] == {
+            "main_profile": [
+                {"kind": "person", "url": "/in/testuser/", "text": "Test User"}
+            ],
+            "posts": [
+                {"kind": "article", "url": "/pulse/test-post/", "text": "Test post"}
+            ],
+        }
+
+    async def test_error_isolation(self, mock_page):
+        """One section failing doesn't block others."""
+
+        async def extract_with_failure(url, *args, **kwargs):
+            if "experience" in url:
+                raise Exception("Simulated failure")
+            return extracted(f"text for {url}")
+
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                side_effect=extract_with_failure,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.person.build_issue_diagnostics",
+                return_value={"issue_template_path": "/tmp/issue.md"},
+            ),
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person(
+                "testuser", {"main_profile", "experience", "education"}
+            )
+
+        # main_profile and education should have sections, experience should not
+        assert "main_profile" in result["sections"]
+        assert "education" in result["sections"]
+        assert "experience" not in result["sections"]
+        assert result["section_errors"]["experience"]["issue_template_path"] == (
+            "/tmp/issue.md"
+        )
+
+    async def test_a_rate_limited_section_is_reported_and_stops_the_rest(
+        self, mock_page
+    ):
+        """A throttled section is named as an error, and the walk stops there.
+
+        Both halves matter. Returning the section as merely absent reads as
+        "nothing to find" and invites the caller to try again, which is the
+        opposite of what LinkedIn just asked for. And continuing to the
+        remaining sections would be another navigation each, immediately after
+        being told to slow down.
+        """
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                side_effect=[
+                    extracted(RATE_LIMITED_SECTION_TEXT),
+                    extracted("Post text"),
+                ],
+            ) as mock_extract,
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("testuser", {"posts"})
+
+        assert "main_profile" not in result["sections"]
+        assert result["section_errors"]["main_profile"]["error_type"] == "rate_limit"
+        # The second section was never fetched, so its side effect is unused.
+        assert mock_extract.await_count == 1
+        assert "posts" not in result["sections"]
+
+    async def test_a_failing_urn_read_cannot_bury_the_rate_limit(self, mock_page):
+        """The URN read is skipped once throttled, so it cannot overwrite it.
+
+        It runs after the section handling but inside the same try, so a
+        failure there lands in the generic handler and replaces the entry with
+        a diagnostic — losing the one thing this section had to report. There
+        is nothing to read a URN from on a page with no content anyway.
+        """
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted(RATE_LIMITED_SECTION_TEXT),
+            ),
+            patch.object(
+                scraper._profile_page,
+                "_extract_profile_urn",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("execution context destroyed"),
+            ) as mock_urn,
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("testuser", set())
+
+        mock_urn.assert_not_awaited()
+        assert result["section_errors"]["main_profile"]["error_type"] == "rate_limit"
+
+    async def test_earlier_sections_survive_a_later_rate_limit(self, mock_page):
+        """Stopping early keeps what was already gathered."""
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                side_effect=[
+                    extracted("Profile text"),
+                    extracted(RATE_LIMITED_SECTION_TEXT),
+                ],
+            ),
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("testuser", {"posts"})
+
+        assert result["sections"]["main_profile"] == "Profile text"
+        assert result["section_errors"]["posts"]["error_type"] == "rate_limit"
+
+    async def test_scrape_person_reraises_closed_target(self, mock_page):
+        """A dead browser fails the call, not the section.
+
+        Measured: Chromium exited mid-call and every later section was recorded
+        as its own ``TargetClosedError`` while the call returned normally, so a
+        bunch loop walked eight more profiles against the dead page.
+        """
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                side_effect=[
+                    extracted("profile text"),
+                    TargetClosedError(
+                        "Target page, context or browser has been closed"
+                    ),
+                ],
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+            pytest.raises(TargetClosedError),
+        ):
+            await scraper.scrape_person("testuser", {"posts"})
+
+    async def test_scrape_person_closed_target_reaches_on_error(self, mock_page):
+        """The re-raise bypasses the ``LinkedInScraperException`` handler that
+        reports to ``callbacks.on_error``; the tool layer reports through it."""
+        scraper = _scraper(mock_page)
+        callbacks = AsyncMock()
+        closed = TargetClosedError("closed")
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                side_effect=closed,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+            pytest.raises(TargetClosedError),
+        ):
+            await scraper.scrape_person("testuser", {"posts"}, callbacks=callbacks)
+        callbacks.on_error.assert_awaited_once_with(closed)
+
+    async def test_sections_are_paced_through_the_jittered_navigation_delay(
+        self, mock_page
+    ):
+        """One pause per gap, at ``nav_delay()`` read at call time and
+        jittered by the session, never a fixed sleep."""
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("text"),
+            ),
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted(""),
+            ),
+            patch.object(person_module, "nav_delay", return_value=7.0),
+            patch(
+                "linkedin_mcp_server.scraping.session.jitter",
+                side_effect=lambda base, *a, **kw: base + 0.5,
+            ),
+            _sleep() as sleep,
+        ):
+            await scraper.scrape_person("testuser", {"experience", "posts"})
+
+        assert sleep.await_args_list == [call(7.5), call(7.5)]
+
+
+class TestScrapePersonCallbacks:
+    """Test that scrape_person invokes callbacks at each stage."""
+
+    async def test_scrape_person_calls_callbacks(self, mock_page):
+        scraper = _scraper(mock_page)
+        cb = MagicMock(spec=ProgressCallback)
+        cb.on_start = AsyncMock()
+        cb.on_progress = AsyncMock()
+        cb.on_complete = AsyncMock()
+        cb.on_error = AsyncMock()
+
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("text"),
+            ),
+            patch.object(
+                scraper._capture,
+                "_extract_overlay",
+                new_callable=AsyncMock,
+                return_value=extracted("overlay text"),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await scraper.scrape_person(
+                "testuser", {"experience", "education"}, callbacks=cb
+            )
+
+        cb.on_start.assert_awaited_once()
+        assert cb.on_start.call_args[0][0] == "person profile"
+
+        # 3 sections: main_profile (always) + experience + education
+        assert cb.on_progress.await_count == 3
+        messages = [c.args[0] for c in cb.on_progress.call_args_list]
+        assert messages == [
+            "Scraped main_profile (1/3)",
+            "Scraped experience (2/3)",
+            "Scraped education (3/3)",
+        ]
+        # Last section should be at 95%
+        assert cb.on_progress.call_args_list[-1].args[1] == 95
+
+        cb.on_complete.assert_awaited_once()
+        assert cb.on_complete.call_args[0][0] == "person profile"
+        cb.on_error.assert_not_awaited()
+
+    async def test_scrape_person_no_callbacks_by_default(self, mock_page):
+        """Without callbacks, scrape_person works identically to before."""
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("text"),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("testuser", {"main_profile"})
+
+        assert "main_profile" in result["sections"]
+
+    async def test_scrape_person_calls_on_error(self, mock_page):
+        scraper = _scraper(mock_page)
+        cb = MagicMock(spec=ProgressCallback)
+        cb.on_start = AsyncMock()
+        cb.on_progress = AsyncMock()
+        cb.on_complete = AsyncMock()
+        cb.on_error = AsyncMock()
+
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                side_effect=LinkedInScraperException("boom"),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            with pytest.raises(LinkedInScraperException):
+                await scraper.scrape_person("testuser", {"main_profile"}, callbacks=cb)
+
+        cb.on_start.assert_awaited_once()
+        cb.on_error.assert_awaited_once()
+        error_arg = cb.on_error.call_args[0][0]
+        assert isinstance(error_arg, LinkedInScraperException)
+        assert "boom" in str(error_arg)
+        cb.on_complete.assert_not_awaited()
+
+
+class TestMainProfileAlreadyLoaded:
+    """Reuse path for scrape_person when get_my_profile already loaded the page."""
+
+    async def test_get_my_profile_passes_already_loaded_flag(self, mock_page):
+        scraper = _scraper(mock_page)
+        mock_page.url = "https://www.linkedin.com/in/realuser/"
+        with (
+            patch.object(
+                PageNavigator, "_navigate_to_page", new_callable=AsyncMock
+            ) as nav,
+            patch.object(
+                scraper,
+                "scrape_person",
+                new_callable=AsyncMock,
+                return_value={"url": "...", "sections": {}},
+            ) as scrape,
+        ):
+            await scraper.get_my_profile(sections={"main_profile"})
+
+        nav.assert_awaited_once_with("https://www.linkedin.com/in/me/")
+        assert scrape.await_count == 1
+        assert scrape.call_args.kwargs["main_profile_already_loaded"] is True
+
+    async def test_scrape_person_already_loaded_skips_navigation(self, mock_page):
+        scraper = _scraper(mock_page)
+        mock_page.url = "https://www.linkedin.com/in/foo/"
+        with (
+            patch.object(
+                scraper._capture,
+                "_extract_loaded_section",
+                new_callable=AsyncMock,
+                return_value=extracted("reused"),
+            ) as loaded,
+            patch.object(
+                scraper._capture, "capture", new_callable=AsyncMock
+            ) as extract_page,
+            patch.object(
+                PageNavigator, "_navigate_to_page", new_callable=AsyncMock
+            ) as nav,
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await scraper.scrape_person(
+                "foo", {"main_profile"}, main_profile_already_loaded=True
+            )
+
+        loaded.assert_awaited_once()
+        extract_page.assert_not_awaited()
+        nav.assert_not_awaited()
+
+    async def test_scrape_person_already_loaded_url_mismatch_falls_back(
+        self, mock_page
+    ):
+        scraper = _scraper(mock_page)
+        mock_page.url = "https://www.linkedin.com/feed/"
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("fallback"),
+            ) as extract_page,
+            patch.object(
+                scraper._capture,
+                "_extract_loaded_section",
+                new_callable=AsyncMock,
+            ) as loaded,
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await scraper.scrape_person(
+                "foo", {"main_profile"}, main_profile_already_loaded=True
+            )
+
+        extract_page.assert_awaited_once()
+        loaded.assert_not_awaited()
+
+    async def test_scrape_person_already_loaded_rate_limit_falls_back(self, mock_page):
+        scraper = _scraper(mock_page)
+        mock_page.url = "https://www.linkedin.com/in/foo/"
+
+        with (
+            patch.object(
+                scraper._capture,
+                "_extract_loaded_section",
+                new_callable=AsyncMock,
+                return_value=extracted(RATE_LIMITED_SECTION_TEXT),
+            ) as loaded,
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("retry succeeded"),
+            ) as extract_page,
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person(
+                "foo", {"main_profile"}, main_profile_already_loaded=True
+            )
+
+        loaded.assert_awaited_once()
+        extract_page.assert_awaited_once()
+        assert result["sections"]["main_profile"] == "retry succeeded"
+
+
+class TestScrapePersonProfileUrn:
+    async def test_includes_profile_urn_in_result_when_found(self, mock_page):
+        """scrape_person includes profile_urn in result when _extract_profile_urn returns a value."""
+        urn = "ACoAAB1IelEBLEkqTkNbZ-a1D8mq5R-6C1ihSEk"
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("profile text"),
+            ),
+            patch.object(
+                scraper._profile_page,
+                "_extract_profile_urn",
+                new_callable=AsyncMock,
+                return_value=urn,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("testuser", {"main_profile"})
+
+        assert result["profile_urn"] == urn
+
+    async def test_omits_profile_urn_when_not_found(self, mock_page):
+        """scrape_person omits profile_urn key when _extract_profile_urn returns None."""
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("profile text"),
+            ),
+            patch.object(
+                scraper._profile_page,
+                "_extract_profile_urn",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_person("testuser", {"main_profile"})
+
+        assert "profile_urn" not in result
+
+
+class TestGetMyProfileAlias:
+    async def test_survives_a_redirect_that_never_resolves_the_alias(self, mock_page):
+        """The one caller allowed to hold "me".
+
+        get_my_profile navigates to /in/me/ and reads the identifier back out of
+        the redirect. When the redirect has not happened it still holds the
+        alias, and refusing there would answer the tool that owns the alias with
+        an instruction to call itself.
+        """
+        mock_page.url = "https://www.linkedin.com/in/me/"
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("profile text"),
+            ) as mock_extract,
+            patch.object(PageNavigator, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.get_my_profile()
+
+        # The alias survives normalization, and because the page is already on
+        # it, the scrape reuses the loaded document instead of navigating again.
+        assert result["url"] == "https://www.linkedin.com/in/me/"
+        assert "main_profile" in result["sections"]
+        mock_extract.assert_not_called()
+
+    async def test_refuses_the_alias_from_an_ordinary_caller(self, mock_page):
+        scraper = _scraper(mock_page)
+        with patch.object(
+            scraper._capture, "capture", new_callable=AsyncMock
+        ) as mock_extract:
+            with pytest.raises(InvalidReferenceError):
+                await scraper.scrape_person("me", {"main_profile"})
+        mock_extract.assert_not_called()
+
+
+class TestGetSidebarProfiles:
+    async def test_returns_sidebar_profiles_from_all_sections(self, mock_page):
+        """Happy path: extracts profiles from all sections, merges Show all results."""
+        sidebar_js_result = {
+            "sections": {
+                "more_profiles_for_you": ["/in/alice/", "/in/bob/"],
+                "explore_premium_profiles": ["/in/carol/"],
+                "people_you_may_know": ["/in/dave/"],
+            },
+            "showAllUrls": {
+                "more_profiles_for_you": "https://www.linkedin.com/search/results/people/?keywords=test",
+            },
+        }
+        show_all_js_result = ["/in/alice/", "/in/eve/", "/in/frank/"]
+
+        mock_page.evaluate = AsyncMock(
+            side_effect=[sidebar_js_result, show_all_js_result]
+        )
+        mock_page.url = "https://www.linkedin.com/in/testuser/"
+
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(PageNavigator, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.get_sidebar_profiles("testuser")
+
+        assert result["url"] == "https://www.linkedin.com/in/testuser/"
+        mpfy = result["sidebar_profiles"]["more_profiles_for_you"]
+        # sidebar links first, then show_all expansion, deduped
+        assert mpfy == ["/in/alice/", "/in/bob/", "/in/eve/", "/in/frank/"]
+        assert result["sidebar_profiles"]["explore_premium_profiles"] == ["/in/carol/"]
+        assert result["sidebar_profiles"]["people_you_may_know"] == ["/in/dave/"]
+
+    async def test_show_all_pages_are_paced_through_the_jittered_delay(self, mock_page):
+        """The first Show all follows the profile page unpaced; each later
+        one waits ``nav_delay()``, jittered by the session."""
+        sidebar_js_result = {
+            "sections": {
+                "more_profiles_for_you": ["/in/alice/"],
+                "people_you_may_know": ["/in/dave/"],
+            },
+            "showAllUrls": {
+                "more_profiles_for_you": "https://www.linkedin.com/search/results/people/?keywords=a",
+                "people_you_may_know": "https://www.linkedin.com/search/results/people/?keywords=b",
+            },
+        }
+        mock_page.evaluate = AsyncMock(
+            side_effect=[sidebar_js_result, ["/in/eve/"], ["/in/frank/"]]
+        )
+        mock_page.url = "https://www.linkedin.com/in/testuser/"
+
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(PageNavigator, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(person_module, "nav_delay", return_value=7.0),
+            patch(
+                "linkedin_mcp_server.scraping.session.jitter",
+                side_effect=lambda base, *a, **kw: base + 0.5,
+            ),
+            _sleep() as sleep,
+        ):
+            result = await scraper.get_sidebar_profiles("testuser")
+
+        assert sleep.await_args_list == [call(7.5)]
+        assert result["sidebar_profiles"]["people_you_may_know"] == [
+            "/in/dave/",
+            "/in/frank/",
+        ]
+
+    @pytest.mark.parametrize(
+        ("error_type", "message"),
+        [
+            pytest.param(
+                AuthenticationError,
+                "Run with --login",
+                id="authentication-error",
+            ),
+            pytest.param(
+                ProxyConnectionError,
+                "Proxy unavailable",
+                id="proxy-connection-error",
+            ),
+        ],
+    )
+    async def test_scraper_exception_from_show_all_propagates(
+        self,
+        mock_page,
+        error_type: type[LinkedInScraperException],
+        message: str,
+    ):
+        sidebar_js_result = {
+            "sections": {"more_profiles_for_you": ["/in/alice/"]},
+            "showAllUrls": {
+                "more_profiles_for_you": "https://www.linkedin.com/search/results/people/?keywords=test"
+            },
+        }
+        mock_page.evaluate = AsyncMock(return_value=sidebar_js_result)
+        mock_page.url = "https://www.linkedin.com/in/testuser/"
+
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                PageNavigator,
+                "_navigate_to_page",
+                new_callable=AsyncMock,
+                side_effect=[None, error_type(message)],
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            pytest.raises(error_type, match=message),
+        ):
+            await scraper.get_sidebar_profiles("testuser")
+
+    async def test_raw_exception_from_show_all_keeps_inline_profiles(self, mock_page):
+        show_all_url = "https://www.linkedin.com/search/results/people/?keywords=test"
+        sidebar_js_result = {
+            "sections": {"more_profiles_for_you": ["/in/alice/"]},
+            "showAllUrls": {"more_profiles_for_you": show_all_url},
+        }
+        mock_page.evaluate = AsyncMock(return_value=sidebar_js_result)
+        mock_page.url = "https://www.linkedin.com/in/testuser/"
+
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                PageNavigator,
+                "_navigate_to_page",
+                new_callable=AsyncMock,
+                side_effect=[None, RuntimeError("navigation failed")],
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(person_module.logger, "debug") as debug_mock,
+        ):
+            result = await scraper.get_sidebar_profiles("testuser")
+
+        assert result == {
+            "url": "https://www.linkedin.com/in/testuser/",
+            "sidebar_profiles": {"more_profiles_for_you": ["/in/alice/"]},
+        }
+        debug_mock.assert_called_once_with(
+            "Failed to navigate to Show all for section %s: %s",
+            "more_profiles_for_you",
+            show_all_url,
+        )
+
+    async def test_skips_show_all_when_url_contains_premium(self, mock_page):
+        """Show all URL containing /premium is skipped without navigation."""
+        sidebar_js_result = {
+            "sections": {"explore_premium_profiles": ["/in/carol/"]},
+            "showAllUrls": {
+                "explore_premium_profiles": "https://www.linkedin.com/premium/products/"
+            },
+        }
+        mock_page.evaluate = AsyncMock(return_value=sidebar_js_result)
+        mock_page.url = "https://www.linkedin.com/in/testuser/"
+
+        scraper = _scraper(mock_page)
+        navigate_mock = AsyncMock()
+        with (
+            patch.object(PageNavigator, "_navigate_to_page", navigate_mock),
+            patch(
+                "linkedin_mcp_server.scraping.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            result = await scraper.get_sidebar_profiles("testuser")
+
+        navigate_mock.assert_awaited_once()  # only the initial profile navigation
+        mock_page.evaluate.assert_awaited_once()  # no show_all JS call
+        assert result["sidebar_profiles"]["explore_premium_profiles"] == ["/in/carol/"]
+
+    async def test_skips_show_all_when_page_redirects_to_premium(self, mock_page):
+        """If navigating to Show all lands on a /premium URL, skip that section."""
+        sidebar_js_result = {
+            "sections": {"more_profiles_for_you": ["/in/alice/"]},
+            "showAllUrls": {
+                "more_profiles_for_you": "https://www.linkedin.com/search/results/people/?keywords=test"
+            },
+        }
+        mock_page.evaluate = AsyncMock(return_value=sidebar_js_result)
+        mock_page.url = "https://www.linkedin.com/in/testuser/"
+
+        navigate_call_count = 0
+
+        async def fake_navigate(url: str) -> None:
+            nonlocal navigate_call_count
+            navigate_call_count += 1
+            if navigate_call_count >= 2:
+                mock_page.url = "https://www.linkedin.com/premium/grow-your-network/"
+
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(PageNavigator, "_navigate_to_page", side_effect=fake_navigate),
+            patch(
+                "linkedin_mcp_server.scraping.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.get_sidebar_profiles("testuser")
+
+        mock_page.evaluate.assert_awaited_once()  # sidebar JS only, no show_all expansion
+        assert result["sidebar_profiles"]["more_profiles_for_you"] == ["/in/alice/"]
+
+    async def test_returns_empty_sidebar_profiles_when_no_sections_found(
+        self, mock_page
+    ):
+        """No matching sidebar headings -> empty sidebar_profiles dict."""
+        mock_page.evaluate = AsyncMock(return_value={"sections": {}, "showAllUrls": {}})
+        mock_page.url = "https://www.linkedin.com/in/testuser/"
+
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(PageNavigator, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.session.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.session.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            result = await scraper.get_sidebar_profiles("testuser")
+
+        assert result == {
+            "url": "https://www.linkedin.com/in/testuser/",
+            "sidebar_profiles": {},
+        }
+
+
+class TestSidebarProgramText:
+    """The program `get_sidebar_profiles` evaluates, as text."""
+
+    def test_every_substituted_heading_carries_the_template_indent(self):
+        # `",\n".join(...)` indents the first heading and nothing after it,
+        # because only the first one lands on the template's own indented
+        # line. Whitespace alone, and `program_digest` strips per-line
+        # whitespace before fingerprinting, so the traces hold the claim
+        # `_js_literal` makes about byte identity open on exactly this.
+        block = ",\n".join(
+            f'{" " * 20}"{heading}"'
+            for heading in text_module.SIDEBAR_CHROME_EN.section_headings
+        )
+
+        assert f"const SIDEBAR_SECTIONS = [\n{block}\n" in (
+            person_module._SIDEBAR_PROFILES_JS
+        )
+        assert not [
+            line
+            for line in person_module._SIDEBAR_PROFILES_JS.splitlines()[1:]
+            if line and not line.startswith(" ")
+        ]
+
+    @pytest.mark.parametrize(
+        ("value", "quote"),
+        [("voir l'ensemble", "'"), ('the "all" list', '"'), ("back\\slash", "'")],
+    )
+    def test_an_unquotable_locale_label_is_refused(self, value, quote):
+        with pytest.raises(ValueError, match="cannot be quoted"):
+            person_module._js_literal(value, quote)
+
+    def test_an_unquotable_locale_label_stops_the_import(self, monkeypatch):
+        # The only call sites are module-level, so a table entry carrying an
+        # apostrophe has to fail here rather than as a JavaScript
+        # `SyntaxError` out of the unguarded `page.evaluate` below — which
+        # surfaces against live LinkedIn only, and only once this table grows
+        # the locale it exists to accept. Loaded as a throwaway copy, so the
+        # module every other test holds is left alone.
+        monkeypatch.setattr(
+            text_module,
+            "SIDEBAR_CHROME_EN",
+            replace(
+                text_module.SIDEBAR_CHROME_EN, show_all_prefixes=("voir l'ensemble",)
+            ),
+        )
+        spec = importlib.util.spec_from_file_location(
+            "person_locale_probe", person_module.__file__
+        )
+        assert spec is not None and spec.loader is not None
+        probe = importlib.util.module_from_spec(spec)
+
+        with pytest.raises(ValueError, match="cannot be quoted"):
+            spec.loader.exec_module(probe)
+
+
+class TestSearchPeople:
+    async def test_search_people_omits_orphaned_references(self, mock_page):
+        scraper = _scraper(mock_page)
+        with _results(
+            scraper,
+            extracted(
+                "",
+                [
+                    {
+                        "kind": "person",
+                        "url": "/in/testuser/",
+                        "text": "Test User",
+                    }
+                ],
+            ),
+        ) as capture:
+            result = await scraper.search_people("python")
+
+        assert capture.call_args.args[2].mode is CaptureMode.SEARCH_RESULTS
+        assert result["sections"] == {}
+        assert "references" not in result
+
+    async def test_search_people_network_filter_first_degree(self, mock_page):
+        scraper = _scraper(mock_page)
+        with _results(scraper, extracted("Jane Doe")):
+            result = await scraper.search_people("engineer", network=["F"])
+
+        assert "network=%5B%22F%22%5D" in result["url"]
+
+    async def test_search_people_network_filter_multi_degree(self, mock_page):
+        scraper = _scraper(mock_page)
+        with _results(scraper, extracted("Jane Doe")):
+            result = await scraper.search_people("engineer", network=["F", "S"])
+
+        assert "network=%5B%22F%22%2C%22S%22%5D" in result["url"]
+
+    async def test_search_people_current_company_filter(self, mock_page):
+        scraper = _scraper(mock_page)
+        with _results(scraper, extracted("Jane Doe")) as capture:
+            result = await scraper.search_people("engineer", current_company="1115")
+
+        assert "currentCompany=%5B%221115%22%5D" in result["url"]
+        # An id needs no resolution: the one navigation is the results page.
+        assert capture.await_count == 1
+
+    async def test_search_people_invalid_network_token_raises(self, mock_page):
+        scraper = _scraper(mock_page)
+        with pytest.raises(ValueError, match="Invalid network token"):
+            await scraper.search_people("engineer", network=["X"])
+
+        mock_page.goto.assert_not_awaited()
+
+    async def test_search_people_resolves_company_name(self, mock_page):
+        """A name goes through ``resolve_company_urn`` and the facet carries
+        the id it returned, never the name."""
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, extracted("Jane Doe")),
+            patch.object(
+                scraper._facets,
+                "resolve_company_urn",
+                new_callable=AsyncMock,
+                return_value="1115",
+            ) as resolve,
+        ):
+            result = await scraper.search_people("engineer", current_company="SAP")
+
+        resolve.assert_awaited_once_with("SAP")
+        assert "currentCompany=%5B%221115%22%5D" in result["url"]
+        assert "SAP" not in result["url"]
+
+    async def test_search_people_unicode_digit_company_is_not_a_urn(
+        self, mock_page, tmp_path
+    ):
+        """LinkedIn URN ids are ASCII decimal; Unicode digits are a name to
+        resolve (``str.isdigit()`` would have passed them through), and one
+        nothing matches raises."""
+        scraper = _scraper(mock_page)
+        scraper._facets._company_cache = CompanyCache(tmp_path)
+        with _results(scraper, extracted("No results")) as nav:
+            with pytest.raises(FilterValidationError, match="Could not resolve"):
+                await scraper.search_people("engineer", current_company="١١١٥")
+
+        assert nav.await_count == 1
+        assert "results/people" not in nav.await_args_list[-1].args[0]
+
+    async def test_search_people_empty_current_company_is_noop(self, mock_page):
+        scraper = _scraper(mock_page)
+        with _results(scraper, extracted("Jane Doe")):
+            result = await scraper.search_people("engineer", current_company="")
+
+        assert "currentCompany" not in result["url"]
+
+    async def test_search_people_combines_all_filters(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, extracted("Jane Doe")),
+            # location is resolved to a numeric geo id via the site dropdown;
+            # stub the resolver so this stays a pure URL-building test.
+            patch.object(
+                scraper._facets,
+                "resolve_geo_urn",
+                new_callable=AsyncMock,
+                return_value="104116203",
+            ) as resolve,
+        ):
+            result = await scraper.search_people(
+                "engineer",
+                location="Seattle",
+                network=["F"],
+                current_company="1115",
+            )
+
+        resolve.assert_awaited_once_with("Seattle")
+        assert "keywords=engineer" in result["url"]
+        # location becomes a resolved geoUrn facet, not a free-text location=.
+        assert "geoUrn=%5B%22104116203%22%5D" in result["url"]
+        assert "location=Seattle" not in result["url"]
+        assert "network=%5B%22F%22%5D" in result["url"]
+        assert "currentCompany=%5B%221115%22%5D" in result["url"]
+
+    async def test_search_people_unresolvable_location_raises(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, extracted("Jane Doe")) as nav,
+            patch.object(
+                scraper._facets,
+                "resolve_geo_urn",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            with pytest.raises(FilterValidationError, match="Could not resolve"):
+                await scraper.search_people("engineer", location="Nowhereland")
+
+        nav.assert_not_awaited()
+
+
+class TestSearchPeopleFacets:
+    """Facets are validated, then resolved, then searched -- in that order."""
+
+    async def test_no_criterion_raises_without_navigating(self, mock_page):
+        scraper = _scraper(mock_page)
+        with _results(scraper, extracted("Jane Doe")) as nav:
+            with pytest.raises(FilterValidationError, match="at least one of"):
+                await scraper.search_people()
+            with pytest.raises(FilterValidationError, match="at least one of"):
+                await scraper.search_people("", current_company="", industry=[])
+
+        nav.assert_not_awaited()
+
+    async def test_title_alone_is_refused(self, mock_page):
+        """LinkedIn ignores titleFreeText, so a lone title would navigate and
+        return the unfiltered worldwide list."""
+        scraper = _scraper(mock_page)
+        with _results(scraper, extracted("Jane Doe")) as nav:
+            with pytest.raises(FilterValidationError, match="title alone") as info:
+                await scraper.search_people(title="Head of Sales")
+
+        nav.assert_not_awaited()
+        assert "keywords='\"Head of Sales\"'" in str(info.value)
+
+    async def test_title_with_location_navigates(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, extracted("Jane Doe")) as nav,
+            patch.object(
+                scraper._facets,
+                "resolve_geo_urn",
+                new_callable=AsyncMock,
+                return_value="104116203",
+            ),
+        ):
+            result = await scraper.search_people(
+                title="Head of Sales", location="Seattle"
+            )
+
+        nav.assert_awaited_once()
+        assert result["url"] == (
+            "https://www.linkedin.com/search/results/people/"
+            "?geoUrn=%5B%22104116203%22%5D&titleFreeText=Head+of+Sales"
+        )
+
+    @pytest.mark.parametrize(
+        "facet",
+        [
+            pytest.param({"industry": ["Basket Weaving"]}, id="industry"),
+            pytest.param({"school": "Stanford University"}, id="school"),
+            pytest.param({"profile_language": ["en-US"]}, id="language"),
+            pytest.param({"network": ["X"]}, id="network"),
+        ],
+    )
+    async def test_an_invalid_facet_is_refused_before_anything_resolves(
+        self, mock_page, facet
+    ):
+        """Every pure check runs first: a typo beside a company name must not
+        cost the company lookup, which is up to two navigations."""
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, extracted("Jane Doe")) as nav,
+            patch.object(
+                scraper._facets,
+                "resolve_company_urn",
+                new_callable=AsyncMock,
+                return_value="1115",
+            ) as resolve,
+            patch.object(
+                scraper._facets,
+                "resolve_geo_urn",
+                new_callable=AsyncMock,
+                return_value="104116203",
+            ) as resolve_geo,
+        ):
+            with pytest.raises(FilterValidationError):
+                await scraper.search_people(
+                    "engineer", location="Seattle", current_company="SAP", **facet
+                )
+
+        resolve.assert_not_awaited()
+        resolve_geo.assert_not_awaited()
+        nav.assert_not_awaited()
+
+    async def test_current_company_list_is_resolved_per_element(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, extracted("Jane Doe")),
+            patch.object(
+                scraper._facets,
+                "resolve_company_urn",
+                new_callable=AsyncMock,
+                side_effect=["1115", "1441"],
+            ) as resolve,
+        ):
+            result = await scraper.search_people(
+                "engineer", current_company=["SAP", "Google"]
+            )
+
+        assert resolve.await_args_list == [call("SAP"), call("Google")]
+        assert "currentCompany=%5B%221115%22%2C%221441%22%5D" in result["url"]
+
+    async def test_past_company_names_resolve_to_urns(self, mock_page):
+        """A string or a list; each element goes through the company
+        resolver and only ids reach ``pastCompany``."""
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, extracted("Jane Doe")),
+            patch.object(
+                scraper._facets,
+                "resolve_company_urn",
+                new_callable=AsyncMock,
+                side_effect=lambda name: {"SAP": "1115", "1441": "1441"}[name],
+            ) as resolve,
+        ):
+            single = await scraper.search_people(past_company="SAP")
+            many = await scraper.search_people(past_company=["SAP", "1441"])
+
+        assert resolve.await_count == 3
+        assert "pastCompany=%5B%221115%22%5D" in single["url"]
+        assert "SAP" not in single["url"]
+        assert "pastCompany=%5B%221115%22%2C%221441%22%5D" in many["url"]
+        assert "currentCompany" not in many["url"]
+
+    async def test_companies_resolve_before_the_location(self, mock_page):
+        """The company lookup is the expensive hop, so it goes first: a name
+        that fails to resolve never pays for the location dropdown."""
+        scraper = _scraper(mock_page)
+        order: list[str] = []
+
+        async def resolve_company(name: str) -> str:
+            order.append(f"company:{name}")
+            return "1115"
+
+        async def resolve_geo(location: str) -> str:
+            order.append(f"geo:{location}")
+            return "104116203"
+
+        with (
+            _results(scraper, extracted("Jane Doe")),
+            patch.object(scraper._facets, "resolve_company_urn", resolve_company),
+            patch.object(scraper._facets, "resolve_geo_urn", resolve_geo),
+        ):
+            await scraper.search_people(
+                location="Seattle", current_company="SAP", past_company="Google"
+            )
+
+        assert order == ["company:SAP", "company:Google", "geo:Seattle"]
+
+    async def test_company_resolution_is_spaced_from_the_first_results_page(
+        self, mock_page
+    ):
+        """A resolution navigates; the people search that follows gets the
+        same pause as a later results page, and a search with nothing to
+        resolve gets none."""
+        scraper = _scraper(mock_page)
+
+        async def resolve(name: str) -> str:
+            scraper._facets.navigated = True
+            return "1115"
+
+        with (
+            _results(scraper, extracted("Jane Doe")),
+            patch.object(scraper._facets, "resolve_company_urn", resolve),
+            patch.object(search_pages_module, "nav_delay", return_value=7.0),
+            _identity_jitter(),
+            _sleep() as sleep,
+        ):
+            await scraper.search_people("engineer")
+            sleep.assert_not_awaited()
+            await scraper.search_people(current_company="SAP")
+
+        sleep.assert_awaited_once_with(7.0)
+
+    async def test_school_id_is_not_a_navigation(self, mock_page):
+        """An id needs no resolution, so a school alone costs no pause
+        before the first results page (unlike a company that resolved)."""
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, extracted("Jane Doe")) as nav,
+            _sleep() as sleep,
+        ):
+            result = await scraper.search_people(school=" 1792 ")
+
+        sleep.assert_not_awaited()
+        nav.assert_awaited_once()
+        assert result["url"].endswith("?schoolFilter=%5B%221792%22%5D")
+
+    async def test_every_facet_reaches_the_url_in_recorded_order(self, mock_page):
+        """Each keyword is forwarded to the builder under its own name; a
+        swapped pair (first/last name, current/past company) shows here."""
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, extracted("Jane Doe")),
+            patch.object(
+                scraper._facets,
+                "resolve_geo_urn",
+                new_callable=AsyncMock,
+                return_value="104116203",
+            ),
+        ):
+            result = await scraper.search_people(
+                "engineer",
+                location="Seattle",
+                network=["F"],
+                current_company="1115",
+                title="CTO",
+                past_company="1441",
+                industry="4",
+                school="1792",
+                first_name="Jane",
+                last_name="Doe",
+                profile_language="en",
+            )
+
+        assert result["url"] == (
+            "https://www.linkedin.com/search/results/people/?keywords=engineer"
+            "&geoUrn=%5B%22104116203%22%5D&network=%5B%22F%22%5D"
+            "&currentCompany=%5B%221115%22%5D&pastCompany=%5B%221441%22%5D"
+            "&industry=%5B%224%22%5D&schoolFilter=%5B%221792%22%5D"
+            "&titleFreeText=CTO&firstName=Jane&lastName=Doe"
+            "&profileLanguage=%5B%22en%22%5D"
+        )
+
+
+class TestSearchPeoplePagination:
+    """``max_pages`` walks LinkedIn's ``&page=N`` facet (issue #526)."""
+
+    @staticmethod
+    def _page(n: int) -> ExtractedSection:
+        """One results page holding a single, page-unique person."""
+        return extracted(
+            f"Person {n}",
+            [{"kind": "person", "url": f"/in/person{n}/", "text": f"Person {n}"}],
+        )
+
+    async def test_default_fetches_only_first_page(self, mock_page):
+        scraper = _scraper(mock_page)
+        with _results(scraper, self._page(1), self._page(2)) as fetch:
+            result = await scraper.search_people("engineer")
+
+        assert fetch.await_count == 1
+        assert "&page=" not in fetch.await_args_list[0].args[0]
+        assert result["sections"]["search_results"] == "Person 1"
+
+    async def test_pages_are_joined_and_references_merged(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, self._page(1), self._page(2), self._page(3)) as fetch,
+            patch.object(search_pages_module, "nav_delay", return_value=7.0),
+            _identity_jitter(),
+            _sleep() as sleep,
+        ):
+            result = await scraper.search_people("engineer", max_pages=3)
+
+        assert fetch.await_count == 3
+        urls = [c.args[0] for c in fetch.await_args_list]
+        assert "&page=" not in urls[0]
+        assert urls[1].endswith("&page=2")
+        assert urls[2].endswith("&page=3")
+        # Paced between pages, not before the first, at the navigation delay.
+        assert sleep.await_args_list == [call(7.0), call(7.0)]
+        assert (
+            result["sections"]["search_results"]
+            == "Person 1\n---\nPerson 2\n---\nPerson 3"
+        )
+        assert [r["url"] for r in result["references"]["search_results"]] == [
+            "/in/person1/",
+            "/in/person2/",
+            "/in/person3/",
+        ]
+        # Paged results collapse onto the unpaged URL, so the caller can rerun it.
+        assert "&page=" not in result["url"]
+
+    async def test_stops_when_a_page_repeats_people(self, mock_page):
+        """Running past the last page re-serves it; stop instead of looping."""
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, self._page(1), self._page(1), self._page(3)) as fetch,
+            _sleep(),
+        ):
+            result = await scraper.search_people("engineer", max_pages=10)
+
+        assert fetch.await_count == 2
+        # The repeated page is kept -- it is real text, just not new people.
+        assert result["sections"]["search_results"] == "Person 1\n---\nPerson 1"
+        assert [r["url"] for r in result["references"]["search_results"]] == [
+            "/in/person1/"
+        ]
+
+    async def test_rate_limit_midway_keeps_earlier_pages(self, mock_page):
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, self._page(1), extracted(RATE_LIMITED_SECTION_TEXT)),
+            _sleep(),
+        ):
+            result = await scraper.search_people("engineer", max_pages=5)
+
+        assert result["sections"]["search_results"] == "Person 1"
+        assert result["section_errors"]["search_results"]["error_type"] == "rate_limit"
+
+
+def _person_card(name: str, headline: str, location: str) -> str:
+    return f"{name} • 2nd\n\n{headline}\n\n{location}"
+
+
+def _person_ref(slug: str, name: str) -> Reference:
+    return {"kind": "person", "url": f"/in/{slug}/", "text": name}
+
+
+class TestSearchPeopleRows:
+    """``people`` rows come from ``search_parse`` per page, before the join.
+
+    The pages here are synthetic containers in the shape the parser's
+    docstring names -- a claim about the wiring, not about LinkedIn; the
+    parser's own suite holds the live fixtures.
+    """
+
+    # Ada / Bob on page 1, Bob again / Cy / Dee on page 2. Bob is the row a
+    # naive concatenation would double, and the last card of page 1, whose
+    # location would swallow the ``---`` separator and page 2's header if the
+    # pages were joined before parsing. Dee has no anchor.
+    PAGE_1 = "About 1,234 results\n\n" + "\n\n".join(
+        [
+            _person_card("Ada", "Engineer at Example", "London, United Kingdom"),
+            _person_card("Bob", "Founder", "Berlin, Germany"),
+        ]
+    )
+    PAGE_2 = "About 999 results\n\n" + "\n\n".join(
+        [
+            _person_card("Bob", "Founder", "Berlin, Germany"),
+            _person_card("Cy", "Designer", "Paris, France"),
+            _person_card("Dee", "Writer", "Rome, Italy"),
+        ]
+    )
+
+    @classmethod
+    def _pages(cls) -> list[ExtractedSection]:
+        return [
+            extracted(
+                cls.PAGE_1, [_person_ref("ada", "Ada"), _person_ref("bob", "Bob")]
+            ),
+            extracted(cls.PAGE_2, [_person_ref("bob", "Bob"), _person_ref("cy", "Cy")]),
+        ]
+
+    async def test_rows_are_parsed_per_page_and_deduped_by_url(self, mock_page):
+        scraper = _scraper(mock_page)
+        with _results(scraper, *self._pages()), _sleep():
+            result = await scraper.search_people("engineer", max_pages=2)
+
+        assert [(row["name"], row["url"]) for row in result["people"]] == [
+            ("Ada", "/in/ada/"),
+            ("Bob", "/in/bob/"),
+            ("Cy", "/in/cy/"),
+            ("Dee", None),
+        ]
+        assert result["people"][1] == {
+            "name": "Bob",
+            "degree": "2nd",
+            "headline": "Founder",
+            "location": "Berlin, Germany",
+            "snippet": None,
+            "url": "/in/bob/",
+        }
+        assert result["result_count"] == 1234
+        # The raw text keeps its shape alongside the rows.
+        assert result["sections"]["search_results"] == (
+            self.PAGE_1 + "\n---\n" + self.PAGE_2
+        )
+
+    async def test_a_parser_failure_keeps_the_raw_text(self, mock_page, caplog):
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, self._pages()[0]),
+            patch.object(
+                person_module,
+                "parse_people_cards",
+                side_effect=RuntimeError("parser bug"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            result = await scraper.search_people("engineer")
+
+        assert result["people"] == []
+        assert result["result_count"] == 1234
+        assert result["sections"]["search_results"] == self.PAGE_1
+        assert "Could not parse result cards on page 1" in caplog.text
+
+    async def test_anchors_without_rows_warn_of_an_unrecognised_layout(
+        self, mock_page, caplog
+    ):
+        """A page with profile anchors is a page of cards. Parsing none of
+        them is a layout the text parser does not know (or a locale whose
+        degree token differs), not an empty result, and must not pass as
+        one in silence."""
+        # The cards carry no ``• 2nd`` head, as a non-English page might.
+        page = "About 12 results\n\nAda\nIngenieurin\nBerlin\n\nBob\nGruender\nWien"
+        scraper = _scraper(mock_page)
+        with (
+            _results(
+                scraper,
+                extracted(page, [_person_ref("ada", "Ada"), _person_ref("bob", "Bob")]),
+            ),
+            caplog.at_level(logging.WARNING, logger="linkedin_mcp_server.scraping"),
+        ):
+            result = await scraper.search_people("engineer")
+
+        assert result["people"] == []
+        assert [r.message for r in caplog.records if r.levelno == logging.WARNING] == [
+            "Page 1: 2 references but no result rows parsed (unrecognised card "
+            "layout or locale)"
+        ]
+
+    async def test_a_page_without_anchors_or_rows_does_not_warn(
+        self, mock_page, caplog
+    ):
+        scraper = _scraper(mock_page)
+        with (
+            _results(scraper, extracted("No results found")),
+            caplog.at_level(logging.WARNING, logger="linkedin_mcp_server.scraping"),
+        ):
+            result = await scraper.search_people("engineer")
+
+        assert result["people"] == []
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    async def test_no_page_means_no_rows(self, mock_page):
+        scraper = _scraper(mock_page)
+        with _results(scraper, extracted(RATE_LIMITED_SECTION_TEXT)):
+            result = await scraper.search_people("engineer")
+
+        assert result["people"] == []
+        assert result["result_count"] is None
+
+    async def test_rows_pair_before_the_reference_cap(self, mock_page):
+        # Six cards naming two mutual connections each is 18 ``/in/``
+        # anchors, three past the section cap. The page is extracted
+        # uncapped so card six still finds its own anchor; the cap lands on
+        # ``references`` instead.
+        cards, refs = [], []
+        for i in range(1, 7):
+            cards.append(
+                _person_card(f"Person {i}", "Engineer", "Oslo, Norway")
+                + f"\n\nMutual {i}A & Mutual {i}B are mutual connections"
+            )
+            refs.append(_person_ref(f"person-{i}", f"Person {i}"))
+            refs.append(_person_ref(f"mutual-{i}a", f"Mutual {i}A"))
+            refs.append(_person_ref(f"mutual-{i}b", f"Mutual {i}B"))
+        scraper = _scraper(mock_page)
+        with _results(scraper, extracted("\n\n".join(cards), refs)) as capture:
+            result = await scraper.search_people("engineer")
+
+        assert capture.await_args is not None
+        assert capture.await_args.args[2].apply_cap is False
+        assert [r["url"] for r in result["people"]] == [
+            f"/in/person-{i}/" for i in range(1, 7)
+        ]
+        assert len(result["references"]["search_results"]) == 15

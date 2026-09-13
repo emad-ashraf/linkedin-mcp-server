@@ -1266,7 +1266,7 @@ class TestEnrichCompanyDeep:
         """Mock the two calls the tool now makes: scrape_company(about) -- which
         yields the firmographics and the company URN reference -- and
         extract_page(job-search URL) for the open-roles count."""
-        from linkedin_mcp_server.scraping.extractor import ExtractedSection
+        from linkedin_mcp_server.scraping.contracts import ExtractedSection
 
         mock = MagicMock()
         mock.scrape_company = AsyncMock(
@@ -1335,15 +1335,15 @@ class TestEnrichCompanyDeep:
         """extract_page can return the soft rate-limit sentinel WITHOUT raising.
         Caching it would serve a failed lookup as fresh for the jobs TTL, so the
         jobs half must stay stale (unrecorded) instead."""
-        from linkedin_mcp_server.scraping.extractor import (
-            _RATE_LIMITED_MSG,
+        from linkedin_mcp_server.scraping.contracts import (
+            RATE_LIMITED_SECTION_TEXT,
             ExtractedSection,
         )
 
         cache, _ = wired
         extractor = self._deep_extractor()
         extractor.extract_page = AsyncMock(
-            return_value=ExtractedSection(text=_RATE_LIMITED_MSG, references=[])
+            return_value=ExtractedSection(text=RATE_LIMITED_SECTION_TEXT, references=[])
         )
 
         fn = await get_tool_fn(mcp, "enrich_company_deep")

@@ -76,7 +76,7 @@ from linkedin_mcp_server.scraping.company_parse import (
     parse_job_search,
     parse_search_results,
 )
-from linkedin_mcp_server.scraping.extractor import _RATE_LIMITED_MSG
+from linkedin_mcp_server.scraping.contracts import RATE_LIMITED_SECTION_TEXT
 from linkedin_mcp_server.tools.enrichment import (
     RETRY_AFTER_QUEUED_OUT,
     _browser_gone,
@@ -698,7 +698,7 @@ def register_company_enrichment_tools(
                 # real data. Only record on a genuine page; the load happened
                 # either way, so it still costs a budget action, and the jobs
                 # half stays stale so the next call retries.
-                if text and text != _RATE_LIMITED_MSG and not extracted.error:
+                if text and text != RATE_LIMITED_SECTION_TEXT and not extracted.error:
                     parsed = parse_job_search(text)
                     cache.record_jobs(
                         company,
