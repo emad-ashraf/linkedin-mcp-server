@@ -291,6 +291,8 @@ class TestRunBunch:
         assert out["next_run_after_seconds"] >= 3600
         assert store.load("j").pending == ["a", "b"]
         assert store.load("j").failed == {}
+        # Unread, but requested: the throttled load counts against the cap.
+        assert out["account_spent_last_24h"] == 1
 
     async def test_a_session_expiry_keeps_the_profile_queued(
         self, mcp, store, mock_context
@@ -854,6 +856,21 @@ class TestStatus:
         fn = await get_tool_fn(mcp, "get_enrichment_status")
         with pytest.raises(ToolError, match="No job named"):
             await fn("nope")
+
+    async def test_the_budget_record_cannot_be_read_as_a_job(
+        self, mcp, store, mock_context
+    ):
+        # Listing hides the budget record; naming it must not load it either,
+        # or its action history and pacing settings leak out as "results".
+        assert store.exists(ACCOUNT_BUDGET_JOB)
+
+        status = await get_tool_fn(mcp, "get_enrichment_status")
+        with pytest.raises(ToolError, match="reserved"):
+            await status(ACCOUNT_BUDGET_JOB)
+
+        run = await get_tool_fn(mcp, "run_enrichment_bunch")
+        with pytest.raises(ToolError, match="reserved"):
+            await run(ACCOUNT_BUDGET_JOB, mock_context, extractor=MagicMock())
 
 
 class TestConfigurableLimits:

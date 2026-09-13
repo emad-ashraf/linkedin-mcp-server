@@ -8,6 +8,8 @@ from urllib.parse import quote_plus
 import logging
 import re
 
+from patchright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from linkedin_mcp_server.company_cache import CompanyCache, normalize_company_name
 from linkedin_mcp_server.core.humanize import human_type
 from linkedin_mcp_server.scraping.capture import (
@@ -53,6 +55,14 @@ def _company_urn_of_first_card(references: list[Reference]) -> str | None:
             if value:
                 return str(value)
     return None
+
+
+# The jobs-search typeahead renders its suggestions from a network round trip
+# and selecting one navigates. Both are bounded so a stalled page reads as a
+# miss rather than hanging the tool call.
+TYPEAHEAD_TIMEOUT_MS = 5000
+GEO_ID_PATTERN = re.compile(r"[?&]geoId=(\d+)")
+LOCATION_BOX_SELECTOR = "input[id*='jobs-search-box-location']"
 
 
 class FacetResolver:
@@ -101,7 +111,9 @@ class FacetResolver:
         geoUrn. Works for any country/city LinkedIn's own dropdown knows.
 
         Returns the id, or ``None`` if the dropdown offered no match. Results
-        are cached per resolver so a repeated region costs one resolution.
+        are cached per resolver so a repeated region costs one resolution; a
+        dropdown that never opened is not, since a timeout says nothing about
+        the name.
         """
         key = location.casefold()
         if key in self._geo_cache:
@@ -112,34 +124,32 @@ class FacetResolver:
             "https://www.linkedin.com/jobs/search/?keywords="
         )
         self.navigated = True
-        box = None
-        for sel in (
-            "input[id*='jobs-search-box-location']",
-            "input[aria-label='City, state, or zip code']",
-            "input[aria-label*='location' i]",
-        ):
-            box = await page.query_selector(sel)
-            if box:
-                break
+        # The id is structural; an ``aria-label`` fallback would carry the
+        # locale's own words for "location", which is exactly the kind of text
+        # match that reads as a miss on a non-English profile.
+        box = await page.query_selector(LOCATION_BOX_SELECTOR)
 
-        geo_id: str | None = None
-        if box is not None:
-            await box.click()
-            await box.fill("")
-            # Type it like a person; the dropdown resolves as we type.
-            await human_type(page, location)
-            await self._session.pace(1.5)
-            suggestion = await page.query_selector(
-                ".basic-typeahead__selectable, [role=option]"
-            )
-            if suggestion is not None:
-                await suggestion.click()
-                await self._session.pace(1.0)
-                match = re.search(r"[?&]geoId=(\d+)", page.url)
-                if match:
-                    geo_id = match.group(1)
-
-        # Cache the outcome (including a miss) to avoid re-driving the dropdown.
+        if box is None:
+            return None
+        await box.click()
+        await box.fill("")
+        # Type it like a person; the dropdown resolves as we type.
+        await human_type(page, location)
+        suggestion = await self._first_location_suggestion(box)
+        if suggestion is None:
+            # A dropdown that never opened is a stalled page as often as an
+            # unknown name; remembering it would pin a valid location as a
+            # miss for the rest of the batch.
+            return None
+        await suggestion.click()
+        try:
+            await page.wait_for_url(GEO_ID_PATTERN, timeout=TYPEAHEAD_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            pass
+        match = GEO_ID_PATTERN.search(page.url)
+        geo_id = match.group(1) if match else None
+        # LinkedIn answered, with or without an id: cache either so a repeated
+        # name does not re-drive the dropdown.
         self._geo_cache[key] = geo_id or ""
         return geo_id
 
@@ -275,7 +285,7 @@ class FacetResolver:
             )
         self._company_urn_cache[key] = urn
         # The write-back is an optimisation, not the result: ``_path`` refuses
-        # a name that normalises to nothing ("Group", "Co") with ValueError.
+        # a name that normalises to nothing (punctuation only) with ValueError.
         try:
             self._company_cache.record_firmographics(
                 cache_name,
@@ -300,3 +310,26 @@ class FacetResolver:
             f"({why}). Pass the numeric id instead: get_company_profile "
             f'exposes it under references["about"] as kind "company_urn".'
         )
+
+    async def _first_location_suggestion(self, box):
+        """Wait for the location box's own dropdown and return its top option.
+
+        The jobs page carries other ``role=option`` elements (the keyword
+        typeahead, filter menus), so a document-wide query can land on one of
+        those and either drop the geoId or navigate to the wrong region. The
+        combobox pattern names its listbox in ``aria-controls`` (or the older
+        ``aria-owns``); that scope is structural and locale-independent. With
+        neither attribute, any listbox is the one that just opened under the
+        typed text. The first match is the top suggestion, which is the one a
+        person picks.
+        """
+        listbox_id = await box.get_attribute(
+            "aria-controls"
+        ) or await box.get_attribute("aria-owns")
+        scope = f'[id="{listbox_id}"]' if listbox_id else "[role=listbox]"
+        try:
+            return await self._session.page.wait_for_selector(
+                f"{scope} [role=option]", timeout=TYPEAHEAD_TIMEOUT_MS
+            )
+        except PlaywrightTimeoutError:
+            return None

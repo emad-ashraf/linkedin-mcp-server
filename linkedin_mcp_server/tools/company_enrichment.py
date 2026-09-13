@@ -77,6 +77,7 @@ from linkedin_mcp_server.scraping.company_parse import (
     parse_search_results,
 )
 from linkedin_mcp_server.scraping.contracts import RATE_LIMITED_SECTION_TEXT
+from linkedin_mcp_server.scraping.identifiers import company_page_url
 from linkedin_mcp_server.tools.enrichment import (
     RETRY_AFTER_QUEUED_OUT,
     _browser_gone,
@@ -215,7 +216,8 @@ def register_company_enrichment_tools(
         outstanding and nothing is charged).
 
         Args:
-            company_names: Company names or LinkedIn company URLs.
+            company_names: Company names or LinkedIn company URLs. A URL
+                needs no search; it is worked on, and reported, as its slug.
             bunch_searches: Max LinkedIn navigations to run this call
                 (default 8, ceiling 20 unless BUNCH_SEARCHES_MAX moves it;
                 more is clamped): searches, plus About loads when ``about``
@@ -259,6 +261,18 @@ def register_company_enrichment_tools(
         for name in company_names:
             if not name.strip():
                 continue
+            if "/company/" in name:
+                # A URL already says what a search would find: the slug.
+                # Searched anyway it cost a navigation and, matched against
+                # the URL's own words, came back with no confident match. Work
+                # on the slug so the cache, the About load and the result
+                # share one key, and seed the URL a search would have cached.
+                name = _slug(name)
+                rec = cache.get(name)
+                if rec is None or not rec.linkedin_url:
+                    cache.record_firmographics(
+                        name, now, source="search", linkedin_url=company_page_url(name)
+                    )
             rec = cache.get(name)
             if not refresh and _resolved(rec):
                 served[name] = _firmographics_view(rec, "cache")
@@ -635,10 +649,14 @@ def register_company_enrichment_tools(
             The company's cached-and-updated record, with per-half freshness.
         """
         now = datetime.now().astimezone()
-        rec = cache.get(company)
+        # One key for every cache access, the same one enrich_companies uses:
+        # a URL keyed raw is a different record from its slug, so what one
+        # tool wrote the other never finds.
+        slug = _slug(company)
+        rec = cache.get(slug)
 
-        want_firmographics = refresh or cache.needs_firmographics(company, now)
-        want_jobs = include_jobs and (refresh or cache.needs_jobs(company, now))
+        want_firmographics = refresh or cache.needs_firmographics(slug, now)
+        want_jobs = include_jobs and (refresh or cache.needs_jobs(slug, now))
         if not want_firmographics and not want_jobs:
             return {
                 "company": company,
@@ -659,15 +677,17 @@ def register_company_enrichment_tools(
         extractor = extractor or await get_ready_extractor(
             ctx, tool_name="enrich_company_deep"
         )
-        slug = _slug(company)
         urn = rec.company_urn if rec else ""
+        # Why the jobs half was not recorded, when it was wanted and the load
+        # came back unusable; the caller must not read that as a refresh.
+        jobs_failure: str | None = None
 
         try:
             # Firmographics from the About tab; also yields the numeric company
             # URN, which the open-roles lookup below is keyed on.
             if want_firmographics:
                 try:
-                    urn = await _load_about(extractor, company, slug, now, urn)
+                    urn = await _load_about(extractor, slug, slug, now, urn)
                 finally:
                     # Charged whether About loaded, was rate-limited,
                     # auth-walled or crashed: the navigation happened either
@@ -698,21 +718,30 @@ def register_company_enrichment_tools(
                 # real data. Only record on a genuine page; the load happened
                 # either way, so it still costs a budget action, and the jobs
                 # half stays stale so the next call retries.
-                if text and text != RATE_LIMITED_SECTION_TEXT and not extracted.error:
+                if text == RATE_LIMITED_SECTION_TEXT:
+                    jobs_failure = "rate_limited"
+                elif extracted.error:
+                    jobs_failure = str(
+                        extracted.error.get("error_message") or "extraction failed"
+                    )[:160]
+                elif not text:
+                    jobs_failure = "empty page"
+                else:
                     parsed = parse_job_search(text)
                     cache.record_jobs(
-                        company,
+                        slug,
                         now,
                         count=parsed.count,
                         sample=parsed.sample,
                         raw_jobs=text,
                     )
         except RateLimitError:
+            # Already charged: each navigation above records in its finally.
             jobs.save(budget)
             return {
                 "company": company,
                 "next_run_after_seconds": 3600,
-                **_firmographics_view(cache.get(company) or rec, "cache"),
+                **_firmographics_view(cache.get(slug) or rec, "cache"),
                 # After the view: an uncached company's view carries its own
                 # "unknown" status, and the rate limit is the answer here.
                 "status": "rate_limited",
@@ -726,12 +755,24 @@ def register_company_enrichment_tools(
             raise_tool_error(e, "enrich_company_deep")  # NoReturn
 
         jobs.save(budget)
+        if jobs_failure == "rate_limited":
+            return {
+                "company": company,
+                "status": "rate_limited",
+                "next_run_after_seconds": 3600,
+                **_firmographics_view(cache.get(slug) or rec, "cache"),
+            }
         out = {
             "company": company,
-            "status": "fetched",
-            **_firmographics_view(cache.get(company), "company_page"),
+            "status": "jobs_failed" if jobs_failure else "fetched",
+            **_firmographics_view(cache.get(slug), "company_page"),
         }
-        if want_jobs and not urn:
+        if jobs_failure:
+            out["jobs_note"] = (
+                f"Open roles not refreshed ({jobs_failure}); the cached jobs "
+                "half is left stale so the next call retries it."
+            )
+        elif want_jobs and not urn:
             out["jobs_note"] = (
                 "Open roles unavailable: no company URN known (fetch "
                 "firmographics first, or the About page exposed no id)."
@@ -753,7 +794,7 @@ def register_company_enrichment_tools(
         """
         if company is None:
             return {"cached_companies": cache.list_keys()}
-        rec = cache.get(company)
+        rec = cache.get(_slug(company))
         if rec is None:
             return {"company": company, "status": "not_cached"}
         now = datetime.now().astimezone()
@@ -863,7 +904,7 @@ def _firmographics_view(
 ) -> dict[str, Any]:
     if rec is None:
         return {"status": "unknown", "source": source, "raw_about": fallback_raw}
-    return {
+    view = {
         "display_name": rec.display_name,
         "industry": rec.industry,
         "employee_count": rec.employee_count,
@@ -880,6 +921,16 @@ def _firmographics_view(
         "firmographics_fetched_at": rec.firmographics_fetched_at,
         "jobs_fetched_at": rec.jobs_fetched_at,
     }
+    if rec.has_jobs() and rec.open_roles_count is None:
+        # The "N results" header is matched in English only, so on another
+        # locale the count is None on every fetch. The page is still stamped
+        # (refusing would leave jobs never fresh there); say so, or a None
+        # reads as a zero.
+        view["jobs_note"] = (
+            "Open roles count unparsed: the jobs page loaded but its results "
+            "header was not recognised (English only); the sample is intact."
+        )
+    return view
 
 
 def _paced_return(
