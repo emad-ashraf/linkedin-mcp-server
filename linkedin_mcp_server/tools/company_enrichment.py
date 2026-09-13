@@ -62,6 +62,7 @@ from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_er
 from linkedin_mcp_server.error_handler import raise_tool_error
 from linkedin_mcp_server.pacing import (
     JobStore,
+    bunch_searches_max,
     load_account_budget,
     next_bunch_delay,
     step_delay,
@@ -74,6 +75,13 @@ from linkedin_mcp_server.scraping.company_parse import (
     parse_search_results,
 )
 from linkedin_mcp_server.scraping.extractor import _RATE_LIMITED_MSG
+from linkedin_mcp_server.tools.enrichment import (
+    _browser_gone,
+    _BrowserGone,
+    _closed_target_filed,
+    _RelaunchFailed,
+    _soft_rate_limit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +117,12 @@ def register_company_enrichment_tools(
         on which tool asked. The caller charges the ledger for the load; this
         only reads and records.
         """
-        result = await extractor.scrape_company(slug, {"about"})
+        try:
+            result = await extractor.scrape_company(slug, {"about"})
+        except Exception as e:
+            if _browser_gone(e):
+                raise _BrowserGone(str(e)) from e
+            raise
         sections = result.get("sections", {})
         # scrape_company does not raise for a rate-limited, auth-walled or
         # crashed About load: it files the failure under section_errors and
@@ -122,12 +135,19 @@ def register_company_enrichment_tools(
         # to nothing is a real page and is recorded as such -- provided it
         # carries the About row labels. A rendered page with none of them (a
         # "page isn't available" body, a redirect) is not an About at all,
-        # and recording it would stamp nothing fresh for the whole TTL.
+        # and recording it would stamp nothing fresh for the whole TTL. No
+        # section at all is the other thing: nothing loaded, which is what a
+        # dead browser looks like from here -- but only when the filed error
+        # says so (see ``_BrowserGone``); a timed-out or auth-walled About is
+        # a failed load like any other.
         if "about" not in sections:
-            error = result.get("section_errors", {}).get("about", {})
+            errors = result.get("section_errors", {})
+            error = errors.get("about", {})
             message = error.get("error_message") or "About section did not load."
             if error.get("error_type") == "rate_limit":
                 raise RateLimitError(message)
+            if _closed_target_filed(errors):
+                raise _BrowserGone(message, errors)
             raise ScrapingError(message)
         about = sections["about"]
         fields = parse_about(about)
@@ -161,7 +181,7 @@ def register_company_enrichment_tools(
     async def enrich_companies(
         company_names: list[str],
         ctx: Context,
-        bunch_searches: Annotated[int, Field(ge=1, le=20)] = 8,
+        bunch_searches: Annotated[int, Field(ge=1)] = 8,
         about: bool = False,
         refresh: bool = False,
         ignore_schedule: bool = False,
@@ -187,13 +207,16 @@ def register_company_enrichment_tools(
 
         Stops early, persisting everything, when the bunch is done, the shared
         rolling-24h action budget is spent, the working window closes, the tool
-        deadline nears, or LinkedIn rate-limits.
+        deadline nears, LinkedIn rate-limits, or the browser has gone away and
+        a relaunch did not bring it back (browser_unavailable: the name stays
+        outstanding and nothing is charged).
 
         Args:
             company_names: Company names or LinkedIn company URLs.
-            bunch_searches: Max LinkedIn navigations to run this call (1-20,
-                default 8): searches, plus About loads when ``about`` is on.
-                Cache hits do not count toward it.
+            bunch_searches: Max LinkedIn navigations to run this call
+                (default 8, ceiling 20 unless BUNCH_SEARCHES_MAX moves it;
+                more is clamped): searches, plus About loads when ``about``
+                is on. Cache hits do not count toward it.
             about: Also read each resolved company's About tab (default
                 False). One extra navigation per company.
             refresh: Re-fetch even companies whose cache is still fresh.
@@ -205,6 +228,13 @@ def register_company_enrichment_tools(
         """
         if not company_names:
             raise ToolError("company_names is empty.")
+
+        ceiling = bunch_searches_max()
+        if bunch_searches > ceiling:
+            logger.info(
+                "Clamping bunch_searches=%d to the ceiling %d", bunch_searches, ceiling
+            )
+            bunch_searches = ceiling
 
         now = datetime.now().astimezone()
         budget = load_account_budget(jobs, now)
@@ -284,6 +314,64 @@ def register_company_enrichment_tools(
                 about_loaded=about_loaded,
             )
 
+        async def _search(name: str) -> dict[str, Any]:
+            """One company search, with both shapes of a dead browser raised
+            as ``_BrowserGone`` and a soft rate limit raised as such."""
+            try:
+                # ty: `nonlocal` rebinding in _relaunch loses the narrowing
+                # from the acquisition above, so read it as what it is.
+                live: Any = extractor
+                result = await live.search_companies(name)
+            except Exception as e:
+                if _browser_gone(e):
+                    raise _BrowserGone(str(e)) from e
+                raise
+            if not result.get("sections"):
+                # With nothing loaded, a filed rate limit is the whole answer,
+                # and it is a rate limit, not a dead browser.
+                if limit := _soft_rate_limit(result):
+                    raise RateLimitError(limit)
+                errors = result.get("section_errors", {})
+                if _closed_target_filed(errors):
+                    raise _BrowserGone("search page came back empty", errors)
+            return result
+
+        async def _relaunch(name: str) -> None:
+            # Re-acquiring goes through get_or_create_browser, which relaunches
+            # a dead browser; the extractor is bound to the old page, so it is
+            # re-created too. The caller retries the same navigation once.
+            nonlocal extractor
+            logger.warning("browser gone under %s; relaunching and retrying once", name)
+            try:
+                extractor = await get_ready_extractor(ctx, tool_name="enrich_companies")
+            except Exception as e:
+                raise _RelaunchFailed(e) from e
+
+        def _relaunch_failed(e: _RelaunchFailed) -> NoReturn:
+            # The name was never loaded and stays outstanding, uncharged.
+            jobs.save(budget)
+            raise_tool_error(e.cause, "enrich_companies")
+
+        def _browser_unavailable(e: _BrowserGone) -> dict[str, Any]:
+            # A closed browser is not a fact about the company; nothing was
+            # loaded, so nothing is charged, and the name stays outstanding.
+            logger.warning("Browser unavailable during company enrichment: %s", e)
+            jobs.save(budget)
+            out = _paced_return(
+                served,
+                spent,
+                "browser_unavailable",
+                60.0,
+                detail=(
+                    "The browser is gone and a relaunch did not bring it back; "
+                    "nothing was loaded and nothing was charged. Progress saved."
+                ),
+                about_loaded=about_loaded,
+            )
+            if e.section_errors:
+                out["section_errors"] = e.section_errors
+            return out
+
         async def _session_expired(e: AuthenticationError) -> NoReturn:
             # An expired session fails every remaining navigation the same
             # way, so the bunch stops here rather than burning one load per
@@ -322,7 +410,15 @@ def register_company_enrichment_tools(
             # ``about``) skips straight to the About load below.
             if refresh or rec is None or not rec.linkedin_url:
                 try:
-                    result = await extractor.search_companies(name)
+                    try:
+                        result = await _search(name)
+                    except _BrowserGone:
+                        await _relaunch(name)
+                        result = await _search(name)
+                except _RelaunchFailed as e:
+                    _relaunch_failed(e)
+                except _BrowserGone as e:
+                    return _browser_unavailable(e)
                 except RateLimitError as e:
                     logger.warning("Rate limited during company enrichment: %s", e)
                     # The refused navigation is one LinkedIn counted too.
@@ -412,9 +508,27 @@ def register_company_enrichment_tools(
                     break
                 await asyncio.sleep(step_delay(rng=rng))
                 try:
-                    await _load_about(
-                        extractor, name, _slug(rec.linkedin_url), now, rec.company_urn
-                    )
+                    try:
+                        await _load_about(
+                            extractor,
+                            name,
+                            _slug(rec.linkedin_url),
+                            now,
+                            rec.company_urn,
+                        )
+                    except _BrowserGone:
+                        await _relaunch(name)
+                        await _load_about(
+                            extractor,
+                            name,
+                            _slug(rec.linkedin_url),
+                            now,
+                            rec.company_urn,
+                        )
+                except _RelaunchFailed as e:
+                    _relaunch_failed(e)
+                except _BrowserGone as e:
+                    return _browser_unavailable(e)
                 except RateLimitError as e:
                     logger.warning("Rate limited during About load: %s", e)
                     budget.ledger.record(now)

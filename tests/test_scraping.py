@@ -12,6 +12,7 @@ import time
 
 import anyio
 from patchright.async_api import Error as PatchrightError
+from patchright._impl._errors import TargetClosedError
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import pytest
@@ -1668,6 +1669,209 @@ class TestHttp429Navigation:
         assert result.text == "Sample profile text"
 
 
+class TestConfigurableLimits:
+    """Each pacing constant is a default an environment variable replaces.
+
+    Read at call time, so `monkeypatch.setenv` inside the test is enough; no
+    module reload. One test per variable, each asserting a value the default
+    cannot produce.
+    """
+
+    _NOISE_ONLY = (
+        "More profiles for you\n\n"
+        "You've approached your profile search limit\n\n"
+        "About\nAccessibility\nTalent Solutions"
+    )
+
+    @staticmethod
+    def _soft_limited(mock_page, slept: list[float]):
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "source": "root",
+                "text": TestConfigurableLimits._NOISE_ONLY,
+                "references": [],
+            }
+        )
+        return (
+            patch(
+                "linkedin_mcp_server.scraping.extractor.scroll_to_bottom",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.jitter",
+                side_effect=lambda base, *a, **kw: base,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+                side_effect=lambda delay: slept.append(delay),
+            ),
+        )
+
+    @staticmethod
+    def _hard_limited(mock_page, slept: list[float]):
+        mock_page.goto = AsyncMock(
+            side_effect=PatchrightError(
+                "Page.goto: net::ERR_HTTP_RESPONSE_CODE_FAILURE at "
+                "https://www.linkedin.com/in/testuser/"
+            )
+        )
+        _show_the_interstitial(mock_page, 429)
+        return (
+            patch(
+                "linkedin_mcp_server.scraping.extractor.jitter",
+                side_effect=lambda base, *a, **kw: base,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+                side_effect=lambda delay: slept.append(delay),
+            ),
+        )
+
+    async def test_retry_budget_zero_means_no_soft_retry(self, mock_page, monkeypatch):
+        monkeypatch.setenv("RATE_LIMIT_RETRY_BUDGET", "0")
+        slept: list[float] = []
+        extractor = LinkedInExtractor(mock_page)
+        patches = self._soft_limited(mock_page, slept)
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = await extractor.extract_page(
+                "https://www.linkedin.com/in/testuser/details/experience/",
+                section_name="experience",
+            )
+
+        assert result.text == _RATE_LIMITED_MSG
+        assert mock_page.goto.await_count == 1
+
+    async def test_retry_delay_is_read_from_the_environment(
+        self, mock_page, monkeypatch
+    ):
+        monkeypatch.setenv("RATE_LIMIT_RETRY_DELAY_SECONDS", "0.25")
+        slept: list[float] = []
+        extractor = LinkedInExtractor(mock_page)
+        patches = self._soft_limited(mock_page, slept)
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            await extractor.extract_page(
+                "https://www.linkedin.com/in/testuser/details/experience/",
+                section_name="experience",
+            )
+
+        assert 0.25 in slept
+        assert extractor_module._RATE_LIMIT_RETRY_DELAY not in slept
+
+    async def test_backoff_delay_is_read_from_the_environment(
+        self, mock_page, monkeypatch
+    ):
+        monkeypatch.setenv("RATE_LIMIT_BACKOFF_DELAY_SECONDS", "0.5")
+        slept: list[float] = []
+        extractor = LinkedInExtractor(mock_page)
+        patches = self._hard_limited(mock_page, slept)
+        with patches[0], patches[1], pytest.raises(RateLimitError):
+            await extractor.extract_page(
+                "https://www.linkedin.com/in/testuser/",
+                section_name="main_profile",
+            )
+
+        assert slept == [0.5]
+
+    async def test_backoff_max_caps_the_first_hit(self, mock_page, monkeypatch):
+        """A cap below the base delay is visible on the very first hit."""
+        monkeypatch.setenv("RATE_LIMIT_BACKOFF_MAX_SECONDS", "1")
+        slept: list[float] = []
+        extractor = LinkedInExtractor(mock_page)
+        patches = self._hard_limited(mock_page, slept)
+        with patches[0], patches[1], pytest.raises(RateLimitError):
+            await extractor.extract_page(
+                "https://www.linkedin.com/in/testuser/",
+                section_name="main_profile",
+            )
+
+        assert slept == [1.0]
+
+    async def test_backoff_max_doublings_stops_the_escalation(
+        self, mock_page, monkeypatch
+    ):
+        """With no doublings allowed, the second hit waits the base delay."""
+        monkeypatch.setenv("RATE_LIMIT_BACKOFF_MAX_DOUBLINGS", "0")
+        slept: list[float] = []
+        extractor = LinkedInExtractor(mock_page)
+        patches = self._hard_limited(mock_page, slept)
+        with patches[0], patches[1]:
+            for _ in range(2):
+                with pytest.raises(RateLimitError):
+                    await extractor.extract_page(
+                        "https://www.linkedin.com/in/testuser/",
+                        section_name="main_profile",
+                    )
+
+        base = extractor_module._RATE_LIMIT_BACKOFF_DELAY
+        assert slept == [base, base]
+
+    def test_retry_after_ceiling_is_read_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("RETRY_AFTER_CEILING_SECONDS", "60")
+        assert extractor_module._retry_after_seconds("120") == 60
+        assert extractor_module._retry_after_seconds("30") == 30
+
+    async def test_nav_delay_is_read_from_the_environment(self, mock_page, monkeypatch):
+        monkeypatch.setenv("NAV_DELAY_SECONDS", "0.75")
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(
+                extractor,
+                "_resolve_company_urn",
+                new_callable=AsyncMock,
+                return_value="1115",
+            ),
+            patch.object(
+                extractor,
+                "_extract_search_page",
+                new_callable=AsyncMock,
+                return_value=extracted("no results"),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.human_pause",
+                new_callable=AsyncMock,
+            ) as pause,
+        ):
+            await extractor.search_people(current_company="SAP")
+
+        pause.assert_awaited_once_with(0.75)
+
+    async def test_garbage_falls_back_to_the_default_with_a_warning(
+        self, mock_page, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("RATE_LIMIT_BACKOFF_DELAY_SECONDS", "soon")
+        slept: list[float] = []
+        extractor = LinkedInExtractor(mock_page)
+        patches = self._hard_limited(mock_page, slept)
+        with (
+            caplog.at_level(logging.WARNING, logger="linkedin_mcp_server.limits"),
+            patches[0],
+            patches[1],
+            pytest.raises(RateLimitError),
+        ):
+            await extractor.extract_page(
+                "https://www.linkedin.com/in/testuser/",
+                section_name="main_profile",
+            )
+
+        assert slept == [extractor_module._RATE_LIMIT_BACKOFF_DELAY]
+        assert any(
+            "RATE_LIMIT_BACKOFF_DELAY_SECONDS" in r.getMessage()
+            and "'soon'" in r.getMessage()
+            for r in caplog.records
+        )
+
+
 class TestNavigationDiagnostics:
     async def test_goto_with_auth_checks_clicks_remember_me_and_retries(
         self, mock_page
@@ -2047,6 +2251,110 @@ class TestScrapePersonUrls:
         assert (
             result["section_errors"]["posts"]["issue_template_path"] == "/tmp/issue.md"
         )
+
+    async def test_scrape_person_reraises_closed_target(self, mock_page):
+        """A dead browser fails the call, not the section.
+
+        Measured: Chromium exited mid-call and every later section was recorded
+        as its own ``TargetClosedError`` while the call returned normally, so a
+        bunch loop walked eight more profiles against the dead page.
+        """
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                side_effect=[
+                    extracted("profile text"),
+                    TargetClosedError(
+                        "Target page, context or browser has been closed"
+                    ),
+                ],
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+            pytest.raises(TargetClosedError),
+        ):
+            await extractor.scrape_person("testuser", {"posts"})
+
+    async def test_scrape_person_closed_target_reaches_on_error(self, mock_page):
+        """The re-raise bypasses the ``LinkedInScraperException`` handler that
+        reports to ``callbacks.on_error``; the tool layer reports through it."""
+        extractor = LinkedInExtractor(mock_page)
+        callbacks = AsyncMock()
+        closed = TargetClosedError("closed")
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                side_effect=closed,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+            pytest.raises(TargetClosedError),
+        ):
+            await extractor.scrape_person("testuser", {"posts"}, callbacks=callbacks)
+        callbacks.on_error.assert_awaited_once_with(closed)
+
+    async def test_extract_page_reraises_closed_target(self, mock_page):
+        """The inner isolation handler is where the incident's error was
+        swallowed; re-raising only in ``scrape_person`` would never see it."""
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(
+                extractor,
+                "_extract_page_once",
+                new_callable=AsyncMock,
+                side_effect=TargetClosedError("closed"),
+            ),
+            pytest.raises(TargetClosedError),
+        ):
+            await extractor.extract_page(
+                "https://www.linkedin.com/in/testuser/", section_name="main_profile"
+            )
+
+    async def test_scrape_company_reraises_closed_target(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                side_effect=TargetClosedError("closed"),
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+            pytest.raises(TargetClosedError),
+        ):
+            await extractor.scrape_company("testcorp", {"about"})
+
+    async def test_scrape_company_closed_target_reaches_on_error(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        callbacks = AsyncMock()
+        closed = TargetClosedError("closed")
+        with (
+            patch.object(
+                extractor,
+                "extract_page",
+                new_callable=AsyncMock,
+                side_effect=closed,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+            pytest.raises(TargetClosedError),
+        ):
+            await extractor.scrape_company("testcorp", {"about"}, callbacks=callbacks)
+        callbacks.on_error.assert_awaited_once_with(closed)
 
     async def test_experience_education_visits_correct_urls(self, mock_page):
         extractor = LinkedInExtractor(mock_page)

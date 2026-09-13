@@ -6,16 +6,23 @@ and that a rate limit never loses progress.
 """
 
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from patchright._impl._errors import TargetClosedError
+from patchright.async_api import Error as PatchrightError
 
 from linkedin_mcp_server.company_cache import CompanyCache
+from linkedin_mcp_server.config.loaders import EnvironmentKeys
 from linkedin_mcp_server.core.exceptions import AuthenticationError, RateLimitError
-from linkedin_mcp_server.exceptions import AuthenticationStartedError
+from linkedin_mcp_server.exceptions import (
+    AuthenticationStartedError,
+    BrowserBusyError,
+)
 from linkedin_mcp_server.pacing import (
     ACCOUNT_BUDGET_JOB,
     Job,
@@ -114,6 +121,49 @@ def _search_extractor(hits):
 
 def _spent(jobs):
     return jobs.load(ACCOUNT_BUDGET_JOB).ledger.spent(datetime.now().astimezone())
+
+
+CLOSED_TARGET = "Target page, context or browser has been closed"
+
+# The incident shape: the scraper swallowed a dead browser into section_errors
+# for every section and returned with nothing loaded.
+NOTHING_LOADED = {
+    "url": "https://www.linkedin.com/company/copado/",
+    "sections": {},
+    "section_errors": {
+        "about": {"error_type": "scraping", "error_message": CLOSED_TARGET}
+    },
+}
+
+
+@pytest.fixture(
+    params=[
+        NOTHING_LOADED,
+        TargetClosedError(CLOSED_TARGET),
+        PatchrightError(CLOSED_TARGET),
+    ],
+    ids=["empty-result", "TargetClosedError", "Error-with-closed-message"],
+)
+def dead(request):
+    """A dead-browser answer in each shape scrape_company / search_companies
+    can give: the swallowed result or a raised error."""
+    return request.param
+
+
+def _mock_of(failure):
+    if isinstance(failure, Exception):
+        return AsyncMock(side_effect=failure)
+    return AsyncMock(return_value=failure)
+
+
+def _relaunch_to(monkeypatch, extractor):
+    """Fake the re-acquisition a dead browser triggers, handing back the
+    given extractor; returns the mock so the test can count relaunches."""
+    relaunch = AsyncMock(return_value=extractor)
+    monkeypatch.setattr(
+        "linkedin_mcp_server.tools.company_enrichment.get_ready_extractor", relaunch
+    )
+    return relaunch
 
 
 class TestEnrichCompanies:
@@ -731,44 +781,424 @@ class TestEnrichCompanies:
         assert extractor.scrape_company.await_count == 2
         assert extractor.search_companies.await_count == 1  # URL was kept
 
-    async def test_a_failed_about_surfaces_as_about_error_and_is_not_stamped_fresh(
-        self, mcp, wired, mock_context, monkeypatch
+    async def test_a_dead_browser_during_about_is_relaunched_and_retried_once(
+        self, mcp, wired, mock_context, monkeypatch, caplog, dead
     ):
-        """A crashed or auth-walled About (any section error that is not a
-        rate limit) is a failed load, not an empty page: it surfaces as
-        about_error, costs the navigation, and leaves the record stale so
-        the next call retries."""
+        """Measured: the daemon's Chrome died mid-run and every About after
+        it came back with no section at all, each charged "because the page
+        load still happened". Nothing loaded is nothing to charge: the browser
+        is re-acquired (which relaunches it) and the same About is retried
+        once, at its normal cost."""
         monkeypatch.setattr(
             "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
         )
         cache, jobs = wired
         extractor = _search_extractor(["copado"])
+        extractor.scrape_company = _mock_of(dead)
+        relaunched = _search_extractor(["copado"])
+        relaunch = _relaunch_to(monkeypatch, relaunched)
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        with caplog.at_level(logging.WARNING):
+            out = await fn(["Copado"], mock_context, about=True, extractor=extractor)
+
+        assert "browser gone under Copado; relaunching and retrying once" in (
+            caplog.text
+        )
+        relaunch.assert_awaited_once()
+        assert out["stopped_because"] == "all_done"
+        assert out["about_loaded"] == 1
+        assert _spent(jobs) == 2  # search + one About, not two
+        assert out["results"]["Copado"]["source"] == "company_page"
+        assert cache.get("Copado").has_firmographics()
+        assert extractor.scrape_company.await_count == 1
+        assert relaunched.scrape_company.await_count == 1
+
+    async def test_a_browser_still_dead_after_an_about_relaunch_stops_the_bunch(
+        self, mcp, wired, mock_context, monkeypatch, dead
+    ):
+        """The retry failing the same way is the stop: the search that ran
+        is charged, the About is not, the record stays stale for the next
+        call to retry, and the next name is not attempted."""
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        cache, jobs = wired
+        extractor = _search_extractor(["copado"])
+        extractor.scrape_company = _mock_of(dead)
+        relaunch = _relaunch_to(monkeypatch, extractor)
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        first = await fn(
+            ["Copado", "Globex"], mock_context, about=True, extractor=extractor
+        )
+
+        assert first["stopped_because"] == "browser_unavailable"
+        assert first["about_loaded"] == 0
+        assert _spent(jobs) == 1  # the search, not the About that never loaded
+        relaunch.assert_awaited_once()
+        assert extractor.scrape_company.await_count == 2  # once, retried once
+        assert "about_error" not in first["results"]["Copado"]
+        assert "Globex" not in first["results"]  # never attempted
+        assert extractor.search_companies.await_count == 1
+        if dead is NOTHING_LOADED:
+            assert first["section_errors"] == NOTHING_LOADED["section_errors"]
+        rec = cache.get("Copado")
+        assert rec is not None and rec.linkedin_url
+        assert not rec.has_firmographics()
+
+        extractor.scrape_company = AsyncMock(side_effect=lambda s, _: _about_result(s))
+        second = await fn(["Copado"], mock_context, about=True, extractor=extractor)
+
+        assert second["about_loaded"] == 1  # retried, not served from cache
+        assert extractor.search_companies.await_count == 1  # URL was kept
+
+    async def test_a_dead_browser_during_search_is_relaunched_and_retried_once(
+        self, mcp, wired, mock_context, monkeypatch, caplog, dead
+    ):
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        cache, jobs = wired
+        if dead is NOTHING_LOADED:
+            dead = {
+                "sections": {},
+                "section_errors": {
+                    "search_results": {
+                        "error_type": "scraping",
+                        "error_message": CLOSED_TARGET,
+                    }
+                },
+            }
+        extractor = _search_extractor(["copado"])
+        extractor.search_companies = _mock_of(dead)
+        relaunched = _search_extractor(["copado", "globex"])
+        relaunch = _relaunch_to(monkeypatch, relaunched)
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        with caplog.at_level(logging.WARNING):
+            out = await fn(["Copado", "Globex"], mock_context, extractor=extractor)
+
+        assert "browser gone under Copado; relaunching and retrying once" in (
+            caplog.text
+        )
+        relaunch.assert_awaited_once()
+        assert out["stopped_because"] == "all_done"
+        assert out["fetched"] == 1
+        assert _spent(jobs) == 1  # the retry of Copado; Globex was on its page
+        assert out["results"]["Copado"]["source"] == "search"
+        assert out["results"]["Globex"]["source"] == "cache"
+        assert extractor.search_companies.await_count == 1
+        assert relaunched.search_companies.await_count == 1
+
+    async def test_a_browser_still_dead_after_a_search_relaunch_stops_the_bunch(
+        self, mcp, wired, mock_context, monkeypatch, dead
+    ):
+        """A generic search failure is served as search_failed and charged;
+        a dead browser says nothing about the company and loaded nothing."""
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        cache, jobs = wired
+        errors = {
+            "search_results": {"error_type": "scraping", "error_message": CLOSED_TARGET}
+        }
+        if dead is NOTHING_LOADED:
+            dead = {"sections": {}, "section_errors": errors}
+        extractor = _search_extractor(["copado"])
+        extractor.search_companies = _mock_of(dead)
+        relaunch = _relaunch_to(monkeypatch, extractor)
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        out = await fn(["Copado", "Globex"], mock_context, extractor=extractor)
+
+        assert out["stopped_because"] == "browser_unavailable"
+        assert out["fetched"] == 0
+        assert _spent(jobs) == 0
+        assert out["results"] == {}  # neither name is known or failed
+        relaunch.assert_awaited_once()
+        assert [c.args[0] for c in extractor.search_companies.await_args_list] == [
+            "Copado",
+            "Copado",
+        ]  # retried once, Globex never tried
+        assert cache.get("Copado") is None
+        if isinstance(dead, dict):
+            assert out["section_errors"] == errors
+        else:
+            assert "section_errors" not in out
+
+    async def test_a_failed_relaunch_serves_nothing_and_charges_nothing(
+        self, mcp, wired, mock_context, monkeypatch
+    ):
+        """get_ready_extractor turns a browser that will not start into the
+        client-facing ToolError; that must not fall into the generic search
+        handler, which would serve search_failed and charge the load."""
+        _, jobs = wired
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.get_ready_extractor",
+            AsyncMock(side_effect=ToolError("browser would not start")),
+        )
+        extractor = _search_extractor(["copado"])
+        extractor.search_companies = AsyncMock(
+            side_effect=TargetClosedError(CLOSED_TARGET)
+        )
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        with pytest.raises(ToolError, match="would not start"):
+            await fn(["Copado"], mock_context, extractor=extractor)
+
+        assert _spent(jobs) == 0
+
+    @pytest.mark.parametrize(
+        ("failure", "expected"),
+        [
+            (BrowserBusyError("profile held"), ToolError),
+            (RuntimeError("profile held"), RuntimeError),
+        ],
+        ids=["LinkedInMCPError", "raw"],
+    )
+    @pytest.mark.parametrize("about", [False, True], ids=["search", "about"])
+    async def test_a_relaunch_failure_of_any_kind_does_not_drain_the_list(
+        self, mcp, wired, mock_context, monkeypatch, failure, expected, about
+    ):
+        """Reproduced: get_ready_extractor raised BrowserBusyError, which is
+        not a ToolError, so it fell into the generic handler: the name was
+        served as search_failed and charged, the next name was searched on
+        the same dead extractor, the relaunch failed again, and so on until
+        the bunch was exhausted. Whatever the relaunch raises is the
+        client-facing error; nothing is served, charged, or retried."""
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        cache, jobs = wired
+        relaunch = AsyncMock(side_effect=failure)
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.get_ready_extractor",
+            relaunch,
+        )
+        extractor = _search_extractor(["copado", "globex", "initech"])
+        gone = TargetClosedError(CLOSED_TARGET)
+        if about:
+            extractor.scrape_company = AsyncMock(side_effect=gone)
+        else:
+            extractor.search_companies = AsyncMock(side_effect=gone)
+        names = ["Copado", "Globex", "Initech"]
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        with pytest.raises(expected, match="profile held"):
+            await fn(names, mock_context, about=about, extractor=extractor)
+
+        relaunch.assert_awaited_once()
+        if about:
+            # The search that resolved Copado is the only navigation charged.
+            assert _spent(jobs) == 1
+            assert extractor.search_companies.await_count == 1
+            assert extractor.scrape_company.await_count == 1
+            assert not cache.get("Copado").has_firmographics()
+        else:
+            assert _spent(jobs) == 0
+            assert extractor.search_companies.await_count == 1
+            assert all(cache.get(n) is None for n in names)
+
+    async def test_an_empty_search_page_without_a_closed_target_is_charged(
+        self, mcp, wired, mock_context, monkeypatch
+    ):
+        """error_type is the exception's class name, so a navigation timeout
+        files the same empty shape as a dead browser. It is not one: the
+        navigation happened, so it is charged and served as before, and the
+        next name is searched -- no relaunch of a live browser."""
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        _, jobs = wired
+        relaunch = _relaunch_to(monkeypatch, None)
+        timed_out = {
+            "sections": {},
+            "section_errors": {
+                "search_results": {
+                    "error_type": "TimeoutError",
+                    "error_message": "Timeout 30000ms exceeded.",
+                }
+            },
+        }
+        extractor = _search_extractor(["globex"])
+        live = extractor.search_companies.return_value
+        extractor.search_companies = AsyncMock(side_effect=[timed_out, live])
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        out = await fn(["Copado", "Globex"], mock_context, extractor=extractor)
+
+        relaunch.assert_not_awaited()
+        assert out["stopped_because"] == "bunch_complete"  # Copado outstanding
+        assert out["fetched"] == 2
+        assert _spent(jobs) == 2
+        assert out["results"]["Copado"]["status"] == "no_confident_match"
+        assert out["results"]["Globex"]["source"] == "search"
+        assert [c.args[0] for c in extractor.search_companies.await_args_list] == [
+            "Copado",
+            "Globex",
+        ]
+
+    async def test_an_about_that_did_not_load_without_a_closed_target_is_charged(
+        self, mcp, wired, mock_context, monkeypatch
+    ):
+        """The About counterpart: a timed-out About is a failed load as
+        before -- charged, surfaced as about_error, left stale for a retry --
+        not a dead browser to relaunch."""
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        cache, jobs = wired
+        relaunch = _relaunch_to(monkeypatch, None)
+        extractor = _search_extractor(["copado", "globex"])
         extractor.scrape_company = AsyncMock(
             return_value={
                 "url": "https://www.linkedin.com/company/copado/",
                 "sections": {},
                 "section_errors": {
-                    "about": {"error_type": "scraping", "error_message": "crashed"}
+                    "about": {
+                        "error_type": "TimeoutError",
+                        "error_message": "Timeout 30000ms exceeded.",
+                    }
                 },
             }
         )
 
         fn = await get_tool_fn(mcp, "enrich_companies")
-        first = await fn(["Copado"], mock_context, about=True, extractor=extractor)
+        out = await fn(
+            ["Copado", "Globex"], mock_context, about=True, extractor=extractor
+        )
 
-        assert first["results"]["Copado"]["about_error"] == "crashed"
-        assert first["about_loaded"] == 1
-        assert _spent(jobs) == 2  # search + the About load that came back empty
-        rec = cache.get("Copado")
-        assert rec is not None and rec.linkedin_url
-        assert not rec.has_firmographics()
+        relaunch.assert_not_awaited()
+        assert out["stopped_because"] == "bunch_complete"  # both left stale
+        assert out["about_loaded"] == 2  # both Abouts were attempted
+        assert _spent(jobs) == 3  # one search, two About loads
+        assert out["results"]["Copado"]["about_error"] == "Timeout 30000ms exceeded."
+        assert out["results"]["Globex"]["about_error"] == "Timeout 30000ms exceeded."
+        assert not cache.get("Copado").has_firmographics()
 
-        second = await fn(["Copado"], mock_context, about=True, extractor=extractor)
+    async def test_a_search_page_that_loaded_is_charged_even_with_a_warning(
+        self, mcp, wired, mock_context, monkeypatch
+    ):
+        """A page with content plus a section_errors note (a dropped filter,
+        say) is a navigation that happened: served and charged as today."""
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        _, jobs = wired
+        extractor = _search_extractor(["copado"])
+        page = extractor.search_companies.return_value
+        page["section_errors"] = {
+            "search_results": {"error_type": "scraping", "error_message": "note"}
+        }
 
-        assert second["stopped_because"] != "all_cached"
-        assert second["about_loaded"] == 1  # retried, not served from cache
-        assert extractor.scrape_company.await_count == 2
-        assert extractor.search_companies.await_count == 1  # URL was kept
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        out = await fn(["Copado"], mock_context, extractor=extractor)
+
+        assert out["stopped_because"] == "all_done"
+        assert out["fetched"] == 1
+        assert _spent(jobs) == 1
+        assert out["results"]["Copado"]["source"] == "search"
+
+    async def test_a_soft_rate_limit_with_nothing_loaded_is_a_rate_limit(
+        self, mcp, wired, mock_context, monkeypatch
+    ):
+        """search_companies files a soft rate limit under section_errors and
+        returns with no section. That is a rate limit, not a dead browser: the
+        refused navigation is charged and the bunch backs off."""
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        _, jobs = wired
+        extractor = _search_extractor(["copado"])
+        extractor.search_companies = AsyncMock(
+            return_value={
+                "sections": {},
+                "section_errors": {
+                    "search_results": {
+                        "error_type": "rate_limit",
+                        "error_message": "throttled",
+                    }
+                },
+            }
+        )
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        out = await fn(["Copado", "Globex"], mock_context, extractor=extractor)
+
+        assert out["stopped_because"] == "rate_limited"
+        assert _spent(jobs) == 1
+        assert extractor.search_companies.await_count == 1
+
+
+class TestBunchSearchesCeiling:
+    """``bunch_searches`` is clamped at call time to BUNCH_SEARCHES_MAX.
+
+    The pydantic ``le`` bound was fixed at import; the environment has to
+    reach the running tool.
+    """
+
+    def _one_page_each(self):
+        """A search that reveals only the company asked for, so every name
+        costs its own navigation."""
+
+        def per_name(name):
+            slug = name.lower()
+            return {
+                "sections": {"search_results": "x"},
+                "references": {
+                    "search_results": [
+                        {
+                            "url": f"https://www.linkedin.com/company/{slug}",
+                            "text": slug,
+                        }
+                    ]
+                },
+            }
+
+        extractor = MagicMock()
+        extractor.search_companies = AsyncMock(side_effect=lambda n: per_name(n))
+        return extractor
+
+    async def test_bunch_searches_is_clamped_to_the_configured_ceiling(
+        self, mcp, wired, mock_context, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        monkeypatch.setenv(EnvironmentKeys.BUNCH_SEARCHES_MAX, "1")
+        extractor = self._one_page_each()
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        with caplog.at_level(logging.INFO):
+            out = await fn(
+                ["a", "b", "c"], mock_context, bunch_searches=3, extractor=extractor
+            )
+
+        assert out["fetched"] == 1
+        assert extractor.search_companies.await_count == 1
+        assert any(
+            "Clamping bunch_searches=3" in r.getMessage() for r in caplog.records
+        )
+
+    async def test_bunch_searches_garbage_ceiling_falls_back_with_a_warning(
+        self, mcp, wired, mock_context, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        monkeypatch.setenv(EnvironmentKeys.BUNCH_SEARCHES_MAX, "many")
+        extractor = self._one_page_each()
+        names = [f"co{i}" for i in range(22)]
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        with caplog.at_level(logging.WARNING):
+            out = await fn(names, mock_context, bunch_searches=22, extractor=extractor)
+
+        assert out["fetched"] == 20
+        assert any(
+            EnvironmentKeys.BUNCH_SEARCHES_MAX in r.getMessage() for r in caplog.records
+        )
 
 
 class TestEnrichCompanyDeep:

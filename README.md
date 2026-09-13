@@ -59,7 +59,7 @@ This MCP server is **free** and **open source**, supported by [**Unipile**](http
 | `get_feed` | Get recent posts from the authenticated user's home feed |
 | `search_posts` | Search posts/content globally by keyword (the "Posts" tab) with an optional recency filter (past-24h/past-week/past-month), scrolling until `max_posts` results (1-50, default 10); author `/in/` references make it usable as a prospect list. Breaking change: `max_pages` was removed and replaced by `max_posts` (default 10) |
 | `start_enrichment_job` | Queue a resumable bulk profile-enrichment job from a list of usernames or profile URLs |
-| `run_enrichment_bunch` | Visit the next few profiles in a job, paced with randomized delays, a rolling 24h action budget and working hours; returns when to call it again |
+| `run_enrichment_bunch` | Visit the next few profiles in a job, paced with randomized delays, a rolling 24h action budget and working hours; returns when to call it again. A bunch that loses its browser relaunches it and retries once; a profile that never loaded is left pending and is not charged |
 | `get_enrichment_status` | Progress and collected results for an enrichment job, or list all jobs |
 | `enrich_companies` | Firmographics for a list of companies, cache-first and paced; one company-search reveals ~10 companies at once, all cached. With `about=true` each resolved company's About tab is read too (industry, headcount band, HQ, website, founded, company type, specialties) at one extra navigation per company. Cache TTLs are set in days via `COMPANY_FIRMOGRAPHICS_TTL_DAYS` (default 90) and `COMPANY_JOBS_TTL_DAYS` (default 14) |
 | `enrich_company_deep` | Deep firmographics (About tab: industry, headcount band, HQ, website, founded, company type, specialties) plus live open roles for one company; cache-first, open roles on the shorter jobs TTL |
@@ -221,7 +221,7 @@ while a container is running.
 **Rate limiting (HTTP 429):**
 
 - LinkedIn answers a burst of page loads with HTTP 429. It arrives as a failed navigation rather than a readable status, so the symptom is a tool call that reports being refused, or a session that suddenly cannot open pages it opened a minute ago.
-- The server spaces consecutive tool calls apart by `TOOL_CALL_GAP_SECONDS` (default 5, jittered ±20%; `0` disables). Raise it if you scrape steadily — published limits for comparable tools are far lower than most people expect, on the order of one action a minute.
+- The server spaces consecutive tool calls apart by `TOOL_CALL_GAP_SECONDS` (default 5, jittered ±20%; `0` disables). Raise it if you scrape steadily — published limits for comparable tools are far lower than most people expect, on the order of one action a minute. Every other pacing limit is tunable too; see [Pacing limits](#pacing-limits).
 - Images, fonts and media are not fetched (`BLOCK_SUBRESOURCES`, on by default), which cuts each page from 100+ requests to the handful that carry text. Set it falsy only if you need those resources; expect 429s sooner if you do.
 - When a limit is hit the server backs off before reporting, and honours LinkedIn's `Retry-After` when one is sent. Wait it out rather than retrying immediately — a retry is one more request into a live limit.
 
@@ -304,7 +304,7 @@ On startup, the MCP Bundle starts preparing the shared Patchright Chromium brows
 **Rate limiting (HTTP 429):**
 
 - LinkedIn answers a burst of page loads with HTTP 429. It arrives as a failed navigation rather than a readable status, so the symptom is a tool call that reports being refused, or a session that suddenly cannot open pages it opened a minute ago.
-- The server spaces consecutive tool calls apart by `TOOL_CALL_GAP_SECONDS` (default 5, jittered ±20%; `0` disables). Raise it if you scrape steadily — published limits for comparable tools are far lower than most people expect, on the order of one action a minute.
+- The server spaces consecutive tool calls apart by `TOOL_CALL_GAP_SECONDS` (default 5, jittered ±20%; `0` disables). Raise it if you scrape steadily — published limits for comparable tools are far lower than most people expect, on the order of one action a minute. Every other pacing limit is tunable too; see [Pacing limits](#pacing-limits).
 - Images, fonts and media are not fetched (`BLOCK_SUBRESOURCES`, on by default), which cuts each page from 100+ requests to the handful that carry text. Set it falsy only if you need those resources; expect 429s sooner if you do.
 - When a limit is hit the server backs off before reporting, and honours LinkedIn's `Retry-After` when one is sent. Wait it out rather than retrying immediately — a retry is one more request into a live limit.
 
@@ -558,7 +558,7 @@ belongs behind something that provides it.
 **Rate limiting (HTTP 429):**
 
 - LinkedIn answers a burst of page loads with HTTP 429. It arrives as a failed navigation rather than a readable status, so the symptom is a tool call that reports being refused, or a session that suddenly cannot open pages it opened a minute ago.
-- The server spaces consecutive tool calls apart by `TOOL_CALL_GAP_SECONDS` (default 5, jittered ±20%; `0` disables). Raise it if you scrape steadily — published limits for comparable tools are far lower than most people expect, on the order of one action a minute.
+- The server spaces consecutive tool calls apart by `TOOL_CALL_GAP_SECONDS` (default 5, jittered ±20%; `0` disables). Raise it if you scrape steadily — published limits for comparable tools are far lower than most people expect, on the order of one action a minute. Every other pacing limit is tunable too; see [Pacing limits](#pacing-limits).
 - Images, fonts and media are not fetched (`BLOCK_SUBRESOURCES`, on by default), which cuts each page from 100+ requests to the handful that carry text. Set it falsy only if you need those resources; expect 429s sooner if you do.
 - When a limit is hit the server backs off before reporting, and honours LinkedIn's `Retry-After` when one is sent. Wait it out rather than retrying immediately — a retry is one more request into a live limit.
 
@@ -648,6 +648,39 @@ name `uvx` by its absolute path (`which uvx`). macOS launchd
 
 Linux systemd: `ExecStart=/absolute/path/to/uvx mcp-server-linkedin@latest
 --transport streamable-http` with `Restart=always`.
+
+## Pacing limits
+
+Every pacing limit is an environment variable, read once per process (so per
+profile). Unset means the default; an unusable value falls back to the default
+with a warning. None is a hard ceiling any more: the defaults are the
+deliberate ceiling, and raising `DAILY_ACTIONS_MAX` raises detection exposure
+in step. Published limits for comparable tools are far lower than most people
+expect, on the order of one action a minute.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `DAILY_ACTIONS_MAX` | `150` | Ceiling on any enrichment job's `daily_cap` |
+| `DAILY_ACTIONS_DEFAULT` | `100` | `daily_cap` when a job does not set one |
+| `DAILY_CAP_JITTER` | `0.15` | Fraction shaved off the daily cap at random each day |
+| `WARMUP_CAPS` | `10,20,50` | Per-day caps during the warm-up ramp |
+| `WARMUP_DAYS` | `7,14,21` | Day thresholds for each warm-up step |
+| `STEP_DELAY_MIN_SECONDS` / `STEP_DELAY_MAX_SECONDS` | `8` / `25` | Gap between page loads inside a bunch |
+| `BUNCH_PAUSE_MIN_SECONDS` / `BUNCH_PAUSE_MAX_SECONDS` | `60` / `3600` | Clamp on the pause between bunches |
+| `BUNCH_PAUSE_JITTER` | `0.25` | ± fraction on the bunch pause |
+| `BUNCH_SIZE_MAX` | `25` | Ceiling on `bunch_size` per enrichment call |
+| `BUNCH_SEARCHES_MAX` | `20` | Ceiling on `bunch_searches` per company-enrichment call |
+| `TOOL_CALL_GAP_SECONDS` | `5` | Minimum gap between two tool calls (`0` disables) |
+| `TOOL_CALL_GAP_JITTER` | `0.2` | ± fraction on that gap |
+| `NAV_DELAY_SECONDS` | `2` | Pause between page navigations |
+| `RATE_LIMIT_RETRY_DELAY_SECONDS` | `5` | Base delay before retrying a soft 429 |
+| `RATE_LIMIT_RETRY_BUDGET` | `2` | Soft-429 retries per navigation |
+| `RATE_LIMIT_BACKOFF_DELAY_SECONDS` | `5` | Base of the hard-429 backoff |
+| `RATE_LIMIT_BACKOFF_MAX_SECONDS` | `30` | Cap on one backoff wait |
+| `RATE_LIMIT_BACKOFF_MAX_DOUBLINGS` | `8` | Doublings before the backoff stops growing |
+| `RETRY_AFTER_CEILING_SECONDS` | `3600` | Cap on a relayed `Retry-After` |
+| `LOGIN_INLINE_WAIT_MAX` | `45` | Ceiling on `LOGIN_INLINE_WAIT` |
+| `BROWSER_WAIT_MAX` | `45` | Ceiling on `BROWSER_WAIT` |
 
 ## 🐍 Local Setup (Develop & Contribute)
 
@@ -766,7 +799,7 @@ uv run -m linkedin_mcp_server --transport streamable-http --host 127.0.0.1 --por
 **Rate limiting (HTTP 429):**
 
 - LinkedIn answers a burst of page loads with HTTP 429. It arrives as a failed navigation rather than a readable status, so the symptom is a tool call that reports being refused, or a session that suddenly cannot open pages it opened a minute ago.
-- The server spaces consecutive tool calls apart by `TOOL_CALL_GAP_SECONDS` (default 5, jittered ±20%; `0` disables). Raise it if you scrape steadily — published limits for comparable tools are far lower than most people expect, on the order of one action a minute.
+- The server spaces consecutive tool calls apart by `TOOL_CALL_GAP_SECONDS` (default 5, jittered ±20%; `0` disables). Raise it if you scrape steadily — published limits for comparable tools are far lower than most people expect, on the order of one action a minute. Every other pacing limit is tunable too; see [Pacing limits](#pacing-limits).
 - Images, fonts and media are not fetched (`BLOCK_SUBRESOURCES`, on by default), which cuts each page from 100+ requests to the handful that carry text. Set it falsy only if you need those resources; expect 429s sooner if you do.
 - When a limit is hit the server backs off before reporting, and honours LinkedIn's `Retry-After` when one is sent. Wait it out rather than retrying immediately — a retry is one more request into a live limit.
 

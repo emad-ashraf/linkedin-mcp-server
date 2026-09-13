@@ -19,6 +19,10 @@ import anyio
 import anyio.lowlevel
 from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
+# Upstream Playwright re-exports this from ``async_api``; patchright does not.
+from patchright._impl._errors import TargetClosedError
+
+from linkedin_mcp_server.config.loaders import EnvironmentKeys
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.company_cache import CompanyCache, normalize_company_name
 from linkedin_mcp_server.core import (
@@ -37,6 +41,7 @@ from linkedin_mcp_server.core.exceptions import (
 from linkedin_mcp_server.debug_trace import record_page_trace
 from linkedin_mcp_server.debug_utils import stabilize_navigation
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
+from linkedin_mcp_server.limits import env_float, env_int
 from linkedin_mcp_server.core.utils import (
     _JOB_CARD_SELECTOR,
     _RAIL_PICK_JS,
@@ -85,11 +90,12 @@ logger = logging.getLogger(__name__)
 
 WaitUntil = Literal["commit", "domcontentloaded", "load", "networkidle"]
 
-# Pacing between page navigations
+# Pacing between page navigations. Default for `NAV_DELAY_SECONDS`.
 _NAV_DELAY = 2.0
 
 # Backoff before retrying a temporarily blocked page. Each retry within one
-# scrape waits twice as long as the one before it, jittered.
+# scrape waits twice as long as the one before it, jittered. Default for
+# `RATE_LIMIT_RETRY_DELAY_SECONDS`.
 _RATE_LIMIT_RETRY_DELAY = 5.0
 
 # How many soft rate-limit retries one extractor may spend in total. The
@@ -98,7 +104,8 @@ _RATE_LIMIT_RETRY_DELAY = 5.0
 # which meant an eight-section scrape that had started to be throttled sent
 # eight extra navigations -- doubling its request volume at the moment
 # LinkedIn was asking for less. Two keeps the original benefit for a genuine
-# one-off blip while capping the amplification at a constant.
+# one-off blip while capping the amplification at a constant. Default for
+# `RATE_LIMIT_RETRY_BUDGET`.
 _RATE_LIMIT_RETRY_BUDGET = 2
 
 # A hard 429 never reaches `detect_rate_limit`, which reads a page that
@@ -138,15 +145,59 @@ _HTTP_TOO_MANY_REQUESTS = 429
 # under the tool timeout on purpose: this cannot wait out a real limit, it
 # only stops the next tool call from leaving for it immediately. How long to
 # actually wait is carried to the client on `RateLimitError.suggested_wait_time`.
+# Defaults for `RATE_LIMIT_BACKOFF_DELAY_SECONDS` and
+# `RATE_LIMIT_BACKOFF_MAX_SECONDS`.
 _RATE_LIMIT_BACKOFF_DELAY = 5.0
 _RATE_LIMIT_BACKOFF_MAX = 30.0
 # Enough doublings to reach the cap from the base delay, and no more.
+# Default for `RATE_LIMIT_BACKOFF_MAX_DOUBLINGS`.
 _RATE_LIMIT_BACKOFF_MAX_DOUBLINGS = 8
 
 # The longest `Retry-After` worth repeating to a client. LinkedIn asking for a
 # day off is a real answer, but relaying it unchanged makes the tool look hung;
 # the cap keeps the report actionable and the server still refuses to scrape.
+# Default for `RETRY_AFTER_CEILING_SECONDS`.
 _RETRY_AFTER_CEILING = 3600
+
+
+# Read at call time so an operator's environment replaces the defaults above
+# without an import-order dependency; see `linkedin_mcp_server.limits`.
+def _nav_delay() -> float:
+    return env_float(EnvironmentKeys.NAV_DELAY_SECONDS, _NAV_DELAY)
+
+
+def _rate_limit_retry_delay() -> float:
+    return env_float(
+        EnvironmentKeys.RATE_LIMIT_RETRY_DELAY_SECONDS, _RATE_LIMIT_RETRY_DELAY
+    )
+
+
+def _rate_limit_retry_budget() -> int:
+    return env_int(EnvironmentKeys.RATE_LIMIT_RETRY_BUDGET, _RATE_LIMIT_RETRY_BUDGET)
+
+
+def _rate_limit_backoff_delay() -> float:
+    return env_float(
+        EnvironmentKeys.RATE_LIMIT_BACKOFF_DELAY_SECONDS, _RATE_LIMIT_BACKOFF_DELAY
+    )
+
+
+def _rate_limit_backoff_max() -> float:
+    return env_float(
+        EnvironmentKeys.RATE_LIMIT_BACKOFF_MAX_SECONDS, _RATE_LIMIT_BACKOFF_MAX
+    )
+
+
+def _rate_limit_backoff_max_doublings() -> int:
+    return env_int(
+        EnvironmentKeys.RATE_LIMIT_BACKOFF_MAX_DOUBLINGS,
+        _RATE_LIMIT_BACKOFF_MAX_DOUBLINGS,
+    )
+
+
+def _retry_after_ceiling() -> int:
+    return env_int(EnvironmentKeys.RETRY_AFTER_CEILING_SECONDS, _RETRY_AFTER_CEILING)
+
 
 # Returned as section text when a page comes back with its content gone and
 # only LinkedIn's own navigation and footer left.
@@ -187,7 +238,7 @@ def _retry_after_seconds(value: str | None) -> int | None:
         return None
     value = value.strip()
     if value.isascii() and value.isdigit():
-        return min(_RETRY_AFTER_CEILING, int(value))
+        return min(_retry_after_ceiling(), int(value))
     try:
         when = parsedate_to_datetime(value)
     except (TypeError, ValueError):
@@ -195,7 +246,7 @@ def _retry_after_seconds(value: str | None) -> int | None:
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
     seconds = int((when - datetime.now(timezone.utc)).total_seconds())
-    return min(_RETRY_AFTER_CEILING, max(0, seconds))
+    return min(_retry_after_ceiling(), max(0, seconds))
 
 
 def _reconcile_search_references(
@@ -1425,15 +1476,16 @@ class LinkedInExtractor:
         stops asking instead of sending one extra navigation per remaining
         section. Each retry waits twice as long as the one before it.
         """
-        if self._soft_retries_used >= _RATE_LIMIT_RETRY_BUDGET:
+        budget = _rate_limit_retry_budget()
+        if self._soft_retries_used >= budget:
             logger.warning(
                 "Soft rate-limit retry budget (%d) spent, not re-fetching %s",
-                _RATE_LIMIT_RETRY_BUDGET,
+                budget,
                 url,
             )
             return False
 
-        delay = jitter(_RATE_LIMIT_RETRY_DELAY * 2**self._soft_retries_used)
+        delay = jitter(_rate_limit_retry_delay() * 2**self._soft_retries_used)
         self._soft_retries_used += 1
         logger.info("Retrying %s after %.1fs backoff", url, delay)
         await asyncio.sleep(delay)
@@ -1471,10 +1523,10 @@ class LinkedInExtractor:
         # exponent is capped too -- it is bounded in practice because every
         # hit sleeps, but nothing in the type says so.
         delay = min(
-            _RATE_LIMIT_BACKOFF_MAX,
+            _rate_limit_backoff_max(),
             jitter(
-                _RATE_LIMIT_BACKOFF_DELAY
-                * 2 ** min(self._rate_limit_hits, _RATE_LIMIT_BACKOFF_MAX_DOUBLINGS)
+                _rate_limit_backoff_delay()
+                * 2 ** min(self._rate_limit_hits, _rate_limit_backoff_max_doublings())
             ),
         )
         self._rate_limit_hits += 1
@@ -2259,6 +2311,9 @@ class LinkedInExtractor:
 
         except LinkedInScraperException:
             raise
+        except TargetClosedError:
+            # Not a property of the page; see scrape_person.
+            raise
         except Exception as e:
             logger.warning("Failed to extract page %s: %s", url, e)
             return ExtractedSection(
@@ -2476,6 +2531,9 @@ class LinkedInExtractor:
 
         except LinkedInScraperException:
             raise
+        except TargetClosedError:
+            # Not a property of the overlay; see scrape_person.
+            raise
         except Exception as e:
             logger.warning("Failed to extract overlay %s: %s", url, e)
             return ExtractedSection(
@@ -2574,7 +2632,7 @@ class LinkedInExtractor:
         try:
             for i, (section_name, suffix, is_overlay) in enumerate(requested_ordered):
                 if i > 0:
-                    await human_pause(_NAV_DELAY)
+                    await human_pause(_nav_delay())
 
                 url = base_url + suffix
                 try:
@@ -2638,6 +2696,11 @@ class LinkedInExtractor:
                         profile_urn = await self._extract_profile_urn()
                 except LinkedInScraperException:
                     raise
+                except TargetClosedError:
+                    # A closed target is not a property of the section; every
+                    # later section would fail identically, so it is the call
+                    # that has to fail, not the section.
+                    raise
                 except Exception as e:
                     logger.warning("Error scraping section %s: %s", section_name, e)
                     section_errors[section_name] = build_issue_diagnostics(
@@ -2657,7 +2720,9 @@ class LinkedInExtractor:
 
                 if rate_limited:
                     break
-        except LinkedInScraperException as e:
+        except (LinkedInScraperException, TargetClosedError) as e:
+            # The closed target is re-raised past the section loop above, so
+            # it reaches the caller only through this handler.
             if callbacks:
                 await callbacks.on_error(e)
             raise
@@ -3249,7 +3314,7 @@ class LinkedInExtractor:
                 continue
 
             if not first_show_all:
-                await human_pause(_NAV_DELAY)
+                await human_pause(_nav_delay())
             first_show_all = False
 
             try:
@@ -3736,7 +3801,7 @@ class LinkedInExtractor:
         try:
             for i, (section_name, suffix, is_overlay) in enumerate(requested_ordered):
                 if i > 0:
-                    await human_pause(_NAV_DELAY)
+                    await human_pause(_nav_delay())
 
                 url = base_url + suffix
                 try:
@@ -3760,6 +3825,9 @@ class LinkedInExtractor:
                         section_errors[section_name] = extracted.error
                 except LinkedInScraperException:
                     raise
+                except TargetClosedError:
+                    # Not a property of the section; see scrape_person.
+                    raise
                 except Exception as e:
                     logger.warning("Error scraping section %s: %s", section_name, e)
                     section_errors[section_name] = build_issue_diagnostics(
@@ -3779,7 +3847,9 @@ class LinkedInExtractor:
 
                 if rate_limited:
                     break
-        except LinkedInScraperException as e:
+        except (LinkedInScraperException, TargetClosedError) as e:
+            # The closed target is re-raised past the section loop above, so
+            # it reaches the caller only through this handler.
             if callbacks:
                 await callbacks.on_error(e)
             raise
@@ -4339,19 +4409,20 @@ class LinkedInExtractor:
                 break
 
             elapsed = time.monotonic() - started
-            if page_num > 0 and elapsed + _NAV_DELAY + slowest_page > budget:
+            nav_delay = _nav_delay()
+            if page_num > 0 and elapsed + nav_delay + slowest_page > budget:
                 logger.debug(
                     "Stopping after %d pages: %.1fs spent, another page costs "
                     "up to %.1fs and the budget is %.1fs",
                     page_num,
                     elapsed,
-                    _NAV_DELAY + slowest_page,
+                    nav_delay + slowest_page,
                     budget,
                 )
                 break
 
             if page_num > 0:
-                await human_pause(_NAV_DELAY)
+                await human_pause(nav_delay)
 
             # Started after the delay, because the prediction above adds
             # `_NAV_DELAY` to `slowest_page` itself. Timing from before the
@@ -4602,12 +4673,13 @@ class LinkedInExtractor:
                 if result.text != _RATE_LIMITED_MSG:
                     return result
 
+                retry_delay = _rate_limit_retry_delay()
                 logger.info(
                     "Retrying saved jobs page %s after %.0fs backoff",
                     url,
-                    _RATE_LIMIT_RETRY_DELAY,
+                    retry_delay,
                 )
-                await asyncio.sleep(_RATE_LIMIT_RETRY_DELAY)
+                await asyncio.sleep(retry_delay)
                 result = await self._extract_saved_jobs_page_once(url, section_name)
                 if result.text == _RATE_LIMITED_MSG:
                     logger.warning(
@@ -4782,7 +4854,7 @@ class LinkedInExtractor:
                 break
 
             if page_num > 0:
-                await human_pause(_NAV_DELAY)
+                await human_pause(_nav_delay())
 
             url = (
                 base_url
@@ -5057,7 +5129,7 @@ class LinkedInExtractor:
             # A batch resolves names back to back, so the previous name's
             # About page and this search are consecutive navigations.
             if self._company_lookup_navigated:
-                await human_pause(_NAV_DELAY)
+                await human_pause(_nav_delay())
             extracted = await self.extract_page(
                 search_url, section_name="search_results"
             )
@@ -5097,7 +5169,7 @@ class LinkedInExtractor:
 
         if slug is not None and urn is None:
             if searched or self._company_lookup_navigated:
-                await human_pause(_NAV_DELAY)
+                await human_pause(_nav_delay())
             about = await self.extract_page(
                 company_page_url(slug, "/about/"), section_name="about"
             )
@@ -5344,7 +5416,7 @@ class LinkedInExtractor:
         resolved = bool(current_ids or past_ids)
         for page_num in range(1, max_pages + 1):
             if page_num > 1 or resolved:
-                await human_pause(_NAV_DELAY)
+                await human_pause(_nav_delay())
 
             url = base_url if page_num == 1 else f"{base_url}&page={page_num}"
             # Uncapped: the rows pair against every anchor on the page, and
@@ -5524,7 +5596,7 @@ class LinkedInExtractor:
 
         for page_num in range(1, max_pages + 1):
             if page_num > 1:
-                await human_pause(_NAV_DELAY)
+                await human_pause(_nav_delay())
 
             url = base_url if page_num == 1 else f"{base_url}&page={page_num}"
             # Uncapped: the rows pair against every anchor on the page, and
