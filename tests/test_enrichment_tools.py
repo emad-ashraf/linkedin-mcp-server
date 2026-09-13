@@ -5,7 +5,9 @@ loop around it -- that it stops for the right reasons, persists as it goes,
 and never silently drops a queued profile.
 """
 
+import asyncio
 import logging
+import time
 from datetime import date, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -27,8 +29,13 @@ from linkedin_mcp_server.pacing import (
     JobStore,
     Ledger,
     Schedule,
+    request_arrived_at,
 )
-from linkedin_mcp_server.tools.enrichment import _normalize
+from linkedin_mcp_server.tools.enrichment import (
+    RETRY_AFTER_QUEUED_OUT,
+    _normalize,
+    register_enrichment_tools,
+)
 
 from test_tools import get_tool_fn
 
@@ -627,6 +634,57 @@ class TestRunBunch:
 
         assert out["stopped_because"] == "queue_empty"
         assert "next_run_after_seconds" not in out
+
+    async def test_a_call_queued_past_its_deadline_loads_nothing(
+        self, mcp, store, mock_context, monkeypatch
+    ):
+        """The incident: queued 200 s behind another session, past the 210 s
+        the frontend proxy waits, then run to completion for nobody."""
+        await self._seed(mcp, store, ["a", "b"])
+        extractor = _extractor()
+        arrival = request_arrived_at.set(time.monotonic() - 200)
+        try:
+            fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+            out = await fn("j", mock_context, extractor=extractor)
+        finally:
+            request_arrived_at.reset(arrival)
+
+        extractor.scrape_person.assert_not_awaited()
+        assert out["stopped_because"] == "tool_deadline"
+        assert out["next_run_after_seconds"] == RETRY_AFTER_QUEUED_OUT
+        assert store.load("j").pending == ["a", "b"]
+        assert store.load(ACCOUNT_BUDGET_JOB).ledger.spent(datetime.now()) == 0
+
+    async def test_time_spent_queued_shortens_the_deadline(
+        self, mcp, store, mock_context, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.enrichment.step_delay", lambda **k: 0
+        )
+        await self._seed(mcp, store, ["a", "b"])
+        extractor = _extractor()
+        page = extractor.scrape_person.return_value
+
+        async def slow_scrape(username, sections, callbacks=None):
+            await asyncio.sleep(0.3)
+            return page
+
+        extractor.scrape_person = AsyncMock(side_effect=slow_scrape)
+        server = FastMCP("test")
+        # 75% of 13.6 s is 10.2 s from arrival; 10 s of that already went by
+        # in the queue, so one 0.3 s profile is all there is time for.
+        register_enrichment_tools(server, tool_timeout=13.6)
+
+        arrival = request_arrived_at.set(time.monotonic() - 10)
+        try:
+            fn = await get_tool_fn(server, "run_enrichment_bunch")
+            out = await fn("j", mock_context, extractor=extractor)
+        finally:
+            request_arrived_at.reset(arrival)
+
+        assert out["stopped_because"] == "tool_deadline"
+        assert out["done"] == 1
+        assert store.load("j").pending == ["b"]
 
 
 class TestStatus:

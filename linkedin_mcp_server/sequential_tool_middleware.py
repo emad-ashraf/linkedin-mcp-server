@@ -17,7 +17,12 @@ from fastmcp.tools import ToolResult
 from linkedin_mcp_server.config import get_config
 from linkedin_mcp_server.config.loaders import EnvironmentKeys
 from linkedin_mcp_server.exceptions import BrowserBusyError
-from linkedin_mcp_server.pacing import JobStore, load_account_budget, tool_call_gap
+from linkedin_mcp_server.pacing import (
+    JobStore,
+    load_account_budget,
+    request_arrived_at,
+    tool_call_gap,
+)
 from linkedin_mcp_server.profile_lease import get_profile_lease
 
 logger = logging.getLogger(__name__)
@@ -102,30 +107,38 @@ class SequentialToolExecutionMiddleware(Middleware):
     ) -> ToolResult:
         tool_name = context.message.name
         wait_started = time.perf_counter()
-        logger.debug("Waiting for scraper lock for tool '%s'", tool_name)
-        await self._report_progress(
-            context,
-            message="Queued waiting for scraper lock",
-        )
-
-        async with self._lock:
-            wait_seconds = time.perf_counter() - wait_started
-            logger.debug(
-                "Acquired scraper lock for tool '%s' after %.3fs",
-                tool_name,
-                wait_seconds,
-            )
+        # Recorded before the lock wait: the tool's own timeout starts only
+        # once the call is let through, so this is the one clock that sees
+        # the queue.
+        arrival = request_arrived_at.set(time.monotonic())
+        try:
+            logger.debug("Waiting for scraper lock for tool '%s'", tool_name)
             await self._report_progress(
                 context,
-                message="Scraper lock acquired, starting tool",
+                message="Queued waiting for scraper lock",
             )
-            # Slept holding the lock on purpose: the gap is between calls to
-            # LinkedIn, so letting a queued call run through it would defeat
-            # it. The cross-process lease is not held here -- that one is taken
-            # inside, after the wait, so no other process is blocked by ours.
-            if tool_name not in self._LOCAL_ONLY_TOOLS:
-                await self._space_out_the_call(context, tool_name)
-            return await self._run_owning_the_profile(context, call_next, tool_name)
+
+            async with self._lock:
+                wait_seconds = time.perf_counter() - wait_started
+                logger.debug(
+                    "Acquired scraper lock for tool '%s' after %.3fs",
+                    tool_name,
+                    wait_seconds,
+                )
+                await self._report_progress(
+                    context,
+                    message="Scraper lock acquired, starting tool",
+                )
+                # Slept holding the lock on purpose: the gap is between calls
+                # to LinkedIn, so letting a queued call run through it would
+                # defeat it. The cross-process lease is not held here -- that
+                # one is taken inside, after the wait, so no other process is
+                # blocked by ours.
+                if tool_name not in self._LOCAL_ONLY_TOOLS:
+                    await self._space_out_the_call(context, tool_name)
+                return await self._run_owning_the_profile(context, call_next, tool_name)
+        finally:
+            request_arrived_at.reset(arrival)
 
     async def _space_out_the_call(
         self,

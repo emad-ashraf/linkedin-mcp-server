@@ -7,6 +7,7 @@ and that a rate limit never loses progress.
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
@@ -29,7 +30,9 @@ from linkedin_mcp_server.pacing import (
     JobStore,
     Ledger,
     Schedule,
+    request_arrived_at,
 )
+from linkedin_mcp_server.tools.enrichment import RETRY_AFTER_QUEUED_OUT
 
 from test_company_cache import _NOT_FOUND_LIVE
 from test_search_parse import COMPANY_PAGE
@@ -737,6 +740,63 @@ class TestEnrichCompanies:
         assert out["stopped_because"] == "tool_deadline"
         assert (out["fetched"], out["about_loaded"]) == (1, 0)
         assert out["results"]["Copado"]["source"] == "search"
+        assert _spent(jobs) == 1
+
+    async def test_a_call_queued_past_its_deadline_loads_nothing(
+        self, mcp, wired, mock_context
+    ):
+        """Queued 200 s behind another session, past the 210 s the frontend
+        proxy waits: nothing is searched and nothing is charged."""
+        _, jobs = wired
+        extractor = _search_extractor(["copado"])
+
+        arrival = request_arrived_at.set(time.monotonic() - 200)
+        try:
+            fn = await get_tool_fn(mcp, "enrich_companies")
+            out = await fn(["Copado"], mock_context, extractor=extractor)
+        finally:
+            request_arrived_at.reset(arrival)
+
+        extractor.search_companies.assert_not_awaited()
+        assert out["stopped_because"] == "tool_deadline"
+        assert out["next_run_after_seconds"] == RETRY_AFTER_QUEUED_OUT
+        assert out["fetched"] == 0
+        assert _spent(jobs) == 0
+
+    async def test_time_spent_queued_shortens_the_deadline(
+        self, wired, mock_context, monkeypatch
+    ):
+        from linkedin_mcp_server.tools.company_enrichment import (
+            register_company_enrichment_tools,
+        )
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        _, jobs = wired
+        extractor = _search_extractor(["copado"])
+        page = extractor.search_companies.return_value
+
+        async def slow_search(name):
+            await asyncio.sleep(0.3)
+            return page
+
+        extractor.search_companies = AsyncMock(side_effect=slow_search)
+        server = FastMCP("test")
+        # 75% of 13.6 s is 10.2 s from arrival; 10 s of that already went by
+        # in the queue, so the 0.3 s search is all there is time for.
+        register_company_enrichment_tools(server, tool_timeout=13.6)
+
+        arrival = request_arrived_at.set(time.monotonic() - 10)
+        try:
+            fn = await get_tool_fn(server, "enrich_companies")
+            out = await fn(["Copado"], mock_context, about=True, extractor=extractor)
+        finally:
+            request_arrived_at.reset(arrival)
+
+        extractor.scrape_company.assert_not_awaited()
+        assert out["stopped_because"] == "tool_deadline"
+        assert (out["fetched"], out["about_loaded"]) == (1, 0)
         assert _spent(jobs) == 1
 
     async def test_a_rate_limited_about_stops_the_bunch_and_is_not_stamped_fresh(

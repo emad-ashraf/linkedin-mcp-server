@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from datetime import datetime
 from typing import Annotated, Any
 
@@ -43,6 +44,7 @@ from linkedin_mcp_server.pacing import (
     load_account_budget,
     max_daily_actions,
     next_bunch_delay,
+    request_arrived_at,
     step_delay,
 )
 
@@ -51,6 +53,10 @@ logger = logging.getLogger(__name__)
 # Leave headroom inside the tool timeout so a bunch always returns and
 # persists rather than being killed mid-profile.
 DEADLINE_FRACTION = 0.75
+
+# What the bunch tells the caller when it was already out of time on arrival:
+# nothing ran, so the pause is a tool-call gap, not a between-bunches one.
+RETRY_AFTER_QUEUED_OUT = 10.0
 
 _CLOSED_TARGET_MSG = "Target page, context or browser has been closed"
 
@@ -343,13 +349,36 @@ def register_enrichment_tools(
                 ),
             )
 
+        # From arrival at the middleware, not from here: the frontend proxy
+        # gives up tool_timeout + 30 s (210 s at the defaults) after it sent
+        # the call, and a call queued behind another session's spends that
+        # waiting before its own timeout starts. Measured: a bunch let
+        # through after the proxy had gone ran to completion for nobody.
+        arrived = request_arrived_at.get()
+        deadline = (
+            time.monotonic() if arrived is None else arrived
+        ) + tool_timeout * DEADLINE_FRACTION
+        if time.monotonic() >= deadline:
+            return _status(
+                job,
+                budget,
+                now,
+                stopped="tool_deadline",
+                next_run_after=RETRY_AFTER_QUEUED_OUT,
+                gathered={},
+                detail=(
+                    "Queued behind other calls for longer than the tool "
+                    "deadline; nothing was loaded and nothing was charged. "
+                    "Call again."
+                ),
+            )
+
         extractor = extractor or await get_ready_extractor(
             ctx, tool_name="run_enrichment_bunch"
         )
 
         # Never plan more profiles than the budget can pay for at `cost` each.
         planned = min(bunch_size, remaining // cost, len(job.pending))
-        deadline = asyncio.get_running_loop().time() + tool_timeout * DEADLINE_FRACTION
 
         gathered: dict[str, Any] = {}
         stopped = "bunch_complete"
@@ -408,7 +437,7 @@ def register_enrichment_tools(
             )
 
         for index in range(planned):
-            if asyncio.get_running_loop().time() >= deadline:
+            if time.monotonic() >= deadline:
                 stopped = "tool_deadline"
                 break
 

@@ -13,7 +13,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from linkedin_mcp_server.config.loaders import EnvironmentKeys
-from linkedin_mcp_server.pacing import JobStore, load_account_budget
+from linkedin_mcp_server.pacing import (
+    JobStore,
+    load_account_budget,
+    request_arrived_at,
+)
 from linkedin_mcp_server.sequential_tool_middleware import (
     SequentialToolExecutionMiddleware,
 )
@@ -161,3 +165,33 @@ class TestSelfRecordingToolsAreNotCountedTwice:
 
         # Unlike a local-only tool, this one waits: it did reach LinkedIn.
         assert second >= GAP * 0.8
+
+
+class TestArrivalIsRecordedBeforeTheQueue:
+    """A bunch's deadline has to see the time its call spent queued.
+
+    The tool timeout starts only once the middleware lets a call through, so a
+    call queued behind another session's can already be past the frontend
+    proxy's deadline when it starts. The middleware records the arrival for the
+    tool to start its deadline from.
+    """
+
+    async def test_the_tool_sees_the_arrival_from_before_the_gap(self, paced):
+        seen: list[float | None] = []
+
+        async def call_next(context):
+            seen.append(request_arrived_at.get())
+            return None
+
+        await paced.on_call_tool(_call_context(), AsyncMock())
+        await paced.on_call_tool(_call_context(), call_next)
+
+        assert seen[0] is not None
+        # The second call sat out the gap between arrival and running, so an
+        # arrival stamped after the wait would read as (almost) now.
+        assert time.monotonic() - seen[0] >= GAP * 0.8
+
+    async def test_the_arrival_is_reset_after_the_call(self, paced):
+        await paced.on_call_tool(_call_context(), AsyncMock())
+
+        assert request_arrived_at.get() is None

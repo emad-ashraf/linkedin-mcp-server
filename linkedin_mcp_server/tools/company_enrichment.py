@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from datetime import datetime
 from typing import Annotated, Any, NoReturn
 
@@ -65,6 +66,7 @@ from linkedin_mcp_server.pacing import (
     bunch_searches_max,
     load_account_budget,
     next_bunch_delay,
+    request_arrived_at,
     step_delay,
 )
 from linkedin_mcp_server.scraping.company_parse import (
@@ -76,6 +78,7 @@ from linkedin_mcp_server.scraping.company_parse import (
 )
 from linkedin_mcp_server.scraping.extractor import _RATE_LIMITED_MSG
 from linkedin_mcp_server.tools.enrichment import (
+    RETRY_AFTER_QUEUED_OUT,
     _browser_gone,
     _BrowserGone,
     _closed_target_filed,
@@ -291,11 +294,30 @@ def register_company_enrichment_tools(
                 detail="Shared 24h action budget spent; refills gradually.",
             )
 
+        # From arrival at the middleware, not from here; see the same
+        # computation in run_enrichment_bunch for the 210 s proxy deadline
+        # a queued call can outlive before its own timeout has started.
+        arrived = request_arrived_at.get()
+        deadline = (
+            time.monotonic() if arrived is None else arrived
+        ) + tool_timeout * DEADLINE_FRACTION
+        if time.monotonic() >= deadline:
+            return _paced_return(
+                served,
+                0,
+                "tool_deadline",
+                RETRY_AFTER_QUEUED_OUT,
+                detail=(
+                    "Queued behind other calls for longer than the tool "
+                    "deadline; nothing was loaded and nothing was charged. "
+                    "Call again."
+                ),
+            )
+
         extractor = extractor or await get_ready_extractor(
             ctx, tool_name="enrich_companies"
         )
         rng = random.Random()
-        deadline = asyncio.get_running_loop().time() + tool_timeout * DEADLINE_FRACTION
         spent = 0
         about_loaded = 0
         stopped = "bunch_complete"
@@ -390,7 +412,7 @@ def register_company_enrichment_tools(
         for name in to_fetch:
             if _navigations() >= bunch_searches:
                 break
-            if asyncio.get_running_loop().time() >= deadline:
+            if time.monotonic() >= deadline:
                 stopped = "tool_deadline"
                 break
 
@@ -503,7 +525,7 @@ def register_company_enrichment_tools(
                     break
                 # The loop-top check ran before the search; a slow search can
                 # have carried past the deadline since.
-                if asyncio.get_running_loop().time() >= deadline:
+                if time.monotonic() >= deadline:
                     stopped = "tool_deadline"
                     break
                 await asyncio.sleep(step_delay(rng=rng))

@@ -30,6 +30,7 @@ The model mirrors what the established LinkedIn automation tools converged on:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import math
@@ -46,6 +47,15 @@ from linkedin_mcp_server.limits import env_float, env_int, env_int_list
 logger = logging.getLogger(__name__)
 
 WINDOW_SECONDS = 24 * 60 * 60
+
+#: Monotonic instant (``time.monotonic()``) at which the current MCP tool
+#: request reached the middleware -- before it queued for the scraper lock, not
+#: after it was let through. A bunch starts its deadline from this so the time
+#: spent queued counts against it. ``None`` when no middleware is driving the
+#: call (a direct call, a test), in which case the bunch starts from now.
+request_arrived_at: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "linkedin_mcp_request_arrived_at", default=None
+)
 
 # Every number below is a default; the named environment variable replaces it
 # at call time through the accessor next to it. Nothing reads these module
