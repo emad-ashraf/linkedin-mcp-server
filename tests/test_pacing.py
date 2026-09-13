@@ -234,6 +234,11 @@ class TestJobRoundTrip:
         assert restored.schedule.days_off == (6,)
         assert restored.warmup is False
 
+    def test_a_job_file_without_strikes_loads_with_none(self):
+        # Job files written before strikes existed carry no such key.
+        job = Job.from_dict({"name": "j", "started_on": "2020-01-01"})
+        assert job.strikes == {}
+
     def test_effective_cap_applies_warmup_then_jitter(self):
         job = Job(name="j", started_on=date(2026, 8, 5), daily_cap=100)
         # Day 0 of the ramp caps at 10, jitter can only shave it.

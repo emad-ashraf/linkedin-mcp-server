@@ -422,6 +422,9 @@ class Job:
     pending: list[str] = field(default_factory=list)
     done: dict[str, Any] = field(default_factory=dict)
     failed: dict[str, str] = field(default_factory=dict)
+    # Consecutive empty-page visits per pending username, so a profile that
+    # never loads can be struck out instead of blocking the queue for good.
+    strikes: dict[str, int] = field(default_factory=dict)
     ledger: Ledger = field(default_factory=Ledger)
     daily_cap: int = field(default_factory=default_daily_actions)
     schedule: Schedule = field(default_factory=Schedule)
@@ -444,6 +447,7 @@ class Job:
             "pending": self.pending,
             "done": self.done,
             "failed": self.failed,
+            "strikes": self.strikes,
             "actions": self.ledger.actions,
             "daily_cap": self.daily_cap,
             "warmup": self.warmup,
@@ -472,6 +476,7 @@ class Job:
             pending=list(raw.get("pending", [])),
             done=dict(raw.get("done", {})),
             failed=dict(raw.get("failed", {})),
+            strikes=dict(raw.get("strikes", {})),
             ledger=Ledger(actions=list(raw.get("actions", []))),
             daily_cap=raw.get("daily_cap", default_daily_actions()),
             schedule=schedule,

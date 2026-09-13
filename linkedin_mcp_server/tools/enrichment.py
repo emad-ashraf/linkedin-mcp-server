@@ -58,6 +58,10 @@ DEADLINE_FRACTION = 0.75
 # nothing ran, so the pause is a tool-call gap, not a between-bunches one.
 RETRY_AFTER_QUEUED_OUT = 10.0
 
+# Empty pages in a row before a profile is filed as failed rather than read
+# as a rate limit: a deleted or private URL looks exactly like a throttle.
+EMPTY_PAGE_STRIKES = 2
+
 _CLOSED_TARGET_MSG = "Target page, context or browser has been closed"
 
 
@@ -116,6 +120,16 @@ class _RelaunchFailed(Exception):
     def __init__(self, cause: Exception) -> None:
         super().__init__(str(cause))
         self.cause = cause
+
+
+class _EmptyPage(RateLimitError):
+    """A profile that came back as an empty shell, filed as a soft rate limit.
+
+    Kept apart from the hard kind (an HTTP 429, a checkpoint or authwall
+    challenge raised by the extractor) because only this shape is ambiguous
+    with a deleted or private profile and may be struck out; a hard limit
+    under sustained pressure must never drain the queue into ``failed``.
+    """
 
 
 def _soft_rate_limit(result: dict[str, Any]) -> str | None:
@@ -382,6 +396,9 @@ def register_enrichment_tools(
 
         gathered: dict[str, Any] = {}
         stopped = "bunch_complete"
+        # The username struck out by the previous visit of this call, if any:
+        # the next visit emptying too says the whole session is throttled.
+        struck_this_call: str | None = None
 
         async def _scrape(username: str) -> dict[str, Any]:
             """One profile visit, with both shapes of a dead browser raised
@@ -398,7 +415,7 @@ def register_enrichment_tools(
                 # With nothing loaded, a filed rate limit is the whole answer,
                 # and it is a rate limit, not a dead browser.
                 if limit := _soft_rate_limit(result):
-                    raise RateLimitError(limit)
+                    raise _EmptyPage(limit)
                 errors = result.get("section_errors", {})
                 if _closed_target_filed(errors):
                     raise _BrowserGone("every section failed", errors)
@@ -466,6 +483,45 @@ def register_enrichment_tools(
                 # `failed` (which an auth error, a sibling of RateLimitError,
                 # would otherwise do by falling through to the generic handler).
                 is_auth = isinstance(e, AuthenticationError)
+                if isinstance(e, _EmptyPage):
+                    # The heuristic cannot tell a throttle from a profile that
+                    # is gone; both come back as an empty shell. The same
+                    # username emptying on consecutive calls is struck out
+                    # rather than heading the queue on every call forever --
+                    # unless the very next profile in the same call empties
+                    # too, which is a session-wide throttle, not a dead URL:
+                    # then the strike-out is undone and the call backs off.
+                    job.strikes[username] = job.strikes.get(username, 0) + 1
+                    if struck_this_call is not None:
+                        job.pending.insert(0, struck_this_call)
+                        del job.failed[struck_this_call]
+                        job.strikes[struck_this_call] = EMPTY_PAGE_STRIKES
+                        logger.info(
+                            "%s emptied right after %s was struck out; "
+                            "re-queued it as a throttle",
+                            username,
+                            struck_this_call,
+                        )
+                    elif job.strikes[username] >= EMPTY_PAGE_STRIKES:
+                        job.pending.pop(0)
+                        del job.strikes[username]
+                        job.failed[username] = (
+                            f"empty page on {EMPTY_PAGE_STRIKES} consecutive visits "
+                            "(heuristic rate limit); profile is probably deleted "
+                            "or private"
+                        )
+                        # The striking visit was a real page load, so it is
+                        # charged and paced like any other; the first stays
+                        # uncharged.
+                        for _ in range(cost):
+                            budget.ledger.record(now)
+                        store.save(job)
+                        store.save(budget)
+                        logger.info("Enrichment struck out %s: %s", username, e)
+                        struck_this_call = username
+                        if index != planned - 1:
+                            await asyncio.sleep(step_delay(rng=rng))
+                        continue
                 logger.warning(
                     "%s during enrichment bunch: %s",
                     "Auth expired" if is_auth else "Rate limited",
@@ -495,12 +551,16 @@ def register_enrichment_tools(
                 )
             except Exception as e:
                 job.pending.pop(0)
+                job.strikes.pop(username, None)
                 job.failed[username] = str(e)[:200]
                 store.save(job)
                 logger.info("Enrichment failed for %s: %s", username, e)
+                struck_this_call = None
                 continue
 
             job.pending.pop(0)
+            job.strikes.pop(username, None)
+            struck_this_call = None
             job.done[username] = result
             gathered[username] = result
             # Every page load counts against the shared budget, extras included.
