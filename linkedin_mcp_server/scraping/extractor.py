@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import json
 import logging
 import re
@@ -17,7 +19,12 @@ import anyio
 import anyio.lowlevel
 from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
+# Upstream Playwright re-exports this from ``async_api``; patchright does not.
+from patchright._impl._errors import TargetClosedError
+
+from linkedin_mcp_server.config.loaders import EnvironmentKeys
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
+from linkedin_mcp_server.company_cache import CompanyCache, normalize_company_name
 from linkedin_mcp_server.core import (
     detect_auth_barrier,
     detect_auth_barrier_quick,
@@ -29,10 +36,12 @@ from linkedin_mcp_server.core import (
 from linkedin_mcp_server.core.exceptions import (
     AuthenticationError,
     LinkedInScraperException,
+    RateLimitError,
 )
 from linkedin_mcp_server.debug_trace import record_page_trace
 from linkedin_mcp_server.debug_utils import stabilize_navigation
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
+from linkedin_mcp_server.limits import env_float, env_int
 from linkedin_mcp_server.core.utils import (
     _JOB_CARD_SELECTOR,
     _RAIL_PICK_JS,
@@ -42,6 +51,7 @@ from linkedin_mcp_server.core.utils import (
     scroll_to_bottom,
 )
 from linkedin_mcp_server.scraping.connection import ActionSignals
+from linkedin_mcp_server.scraping.company_parse import parse_search_results
 from linkedin_mcp_server.scraping.identifiers import (
     company_page_url,
     job_view_url,
@@ -52,6 +62,11 @@ from linkedin_mcp_server.scraping.identifiers import (
     normalize_person_identifier,
     person_profile_url,
 )
+from linkedin_mcp_server.scraping.search_parse import (
+    parse_company_cards,
+    parse_people_cards,
+    parse_result_count,
+)
 from linkedin_mcp_server.scraping.link_metadata import (
     JOB_PATH_RE,
     Reference,
@@ -61,6 +76,12 @@ from linkedin_mcp_server.scraping.link_metadata import (
 )
 
 from .fields import COMPANY_SECTIONS, PERSON_SECTIONS
+from linkedin_mcp_server.core.humanize import (
+    human_pause,
+    human_type,
+    humanize_after_nav,
+    jitter,
+)
 
 if TYPE_CHECKING:
     from linkedin_mcp_server.callbacks import ProgressCallback
@@ -69,11 +90,114 @@ logger = logging.getLogger(__name__)
 
 WaitUntil = Literal["commit", "domcontentloaded", "load", "networkidle"]
 
-# Pacing between page navigations
+# Pacing between page navigations. Default for `NAV_DELAY_SECONDS`.
 _NAV_DELAY = 2.0
 
-# Backoff before retrying a temporarily blocked page
+# Backoff before retrying a temporarily blocked page. Each retry within one
+# scrape waits twice as long as the one before it, jittered. Default for
+# `RATE_LIMIT_RETRY_DELAY_SECONDS`.
 _RATE_LIMIT_RETRY_DELAY = 5.0
+
+# How many soft rate-limit retries one extractor may spend in total. The
+# extractor lives for exactly one tool call, so this is the whole scrape's
+# budget rather than each section's. It used to be one retry *per section*,
+# which meant an eight-section scrape that had started to be throttled sent
+# eight extra navigations -- doubling its request volume at the moment
+# LinkedIn was asking for less. Two keeps the original benefit for a genuine
+# one-off blip while capping the amplification at a constant. Default for
+# `RATE_LIMIT_RETRY_BUDGET`.
+_RATE_LIMIT_RETRY_BUDGET = 2
+
+# A hard 429 never reaches `detect_rate_limit`, which reads a page that
+# loaded. Measured live: LinkedIn answers a throttled navigation with a 429
+# that Chromium refuses to commit, so `page.goto` raises
+# `net::ERR_HTTP_RESPONSE_CODE_FAILURE` and the tab shows Chromium's own
+# "This page isn't working / HTTP ERROR 429" interstitial instead of a
+# document. The net error token is the classifier because it is a Chromium
+# constant; the interstitial's prose is browser chrome and is translated, so
+# matching it would break the locale-independence rule.
+#
+# The token alone is NOT a 429. Chromium raises it for any response code the
+# navigation stack refuses, 404 and 403 and 5xx included, so treating it as a
+# rate limit on its own told a user who mistyped a username to wait five
+# minutes and skipped the not-found branch in `error_handler` entirely. It is
+# therefore only half the signal: the status has to be corroborated off the
+# interstitial before this is called a rate limit, and an uncorroborated
+# refusal is re-raised as the navigation error it already was.
+_HTTP_STATUS_NAV_FAILURE = "ERR_HTTP_RESPONSE_CODE_FAILURE"
+
+# The status on Chromium's own error page, as digits. The words around it are
+# translated; the number is not, which is the whole reason to match on it
+# rather than on "too many requests". Bounded by a word boundary so a 429 in a
+# URL or a timestamp elsewhere on the page cannot stand in for the status.
+_HTTP_STATUS_ON_INTERSTITIAL = re.compile(r"\b429\b")
+
+# The other shape of the same thing, and the reason `page.goto`'s return value
+# is no longer discarded: a 429 that Chromium *does* commit comes back as an
+# ordinary response. Measured against a local server answering 429, with and
+# without a body, under both `wait_until="domcontentloaded"` and `"commit"`:
+# `goto` returns rather than raising, `status` is 429 and `Retry-After`
+# survives on `headers`. No `wait_until` change is needed to see it.
+_HTTP_TOO_MANY_REQUESTS = 429
+
+# Pause before a hard rate limit is reported, doubling per hit within one
+# scrape and jittered like every other deliberate pause here. Bounded well
+# under the tool timeout on purpose: this cannot wait out a real limit, it
+# only stops the next tool call from leaving for it immediately. How long to
+# actually wait is carried to the client on `RateLimitError.suggested_wait_time`.
+# Defaults for `RATE_LIMIT_BACKOFF_DELAY_SECONDS` and
+# `RATE_LIMIT_BACKOFF_MAX_SECONDS`.
+_RATE_LIMIT_BACKOFF_DELAY = 5.0
+_RATE_LIMIT_BACKOFF_MAX = 30.0
+# Enough doublings to reach the cap from the base delay, and no more.
+# Default for `RATE_LIMIT_BACKOFF_MAX_DOUBLINGS`.
+_RATE_LIMIT_BACKOFF_MAX_DOUBLINGS = 8
+
+# The longest `Retry-After` worth repeating to a client. LinkedIn asking for a
+# day off is a real answer, but relaying it unchanged makes the tool look hung;
+# the cap keeps the report actionable and the server still refuses to scrape.
+# Default for `RETRY_AFTER_CEILING_SECONDS`.
+_RETRY_AFTER_CEILING = 3600
+
+
+# Read at call time so an operator's environment replaces the defaults above
+# without an import-order dependency; see `linkedin_mcp_server.limits`.
+def _nav_delay() -> float:
+    return env_float(EnvironmentKeys.NAV_DELAY_SECONDS, _NAV_DELAY)
+
+
+def _rate_limit_retry_delay() -> float:
+    return env_float(
+        EnvironmentKeys.RATE_LIMIT_RETRY_DELAY_SECONDS, _RATE_LIMIT_RETRY_DELAY
+    )
+
+
+def _rate_limit_retry_budget() -> int:
+    return env_int(EnvironmentKeys.RATE_LIMIT_RETRY_BUDGET, _RATE_LIMIT_RETRY_BUDGET)
+
+
+def _rate_limit_backoff_delay() -> float:
+    return env_float(
+        EnvironmentKeys.RATE_LIMIT_BACKOFF_DELAY_SECONDS, _RATE_LIMIT_BACKOFF_DELAY
+    )
+
+
+def _rate_limit_backoff_max() -> float:
+    return env_float(
+        EnvironmentKeys.RATE_LIMIT_BACKOFF_MAX_SECONDS, _RATE_LIMIT_BACKOFF_MAX
+    )
+
+
+def _rate_limit_backoff_max_doublings() -> int:
+    return env_int(
+        EnvironmentKeys.RATE_LIMIT_BACKOFF_MAX_DOUBLINGS,
+        _RATE_LIMIT_BACKOFF_MAX_DOUBLINGS,
+    )
+
+
+def _retry_after_ceiling() -> int:
+    return env_int(EnvironmentKeys.RETRY_AFTER_CEILING_SECONDS, _RETRY_AFTER_CEILING)
+
 
 # Returned as section text when a page comes back with its content gone and
 # only LinkedIn's own navigation and footer left.
@@ -92,6 +216,37 @@ _RATE_LIMIT_RETRY_DELAY = 5.0
 # deliberately — body text would be a per-locale guess, and this project's
 # rule is that classification never depends on text values.
 _RATE_LIMITED_MSG = "[Rate limited] LinkedIn blocked this section. Try again later or request fewer sections."
+
+
+def _retry_after_seconds(value: str | None) -> int | None:
+    """`Retry-After` in whole seconds, or None when absent or unreadable.
+
+    RFC 6585 allows either a delay in seconds or an HTTP-date, and both are
+    accepted here. None is returned rather than a guess: nothing downstream may
+    invent a wait LinkedIn did not ask for.
+
+    The result is clamped to `_RETRY_AFTER_CEILING`. A header is a request, not
+    an instruction, and an hour-long one relayed verbatim reads to the client
+    as the server having hung. The clamp is on the number reported, never on
+    anything slept on -- nothing here sleeps for `Retry-After`.
+
+    `isascii()` guards the `isdigit()`: superscripts and other Unicode digits
+    answer True to `isdigit()` and then raise inside `int()`, which on this
+    path would replace a rate-limit report with an unrelated traceback.
+    """
+    if not value:
+        return None
+    value = value.strip()
+    if value.isascii() and value.isdigit():
+        return min(_retry_after_ceiling(), int(value))
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    seconds = int((when - datetime.now(timezone.utc)).total_seconds())
+    return min(_retry_after_ceiling(), max(0, seconds))
 
 
 def _reconcile_search_references(
@@ -416,14 +571,86 @@ _CONTENT_DATE_POSTED_MAP = {
     "past_month": "past-month",
 }
 
-# Content search is an infinite scroll with no ``&start=`` pagination, so
-# ``max_pages`` caps scroll depth instead of fetching discrete pages. One
-# nominal "page" is this many scrolls.
-_CONTENT_SCROLLS_PER_REQUESTED_PAGE = 5
+# Content search is an infinite scroll with no ``&start=`` pagination, and
+# the results render in an inner scrollable region, so ``window.scrollTo``
+# never moves it. ``_scroll_content_search_results`` wheel-scrolls instead
+# and stops on a result count, so this is only a runaway guard.
+_CONTENT_SEARCH_MAX_SCROLLS = 20
+
+# Counts result cards on a content-search page. Every card links its author
+# (``/in/`` or ``/company/``), but so does every @-mention in a post body,
+# and one mention-heavy post reached ``max_posts`` before the first wheel
+# when the count was distinct hrefs. Anchors are grouped by their nearest
+# list-item or article ancestor, which is structure rather than layout; where
+# no such ancestor exists the distinct hrefs stand in, which is the old
+# count. Either way the estimate errs toward scrolling further, never toward
+# reporting fewer cards than the anchors seen.
+# TODO(live-verify): the ancestor chain of a content-search card is
+# unverified live; the fallback is what makes an unexpected chain harmless.
+_CONTENT_SEARCH_COUNT_JS = r"""() => {
+    const main = document.querySelector('main');
+    if (!main) return 0;
+    const cards = new Set(), hrefs = new Set();
+    for (const a of main.querySelectorAll(
+        'a[href*="/in/"], a[href*="/company/"]'
+    )) {
+        hrefs.add(a.getAttribute('href').split('?')[0]);
+        const card = a.closest('li, article, [role="article"]');
+        if (card) cards.add(card);
+    }
+    return cards.size || hrefs.size;
+}"""
 
 # Valid tokens for the people-search ``network`` facet.
 # LinkedIn accepts "F" (1st-degree), "S" (2nd-degree), "O" (3rd-degree and beyond).
 _NETWORK_TOKENS = ("F", "S", "O")
+# ``profileLanguage`` takes ISO 639-1 codes ("en", "de"); anything else is a typo.
+_PROFILE_LANGUAGE_RE = re.compile(r"[a-z]{2}")
+# ``school`` takes the numeric id ``schoolFilter`` filters on and nothing
+# else: the schools search page carries no ``schoolFilter`` anchor and no
+# numeric id in any ``/school/`` href (measured live 2026-09-12), so a name
+# cannot be resolved to one from here.
+_SCHOOL_ID_RE = re.compile(r"[0-9]+")
+
+# Company-search ``industryCompanyVertical`` facet: LinkedIn's numeric industry ids,
+# keyed by the industry name as the filter dropdown labels it (casefolded,
+# commas stripped, whitespace collapsed -- see ``_normalize_industry_name``).
+# ponytail: partial table; unknown names raise, pass the numeric id
+_COMPANY_INDUSTRY_IDS: dict[str, str] = {
+    "software development": "4",
+    "technology information and internet": "6",
+    "telecommunications": "8",
+    "business consulting and services": "11",
+    "biotechnology research": "12",
+    "hospitals and health care": "14",
+    "pharmaceutical manufacturing": "15",
+    "retail": "27",
+    "banking": "41",
+    "insurance": "42",
+    "financial services": "43",
+    "real estate": "44",
+    "construction": "48",
+    "advertising services": "80",
+    "it services and it consulting": "96",
+    "staffing and recruiting": "104",
+}
+
+# Company-search ``companySize`` facet letters, keyed by the headcount bucket
+# as LinkedIn labels it. Callers may pass either side of the mapping. The
+# letters follow LinkedIn's ``staffCountRange`` enum, which starts at
+# self-employed.
+# TODO(live-verify): letters recalled, not measured; a dropdown probe is queued.
+_COMPANY_SIZE_LETTERS: dict[str, str] = {
+    "self-employed": "A",
+    "1-10": "B",
+    "11-50": "C",
+    "51-200": "D",
+    "201-500": "E",
+    "501-1000": "F",
+    "1001-5000": "G",
+    "5001-10000": "H",
+    "10001+": "I",
+}
 
 _DIALOG_SELECTOR = 'dialog[open], [role="dialog"]'
 _DIALOG_PREMIUM_LINK_SELECTOR = (
@@ -1663,6 +1890,23 @@ def _normalize_csv(value: str, mapping: dict[str, str]) -> str:
     return ",".join(mapping.get(p, p) for p in parts)
 
 
+def _normalize_industry_name(name: str) -> str:
+    """Casefold, drop commas and collapse whitespace for industry lookup.
+
+    LinkedIn labels one entry "Technology, Information and Internet"; a
+    client that transmits list params as a comma-separated string cannot
+    carry that comma, so the lookup ignores it on both sides.
+    """
+    return " ".join(name.replace(",", " ").casefold().split())
+
+
+def _as_list(value: str | list[str] | None) -> list[str]:
+    """One value or a list of them, as a list; ``None`` is empty."""
+    if value is None:
+        return []
+    return [value] if isinstance(value, str) else list(value)
+
+
 def _encode_list_facet(values: list[str]) -> str:
     """Encode a list of string values for a LinkedIn people-search list facet.
 
@@ -1707,6 +1951,56 @@ class ExtractedSection:
     text: str
     references: list[Reference]
     error: dict[str, Any] | None = None
+
+
+_CardParser = Callable[[str, Sequence[Mapping[str, Any]]], list[dict[str, Any]]]
+
+
+def _search_rows(
+    parser: _CardParser, pages: Sequence[ExtractedSection], kind: str
+) -> tuple[list[dict[str, Any]], int | None]:
+    """Rows across the fetched results pages, deduped by URL, plus the result
+    count from the first page.
+
+    Each page is parsed on its own: the pages are only joined into one text
+    for ``sections`` afterwards, so a card can never straddle the separator.
+    A parser failure is logged and yields no rows for that page; the raw text
+    still reaches the caller, and a parser bug must never take the tool down.
+
+    ``kind`` is the reference kind the parser pairs rows with. A page that
+    carries such references but parses to no rows is a page of cards the
+    text parser did not recognise (a layout change, or a locale whose
+    degree and followers tokens differ), and is warned about rather than
+    passed off as an empty result.
+    """
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    result_count = parse_result_count(pages[0].text) if pages else None
+    for index, page in enumerate(pages):
+        try:
+            page_rows = parser(page.text, page.references)
+        except Exception:
+            logger.warning(
+                "Could not parse result cards on page %d", index + 1, exc_info=True
+            )
+            continue
+        if not page_rows:
+            anchors = sum(1 for ref in page.references if ref.get("kind") == kind)
+            if anchors:
+                logger.warning(
+                    "Page %d: %d references but no result rows parsed "
+                    "(unrecognised card layout or locale)",
+                    index + 1,
+                    anchors,
+                )
+        for row in page_rows:
+            url = row.get("url")
+            if url is not None:
+                if url in seen:
+                    continue
+                seen.add(url)
+            rows.append(row)
+    return rows, result_count
 
 
 _FEED_RSC_MARKER = "sduiid=com.linkedin.sdui.pagers.feed.mainFeed"
@@ -1848,6 +2142,30 @@ class FilterValidationError(ValueError):
     letting the MCP tool wrapper catch this case precisely and surface the
     actionable message past ``mask_error_details``.
     """
+
+
+def _company_urn_of_first_card(references: list[Reference]) -> str | None:
+    """The ``company_urn`` reference belonging to the first company card, if any.
+
+    References come in DOM order, so an id anchor sitting between the first
+    ``/company/<slug>/`` link and the next card's link (a different slug) is
+    the first card's own. One before any company link, or after the second
+    card starts, is not attributed to anything.
+    """
+    first_slug: str | None = None
+    for ref in references:
+        if ref["kind"] == "company":
+            match = re.search(r"/company/([^/?#]+)", ref["url"])
+            slug = match.group(1) if match else None
+            if first_slug is None:
+                first_slug = slug
+            elif slug != first_slug:
+                return None
+        elif first_slug is not None and ref["kind"] == "company_urn":
+            value = ref.get("value")
+            if value:
+                return str(value)
+    return None
 
 
 def strip_linkedin_noise(text: str) -> str:
@@ -1996,9 +2314,27 @@ class LinkedInExtractor:
 
     def __init__(self, page: Page):
         self._page = page
+        # location name (casefolded) -> numeric geo id ("" means "did not
+        # resolve"), so a repeated region in a batch resolves once.
+        self._geo_cache: dict[str, str] = {}
+        # company name/slug (casefolded) -> numeric company URN id ("" means
+        # "did not resolve"), same contract as ``_geo_cache``.
+        self._company_urn_cache: dict[str, str] = {}
+        # Whether a company resolution has navigated on this extractor: the
+        # next one paces its first navigation like every later hop.
+        self._company_lookup_navigated = False
+        # The on-disk company cache, opened on first use so an extractor that
+        # never resolves a company name never touches the filesystem.
+        self._company_cache: CompanyCache | None = None
         # What the sidebar scroll spent on the page being read, so that a
         # multi-page search charges its scroll budget for scrolling alone.
         self._scroll_seconds = 0.0
+        # Rate-limit accounting for this scrape. One extractor is built per
+        # tool call, so both counters span the whole scrape and every section
+        # in it, which is the point: a per-section budget is what let a
+        # throttled scrape double its own request volume.
+        self._soft_retries_used = 0
+        self._rate_limit_hits = 0
 
     @staticmethod
     def _normalize_body_marker(value: Any) -> str:
@@ -2101,6 +2437,84 @@ class LinkedInExtractor:
             body_marker,
         )
 
+    async def _claim_soft_retry(self, url: str) -> bool:
+        """Take one retry from this scrape's soft rate-limit budget.
+
+        Returns whether the caller may re-navigate. The budget is the
+        extractor's, not the section's, so a scrape already being throttled
+        stops asking instead of sending one extra navigation per remaining
+        section. Each retry waits twice as long as the one before it.
+        """
+        budget = _rate_limit_retry_budget()
+        if self._soft_retries_used >= budget:
+            logger.warning(
+                "Soft rate-limit retry budget (%d) spent, not re-fetching %s",
+                budget,
+                url,
+            )
+            return False
+
+        delay = jitter(_rate_limit_retry_delay() * 2**self._soft_retries_used)
+        self._soft_retries_used += 1
+        logger.info("Retrying %s after %.1fs backoff", url, delay)
+        await asyncio.sleep(delay)
+        return True
+
+    async def _refusal_was_a_rate_limit(self) -> bool:
+        """Read the status off the error page Chromium left in the tab.
+
+        Only called after a navigation raised, where there is no response
+        object to ask. The interstitial carries the numeric status, so this
+        distinguishes the 429 the backoff exists for from the 404 a mistyped
+        username produces -- both of which arrive as the same net error token.
+
+        Fails closed: a body that cannot be read is not evidence of a rate
+        limit, and the caller re-raises the navigation error instead.
+        """
+        try:
+            body = await self._page.evaluate("() => document.body?.innerText || ''")
+        except Exception:
+            return False
+        return bool(_HTTP_STATUS_ON_INTERSTITIAL.search(str(body)))
+
+    async def _rate_limit_error(
+        self, url: str, *, retry_after: int | None
+    ) -> RateLimitError:
+        """Pause, then build the error for a navigation LinkedIn refused.
+
+        The pause is the only backoff available here: retrying the navigation
+        would be one more request into a live limit, so the wait happens before
+        the failure is handed back and the client's next call inherits it.
+        """
+        # Clamped after the jitter, not before: jittering the cap first meant
+        # `_RATE_LIMIT_BACKOFF_MAX` of 30 could still sleep ~45s at the +50%
+        # end, so the constant did not name the maximum it claimed to. The
+        # exponent is capped too -- it is bounded in practice because every
+        # hit sleeps, but nothing in the type says so.
+        delay = min(
+            _rate_limit_backoff_max(),
+            jitter(
+                _rate_limit_backoff_delay()
+                * 2 ** min(self._rate_limit_hits, _rate_limit_backoff_max_doublings())
+            ),
+        )
+        self._rate_limit_hits += 1
+        logger.warning(
+            "LinkedIn rate-limited %s (retry-after: %s); backing off %.1fs",
+            url,
+            retry_after if retry_after is not None else "not sent",
+            delay,
+        )
+        await asyncio.sleep(delay)
+
+        message = f"LinkedIn refused {url} with HTTP 429 (too many requests)."
+        if retry_after is None:
+            return RateLimitError(f"{message} Wait before scraping again.")
+        return RateLimitError(
+            f"{message} It asked to be left alone for {retry_after}s.",
+            suggested_wait_time=retry_after,
+        )
+
     async def _raise_if_auth_barrier(
         self,
         url: str,
@@ -2131,6 +2545,7 @@ class LinkedInExtractor:
         """Navigate to a LinkedIn page and fail fast on auth barriers."""
         hops: list[str] = []
         listener_registered = False
+        response: Any = None
 
         def record_navigation(frame: Any) -> None:
             if frame != self._page.main_frame:
@@ -2155,8 +2570,13 @@ class LinkedInExtractor:
                 extra={"target_url": url, "wait_until": wait_until},
             )
             try:
-                await self._page.goto(url, wait_until=wait_until, timeout=30000)
+                response = await self._page.goto(
+                    url, wait_until=wait_until, timeout=30000
+                )
                 await stabilize_navigation(f"goto {url}", logger)
+                # A little cursor entropy after each load: a frozen mouse across
+                # navigations is a cheap bot tell. Best-effort, never fatal.
+                await humanize_after_nav(self._page)
                 await record_page_trace(
                     self._page,
                     "extractor-after-goto",
@@ -2168,6 +2588,18 @@ class LinkedInExtractor:
                 # password in trace.jsonl. Converting here also keeps a proxy
                 # outage from being reported as a LinkedIn navigation problem.
                 raise_if_proxy_error(exc)
+                if (
+                    _HTTP_STATUS_NAV_FAILURE in str(exc)
+                    and await self._refusal_was_a_rate_limit()
+                ):
+                    # No response object exists on this path, so no
+                    # `Retry-After` can be read and none is invented.
+                    # `from None` for the same reason the generic re-raise
+                    # below copies the exception rather than passing it on:
+                    # the driver's own text is not carried into anything
+                    # that logs it.
+                    error = await self._rate_limit_error(url, retry_after=None)
+                    raise error from None
                 if allow_remember_me and await resolve_remember_me_prompt(self._page):
                     await stabilize_navigation(
                         f"remember-me resolution for {url}", logger
@@ -2222,6 +2654,16 @@ class LinkedInExtractor:
                 # that. Only the message is rewritten; the type is preserved so
                 # callers that branch on it are unaffected.
                 raise redacted_copy(exc) from None
+
+            # Outside the block above on purpose: raising in there would be
+            # caught by its own handler and re-raised as a navigation failure.
+            if response is not None and response.status == _HTTP_TOO_MANY_REQUESTS:
+                raise await self._rate_limit_error(
+                    url,
+                    retry_after=_retry_after_seconds(
+                        response.headers.get("retry-after")
+                    ),
+                )
 
             barrier = await detect_auth_barrier_quick(self._page)
             if not barrier:
@@ -2527,6 +2969,96 @@ class LinkedInExtractor:
             )
             await asyncio.sleep(pause_time)
 
+    async def _count_content_search_results(self) -> int:
+        """Count result cards on a content-search page.
+
+        Runs ``_CONTENT_SEARCH_COUNT_JS``: author and mention anchors
+        (``/in/`` or ``/company/``) grouped by their nearest ``li``,
+        ``article`` or ``role="article"`` ancestor, so a post with nine
+        @-mentions is one card rather than ten. Without such an ancestor the
+        count falls back to distinct hrefs, the previous behaviour, where a
+        mention-heavy post reached ``max_posts`` before the first wheel.
+
+        An estimate that errs toward over-scrolling, never truncation: under
+        the fallback two posts by one author count as one card, and a card
+        split across ancestors counts more than once, both of which only
+        cost the loop another round.
+
+        TODO(live-verify): the ancestor chain of content-search cards is
+        unverified live.
+        """
+        return await self._page.evaluate(_CONTENT_SEARCH_COUNT_JS)
+
+    async def _scroll_content_search_results(self, max_posts: int) -> int:
+        """Wheel-scroll content-search results until ``max_posts`` cards show.
+
+        Same shape as the feed loop in ``_extract_feed_body``: the results
+        live in their own scroll container, so ``window.scrollTo`` is a no-op
+        and only a wheel over the viewport moves it. Stops once the card
+        count reaches ``max_posts``, after ``_MAX_STALE`` rounds without a
+        new card, or when ``_SCROLL_BUDGET_TOTAL`` runs out: without the
+        deadline the worst case is every round polling to its full wait,
+        which is twice the tool timeout's comfortable share. Returns the
+        final count; any stop below ``max_posts`` is logged as a warning.
+        """
+        # TODO(live-verify): wheel-scroll loading of content-search cards is
+        # unmeasured; the diagnosis (window.scrollTo never moved the results)
+        # was live, this loop was not.
+        _MAX_STALE = 3
+        _BATCH_WAIT = 6
+        _WHEEL_DELTA = 2000
+        stale_count = 0
+        deadline = time.monotonic() + _SCROLL_BUDGET_TOTAL
+        stop_reason: str | None = None
+
+        viewport = self._page.viewport_size or {"width": 1280, "height": 720}
+        cx, cy = viewport["width"] // 2, viewport["height"] // 2
+        await self._page.mouse.move(cx, cy)
+
+        count = await self._count_content_search_results()
+        for i in range(_CONTENT_SEARCH_MAX_SCROLLS):
+            logger.debug("Content search scroll %d: %d results", i, count)
+            if count >= max_posts:
+                break
+            if time.monotonic() >= deadline:
+                stop_reason = f"{_SCROLL_BUDGET_TOTAL:.0f}s scroll budget spent"
+                break
+
+            await self._page.mouse.wheel(0, _WHEEL_DELTA)
+
+            new_count = count
+            for _ in range(_BATCH_WAIT):
+                await human_pause(1.0)
+                new_count = await self._count_content_search_results()
+                if new_count > count or time.monotonic() >= deadline:
+                    break
+
+            if new_count > count:
+                stale_count = 0
+            else:
+                stale_count += 1
+                logger.debug(
+                    "Content search stale scroll %d/%d (still at %d results)",
+                    stale_count,
+                    _MAX_STALE,
+                    new_count,
+                )
+                if stale_count >= _MAX_STALE:
+                    stop_reason = "page stopped producing new results"
+                    break
+            count = new_count
+        else:
+            stop_reason = f"{_CONTENT_SEARCH_MAX_SCROLLS} scroll rounds spent"
+
+        if count < max_posts:
+            logger.warning(
+                "content search stopped at %d of max_posts %d: %s",
+                count,
+                max_posts,
+                stop_reason,
+            )
+        return count
+
     async def extract_feed(
         self,
         num_posts: int = 10,
@@ -2714,28 +3246,42 @@ class LinkedInExtractor:
         url: str,
         section_name: str,
         max_scrolls: int | None = None,
+        max_posts: int | None = None,
+        *,
+        apply_cap: bool = True,
     ) -> ExtractedSection:
         """Navigate to a URL, scroll to load lazy content, and extract innerText.
 
-        Retries once after a backoff when the page returns only LinkedIn chrome
+        ``max_posts`` only applies to content-search result pages, where the
+        scroll is count-driven rather than depth-driven. ``apply_cap=False``
+        returns every reference the page carries; the caller then owns the
+        section's reference cap.
+
+        Retries after a backoff when the page returns only LinkedIn chrome
         (sidebar/footer noise with no actual content), which indicates a soft
-        rate limit.
+        rate limit, for as long as the scrape-wide retry budget allows.
 
         Raises LinkedInScraperException subclasses (rate limit, auth, etc.).
         Returns _RATE_LIMITED_MSG sentinel when soft-rate-limited after retry.
         Returns empty string for unexpected non-domain failures (error isolation).
         """
         try:
-            result = await self._extract_page_once(url, section_name, max_scrolls)
+            result = await self._extract_page_once(
+                url, section_name, max_scrolls, max_posts, apply_cap=apply_cap
+            )
             if result.text != _RATE_LIMITED_MSG:
                 return result
 
-            # Retry once after backoff
-            logger.info("Retrying %s after %.0fs backoff", url, _RATE_LIMIT_RETRY_DELAY)
-            await asyncio.sleep(_RATE_LIMIT_RETRY_DELAY)
-            return await self._extract_page_once(url, section_name, max_scrolls)
+            if not await self._claim_soft_retry(url):
+                return result
+            return await self._extract_page_once(
+                url, section_name, max_scrolls, max_posts, apply_cap=apply_cap
+            )
 
         except LinkedInScraperException:
+            raise
+        except TargetClosedError:
+            # Not a property of the page; see scrape_person.
             raise
         except Exception as e:
             logger.warning("Failed to extract page %s: %s", url, e)
@@ -2755,16 +3301,24 @@ class LinkedInExtractor:
         url: str,
         section_name: str,
         max_scrolls: int | None = None,
+        max_posts: int | None = None,
+        *,
+        apply_cap: bool = True,
     ) -> ExtractedSection:
         """Single attempt to navigate, scroll, and extract innerText."""
         await self._navigate_to_page(url)
-        return await self._extract_loaded_section(url, section_name, max_scrolls)
+        return await self._extract_loaded_section(
+            url, section_name, max_scrolls, max_posts, apply_cap=apply_cap
+        )
 
     async def _extract_loaded_section(
         self,
         url: str,
         section_name: str,
         max_scrolls: int | None = None,
+        max_posts: int | None = None,
+        *,
+        apply_cap: bool = True,
     ) -> ExtractedSection:
         """Run the post-navigation extraction pipeline on the current page.
 
@@ -2881,7 +3435,7 @@ class LinkedInExtractor:
                         break
                     await target.scroll_into_view_if_needed(timeout=2000)
                     await target.click(timeout=2000)
-                    await asyncio.sleep(1.0)
+                    await human_pause(1.0)
                 except PlaywrightTimeoutError:
                     logger.debug("Show more click timed out after %d clicks", i)
                     break
@@ -2890,7 +3444,11 @@ class LinkedInExtractor:
                     break
 
         # Scroll to trigger lazy loading
-        if is_activity:
+        if "/search/results/content/" in path:
+            await self._scroll_content_search_results(
+                max_posts if max_posts is not None else 10
+            )
+        elif is_activity:
             scrolls = max_scrolls if max_scrolls is not None else 10
             await scroll_to_bottom(self._page, pause_time=1.0, max_scrolls=scrolls)
         else:
@@ -2912,7 +3470,9 @@ class LinkedInExtractor:
         cleaned = _filter_linkedin_noise_lines(truncated)
         return ExtractedSection(
             text=cleaned,
-            references=build_references(raw_result["references"], section_name),
+            references=build_references(
+                raw_result["references"], section_name, apply_cap=apply_cap
+            ),
         )
 
     async def _extract_overlay(
@@ -2925,23 +3485,23 @@ class LinkedInExtractor:
         LinkedIn renders contact info as a native <dialog> element.
         Falls back to `<main>` if no dialog is found.
 
-        Retries once after a backoff when the overlay returns only LinkedIn
-        chrome (noise), mirroring `extract_page` behavior.
+        Retries after a backoff when the overlay returns only LinkedIn
+        chrome (noise), mirroring `extract_page` behavior — the retry budget
+        is shared with it, because the requests land on the same limit.
         """
         try:
             result = await self._extract_overlay_once(url, section_name)
             if result.text != _RATE_LIMITED_MSG:
                 return result
 
-            logger.info(
-                "Retrying overlay %s after %.0fs backoff",
-                url,
-                _RATE_LIMIT_RETRY_DELAY,
-            )
-            await asyncio.sleep(_RATE_LIMIT_RETRY_DELAY)
+            if not await self._claim_soft_retry(url):
+                return result
             return await self._extract_overlay_once(url, section_name)
 
         except LinkedInScraperException:
+            raise
+        except TargetClosedError:
+            # Not a property of the overlay; see scrape_person.
             raise
         except Exception as e:
             logger.warning("Failed to extract overlay %s: %s", url, e)
@@ -3041,7 +3601,7 @@ class LinkedInExtractor:
         try:
             for i, (section_name, suffix, is_overlay) in enumerate(requested_ordered):
                 if i > 0:
-                    await asyncio.sleep(_NAV_DELAY)
+                    await human_pause(_nav_delay())
 
                 url = base_url + suffix
                 try:
@@ -3105,6 +3665,11 @@ class LinkedInExtractor:
                         profile_urn = await self._extract_profile_urn()
                 except LinkedInScraperException:
                     raise
+                except TargetClosedError:
+                    # A closed target is not a property of the section; every
+                    # later section would fail identically, so it is the call
+                    # that has to fail, not the section.
+                    raise
                 except Exception as e:
                     logger.warning("Error scraping section %s: %s", section_name, e)
                     section_errors[section_name] = build_issue_diagnostics(
@@ -3124,7 +3689,9 @@ class LinkedInExtractor:
 
                 if rate_limited:
                     break
-        except LinkedInScraperException as e:
+        except (LinkedInScraperException, TargetClosedError) as e:
+            # The closed target is re-raised past the section loop above, so
+            # it reaches the caller only through this handler.
             if callbacks:
                 await callbacks.on_error(e)
             raise
@@ -3698,7 +4265,7 @@ class LinkedInExtractor:
                 continue
 
             if not first_show_all:
-                await asyncio.sleep(_NAV_DELAY)
+                await human_pause(_nav_delay())
             first_show_all = False
 
             try:
@@ -4276,7 +4843,7 @@ class LinkedInExtractor:
         try:
             for i, (section_name, suffix, is_overlay) in enumerate(requested_ordered):
                 if i > 0:
-                    await asyncio.sleep(_NAV_DELAY)
+                    await human_pause(_nav_delay())
 
                 url = base_url + suffix
                 try:
@@ -4300,6 +4867,9 @@ class LinkedInExtractor:
                         section_errors[section_name] = extracted.error
                 except LinkedInScraperException:
                     raise
+                except TargetClosedError:
+                    # Not a property of the section; see scrape_person.
+                    raise
                 except Exception as e:
                     logger.warning("Error scraping section %s: %s", section_name, e)
                     section_errors[section_name] = build_issue_diagnostics(
@@ -4319,7 +4889,9 @@ class LinkedInExtractor:
 
                 if rate_limited:
                     break
-        except LinkedInScraperException as e:
+        except (LinkedInScraperException, TargetClosedError) as e:
+            # The closed target is re-raised past the section loop above, so
+            # it reaches the caller only through this handler.
             if callbacks:
                 await callbacks.on_error(e)
             raise
@@ -4564,7 +5136,7 @@ class LinkedInExtractor:
     ) -> ExtractedSection:
         """Extract innerText from a job search page with soft rate-limit retry.
 
-        Mirrors the noise-only detection and single-retry behavior of
+        Mirrors the noise-only detection and budgeted-retry behavior of
         ``extract_page`` / ``_extract_page_once`` so that callers get a
         ``_RATE_LIMITED_MSG`` sentinel instead of silent empty results.
         """
@@ -4575,12 +5147,8 @@ class LinkedInExtractor:
             if result.text != _RATE_LIMITED_MSG:
                 return result
 
-            logger.info(
-                "Retrying search page %s after %.0fs backoff",
-                url,
-                _RATE_LIMIT_RETRY_DELAY,
-            )
-            await asyncio.sleep(_RATE_LIMIT_RETRY_DELAY)
+            if not await self._claim_soft_retry(url):
+                return result
             result = await self._extract_search_page_once(
                 url, section_name, scroll_deadline / 2
             )
@@ -4883,19 +5451,20 @@ class LinkedInExtractor:
                 break
 
             elapsed = time.monotonic() - started
-            if page_num > 0 and elapsed + _NAV_DELAY + slowest_page > budget:
+            nav_delay = _nav_delay()
+            if page_num > 0 and elapsed + nav_delay + slowest_page > budget:
                 logger.debug(
                     "Stopping after %d pages: %.1fs spent, another page costs "
                     "up to %.1fs and the budget is %.1fs",
                     page_num,
                     elapsed,
-                    _NAV_DELAY + slowest_page,
+                    nav_delay + slowest_page,
                     budget,
                 )
                 break
 
             if page_num > 0:
-                await asyncio.sleep(_NAV_DELAY)
+                await human_pause(nav_delay)
 
             # Started after the delay, because the prediction above adds
             # `_NAV_DELAY` to `slowest_page` itself. Timing from before the
@@ -5146,12 +5715,13 @@ class LinkedInExtractor:
                 if result.text != _RATE_LIMITED_MSG:
                     return result
 
+                retry_delay = _rate_limit_retry_delay()
                 logger.info(
                     "Retrying saved jobs page %s after %.0fs backoff",
                     url,
-                    _RATE_LIMIT_RETRY_DELAY,
+                    retry_delay,
                 )
-                await asyncio.sleep(_RATE_LIMIT_RETRY_DELAY)
+                await asyncio.sleep(retry_delay)
                 result = await self._extract_saved_jobs_page_once(url, section_name)
                 if result.text == _RATE_LIMITED_MSG:
                     logger.warning(
@@ -5326,7 +5896,7 @@ class LinkedInExtractor:
                 break
 
             if page_num > 0:
-                await asyncio.sleep(_NAV_DELAY)
+                await human_pause(_nav_delay())
 
             url = (
                 base_url
@@ -5477,32 +6047,287 @@ class LinkedInExtractor:
             result["section_errors"] = section_errors
         return result
 
+    async def _resolve_geo_urn(self, location: str) -> str | None:
+        """Resolve a free-text location to LinkedIn's numeric geo id.
+
+        People search's location facet is ``geoUrn=["<id>"]`` (a numeric geo
+        id), not the free-text ``location=`` param, which LinkedIn accepts in
+        the URL but silently ignores -- so a plain ``location=Egypt`` returns
+        the unfiltered result set. There is no stable public endpoint to map a
+        name to a geo id (the REST typeahead is gone and the search box is now
+        an opaque server-driven-UI action), so we resolve it the way a person
+        does: drive the jobs-search location typeahead (a stable on-page
+        dropdown), pick the top suggestion, and read the ``geoId`` LinkedIn
+        itself puts in the URL. That numeric id doubles as the people-search
+        geoUrn. Works for any country/city LinkedIn's own dropdown knows.
+
+        Returns the id, or ``None`` if the dropdown offered no match. Results
+        are cached per extractor so a repeated region costs one resolution.
+        """
+        key = location.casefold()
+        if key in self._geo_cache:
+            return self._geo_cache[key] or None
+
+        page = self._page
+        await self._goto_with_auth_checks(
+            "https://www.linkedin.com/jobs/search/?keywords="
+        )
+        box = None
+        for sel in (
+            "input[id*='jobs-search-box-location']",
+            "input[aria-label='City, state, or zip code']",
+            "input[aria-label*='location' i]",
+        ):
+            box = await self._page.query_selector(sel)
+            if box:
+                break
+
+        geo_id: str | None = None
+        if box is not None:
+            await box.click()
+            await box.fill("")
+            # Type it like a person; the dropdown resolves as we type.
+            await human_type(page, location)
+            await human_pause(1.5)
+            suggestion = await page.query_selector(
+                ".basic-typeahead__selectable, [role=option]"
+            )
+            if suggestion is not None:
+                await suggestion.click()
+                await human_pause(1.0)
+                match = re.search(r"[?&]geoId=(\d+)", page.url)
+                if match:
+                    geo_id = match.group(1)
+
+        # Cache the outcome (including a miss) to avoid re-driving the dropdown.
+        self._geo_cache[key] = geo_id or ""
+        return geo_id
+
+    async def _resolve_company_urn(self, name_or_urn: str) -> str:
+        """Resolve a company name, slug or URL to LinkedIn's numeric company id.
+
+        People search's ``currentCompany`` facet filters on the numeric URN
+        only (``"1115"`` for SAP); a name in the URL is accepted and ignored.
+        The id is public but only on the company's own About page, in the
+        "See all employees" anchor that ``link_metadata`` already reads as a
+        ``company_urn`` reference (the same one ``get_company_profile``
+        returns). So a name costs a company search to find the slug, then the
+        About page to read the id; a ``/company/<slug>`` URL skips the search.
+
+        Cache-first: an all-digit input is returned as is, then the
+        per-extractor cache, then the on-disk company cache (populated by the
+        enrichment tools and by this method), so a repeated company in a batch
+        resolves at most once and a company already researched never
+        navigates at all. A disk record that knows only the page URL skips
+        the search and goes straight to About.
+
+        A search hit counts only when its name normalises to the query: the
+        top card is often a promoted page for another company. A page of
+        candidates none of which match raises, naming their slugs.
+
+        Raises ``FilterValidationError`` when nothing resolves. A clean miss
+        is remembered for the batch; a throttled or failed lookup is not.
+        """
+        if re.fullmatch(r"[0-9]+", name_or_urn):
+            return name_or_urn
+
+        key = name_or_urn.strip().casefold()
+        if key in self._company_urn_cache:
+            urn = self._company_urn_cache[key]
+            if urn:
+                return urn
+            raise FilterValidationError(self._company_unresolved_message(name_or_urn))
+
+        # A URL names the page outright; anything else is a name to search for.
+        slug = (
+            normalize_company_identifier(name_or_urn)
+            if "/company/" in name_or_urn
+            else None
+        )
+        lookup = slug or name_or_urn.strip()
+
+        if self._company_cache is None:
+            self._company_cache = CompanyCache()
+        record = self._company_cache.get(lookup)
+        if record is not None:
+            if record.company_urn:
+                self._company_urn_cache[key] = record.company_urn
+                return record.company_urn
+            # A search-sourced record (enrich_companies) knows the page but
+            # not the id: the slug is in the URL, so skip the search.
+            if slug is None and "/company/" in record.linkedin_url:
+                slug = normalize_company_identifier(record.linkedin_url)
+
+        urn: str | None = None
+        throttled = False
+        failed = False
+        searched = False
+        cache_name = lookup
+        if slug is None:
+            search_url = (
+                "https://www.linkedin.com/search/results/companies/"
+                f"?keywords={quote_plus(lookup)}"
+            )
+            # A batch resolves names back to back, so the previous name's
+            # About page and this search are consecutive navigations.
+            if self._company_lookup_navigated:
+                await human_pause(_nav_delay())
+            extracted = await self.extract_page(
+                search_url, section_name="search_results"
+            )
+            searched = True
+            self._company_lookup_navigated = True
+            throttled = extracted.text == _RATE_LIMITED_MSG
+            failed = extracted.error is not None
+            hits = parse_search_results([dict(ref) for ref in extracted.references])
+            # Never take the top card on position alone: it is often a
+            # promoted "Page by <Company>" for a different company (see
+            # ``parse_search_results``). Only a card whose name normalises to
+            # the query is the query.
+            wanted = normalize_company_name(lookup)
+            hit = next(
+                (h for h in hits if normalize_company_name(h["name"]) == wanted),
+                None,
+            )
+            if hit is None and hits and not throttled and not failed:
+                self._company_urn_cache[key] = ""
+                raise FilterValidationError(
+                    f"Could not resolve company {name_or_urn!r}: no company "
+                    f"search card is named that. Candidates: "
+                    f"{[h['slug'] for h in hits]!r}. Pass the intended one as "
+                    f"https://www.linkedin.com/company/<slug>/ instead."
+                )
+            if hit is not None:
+                slug = hit["slug"]
+                cache_name = hit["name"]
+                # ponytail: a live check may collapse this to one navigation.
+                # If the top card carries its own "See all employees" anchor,
+                # the id is already here; the first company_urn reference that
+                # follows the top card's link and precedes the next card's is
+                # that card's. Unverified live, so the About page below stays
+                # the fallback rather than the other way round.
+                if hit is hits[0]:
+                    urn = _company_urn_of_first_card(extracted.references)
+
+        if slug is not None and urn is None:
+            if searched or self._company_lookup_navigated:
+                await human_pause(_nav_delay())
+            about = await self.extract_page(
+                company_page_url(slug, "/about/"), section_name="about"
+            )
+            self._company_lookup_navigated = True
+            throttled = throttled or about.text == _RATE_LIMITED_MSG
+            failed = failed or about.error is not None
+            for ref in about.references:
+                if ref["kind"] == "company_urn" and ref.get("value"):
+                    urn = str(ref["value"])
+                    break
+
+        if not urn:
+            # Only a clean miss is remembered; a throttled or failed lookup
+            # may succeed on retry and must not poison the batch.
+            if not throttled and not failed:
+                self._company_urn_cache[key] = ""
+            raise FilterValidationError(
+                self._company_unresolved_message(name_or_urn, throttled=throttled)
+            )
+        self._company_urn_cache[key] = urn
+        # The write-back is an optimisation, not the result: ``_path`` refuses
+        # a name that normalises to nothing ("Group", "Co") with ValueError.
+        try:
+            self._company_cache.record_firmographics(
+                cache_name,
+                datetime.now().astimezone(),
+                source="search",
+                linkedin_url=company_page_url(slug) if slug else "",
+                company_urn=urn,
+            )
+        except (OSError, ValueError) as e:
+            logger.warning("Could not cache company urn for %r: %s", cache_name, e)
+        return urn
+
+    @staticmethod
+    def _company_unresolved_message(name: str, *, throttled: bool = False) -> str:
+        why = (
+            "LinkedIn throttled the lookup; retry later"
+            if throttled
+            else "no company search hit or About page yielded an id"
+        )
+        return (
+            f"Could not resolve company {name!r} to a LinkedIn company URN "
+            f"({why}). Pass the numeric id instead: get_company_profile "
+            f'exposes it under references["about"] as kind "company_urn".'
+        )
+
     async def search_people(
         self,
-        keywords: str,
+        keywords: str | None = None,
         location: str | None = None,
         network: list[str] | None = None,
-        current_company: str | None = None,
+        current_company: str | list[str] | None = None,
+        max_pages: int = 1,
+        *,
+        title: str | None = None,
+        past_company: str | list[str] | None = None,
+        industry: str | list[str] | None = None,
+        school: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        profile_language: str | list[str] | None = None,
     ) -> dict[str, Any]:
-        """Search for people and extract the results page.
+        """Search for people and extract the results pages.
 
         Args:
             keywords: Free-text query ("software engineer", "recruiter at Google").
-            location: Optional location filter ("New York", "Remote").
+                Optional when at least one other facet is given.
+            location: Optional location filter, a free-text country or city name
+                ("Egypt", "United Arab Emirates", "Amsterdam"). It is resolved to
+                LinkedIn's numeric geo id via the site's own location dropdown
+                (see ``_resolve_geo_urn``); a name the dropdown does not
+                recognize raises ``FilterValidationError`` rather than silently
+                returning worldwide results.
             network: Optional connection-degree filter. Each element is one of
                 ``"F"`` (1st-degree), ``"S"`` (2nd-degree), ``"O"`` (3rd-degree
                 and beyond). Example: ``["F"]`` to only return 1st-degree
                 connections. Invalid tokens raise ``ValueError``.
-            current_company: Optional current-employer filter. LinkedIn's
-                ``currentCompany`` facet only filters on the numeric company
-                URN id (e.g. ``"1115"`` for SAP); plain company names are
-                accepted by the URL but ignored by LinkedIn and return the
-                unfiltered result set. Look up a company's URN via
-                ``get_company_profile`` -- it is exposed under
+            current_company: Optional current-employer filter, one or a list.
+                Each is a company name ("SAP"), a ``/company/<slug>`` URL, or
+                the numeric company URN id (``"1115"`` for SAP). LinkedIn's
+                ``currentCompany`` facet filters on the id only, so a name or
+                URL is resolved to it first (see ``_resolve_company_urn``); one
+                that does not resolve raises ``FilterValidationError`` rather
+                than silently returning the unfiltered result set. The id is
+                what ``get_company_profile`` exposes under
                 ``references["about"]``.
+            max_pages: Maximum result pages to load (LinkedIn returns 10 people
+                per page). Stops early once a page adds no new people, so
+                over-requesting is harmless. Default 1 (previous behavior).
+            title: Optional current-title filter, free text
+                (``titleFreeText``). Measured live as ignored by the SDUI
+                results page; a title in ``keywords`` as a quoted phrase
+                does filter. Refused as the only criterion, since it would
+                navigate and return the unfiltered worldwide list.
+            past_company: Optional past-employer filter, same shapes and
+                resolution as ``current_company`` (``pastCompany``). Each
+                unresolved name may cost up to two navigations.
+            industry: Optional ``industry`` facet, one or a list. Each is a
+                numeric LinkedIn industry id or a name in
+                ``_COMPANY_INDUSTRY_IDS`` (the ids are shared with company
+                search); an unknown name raises ``FilterValidationError``.
+            school: Optional ``schoolFilter`` facet, the numeric school id
+                only. A name raises ``FilterValidationError``: the schools
+                search page carries nothing to resolve it from.
+            first_name: Optional ``firstName`` filter.
+            last_name: Optional ``lastName`` filter.
+            profile_language: Optional ``profileLanguage`` facet, one or a
+                list of two-letter ISO 639-1 codes (``"en"``, ``"de"``).
 
         Returns:
-            {url, sections: {name: text}}
+            {url, sections: {search_results: text}, people: [...],
+            result_count} -- pages joined by ``\\n---\\n``; ``people`` holds one
+            row per card parsed from each page's text
+            (``search_parse.parse_people_cards``), deduped by URL, and
+            ``result_count`` the first page's "About N results" header or None.
         """
         if network is not None:
             invalid = [t for t in network if t not in _NETWORK_TOKENS]
@@ -5512,77 +6337,355 @@ class LinkedInExtractor:
                     f"{invalid!r}; expected any of {list(_NETWORK_TOKENS)!r}"
                 )
 
-        if current_company and not re.fullmatch(r"[0-9]+", current_company):
+        industry_ids: list[str] = []
+        for raw in _as_list(industry):
+            token = raw.strip()
+            if re.fullmatch(r"[0-9]+", token):
+                industry_ids.append(token)
+                continue
+            mapped = _COMPANY_INDUSTRY_IDS.get(_normalize_industry_name(token))
+            if mapped is None:
+                raise FilterValidationError(
+                    f"Unknown industry {raw!r}; pass LinkedIn's numeric industry "
+                    f"id, or one of the names this server knows: "
+                    f"{list(_COMPANY_INDUSTRY_IDS)!r}"
+                )
+            industry_ids.append(mapped)
+
+        languages = [code.strip().lower() for code in _as_list(profile_language)]
+        invalid_languages = [
+            code for code in languages if not _PROFILE_LANGUAGE_RE.fullmatch(code)
+        ]
+        if invalid_languages:
             raise FilterValidationError(
-                f"current_company must be a numeric LinkedIn company URN id "
-                f"(e.g. '1115' for SAP); got {current_company!r}. Plain-text "
-                f"company names are silently ignored by LinkedIn. Look up the "
-                f'URN via get_company_profile -> references["about"].'
+                f"Invalid profile_language {invalid_languages!r}; expected "
+                'two-letter ISO 639-1 codes such as "en"'
             )
 
-        params = f"keywords={quote_plus(keywords)}"
+        current_companies = [c for c in _as_list(current_company) if c]
+        past_companies = [c for c in _as_list(past_company) if c]
+        other_criteria = (
+            keywords,
+            location,
+            network,
+            current_companies,
+            past_companies,
+            industry_ids,
+            school,
+            first_name,
+            last_name,
+            languages,
+        )
+        if not any(other_criteria) and not title:
+            raise FilterValidationError(
+                "search_people needs at least one of keywords, location, network, "
+                "current_company, past_company, title, industry, school, "
+                "first_name, last_name or profile_language"
+            )
+        # LinkedIn ignores titleFreeText (measured live), so a title on its
+        # own would navigate and return the unfiltered worldwide list.
+        if title and not any(other_criteria):
+            raise FilterValidationError(
+                "search_people cannot filter by title alone: LinkedIn ignores "
+                "titleFreeText. Put the title in keywords as a quoted phrase "
+                f"(keywords='\"{title}\"'), or combine title with another "
+                "facet such as location or current_company"
+            )
+
+        # LinkedIn ignores a name in currentCompany=/pastCompany=; resolve each
+        # to the numeric URN or fail loudly (see ``_resolve_company_urn``).
+        current_ids = [await self._resolve_company_urn(c) for c in current_companies]
+        past_ids = [await self._resolve_company_urn(c) for c in past_companies]
+        school_id = school.strip() if school else None
+        if school_id and not _SCHOOL_ID_RE.fullmatch(school_id):
+            raise FilterValidationError(
+                f"Invalid school {school!r}; pass the numeric school id. Find it "
+                "on LinkedIn: people search -> All filters -> School -> pick "
+                'one, then the URL shows schoolFilter=["<id>"].'
+            )
+
+        params: list[str] = []
+        if keywords:
+            params.append(f"keywords={quote_plus(keywords)}")
         if location:
-            params += f"&location={quote_plus(location)}"
+            # LinkedIn ignores a free-text location=; resolve it to the numeric
+            # geoUrn its own dropdown produces, or fail loudly rather than
+            # silently returning an unfiltered (worldwide) result set.
+            geo_id = await self._resolve_geo_urn(location)
+            if not geo_id:
+                raise FilterValidationError(
+                    f"Could not resolve location {location!r} to a LinkedIn "
+                    f"region. Use a country or city name as it appears in "
+                    f"LinkedIn's location dropdown."
+                )
+            params.append(f"geoUrn={_encode_list_facet([geo_id])}")
         if network:
-            params += f"&network={_encode_list_facet(network)}"
-        if current_company:
-            params += f"&currentCompany={_encode_list_facet([current_company])}"
+            params.append(f"network={_encode_list_facet(network)}")
+        if current_ids:
+            params.append(f"currentCompany={_encode_list_facet(current_ids)}")
+        # TODO(live-verify): facet names unconfirmed (pastCompany, industry,
+        # schoolFilter, lastName, profileLanguage). currentCompany, firstName
+        # and a keyword-less search were confirmed live on 2026-09-12.
+        if past_ids:
+            params.append(f"pastCompany={_encode_list_facet(past_ids)}")
+        if industry_ids:
+            params.append(f"industry={_encode_list_facet(industry_ids)}")
+        if school_id:
+            params.append(f"schoolFilter={_encode_list_facet([school_id])}")
+        if title:
+            # live-verified: ignored on 2026-09-12 in the SDUI variant. Kept
+            # because another results-page variant may still read it; the
+            # tool docstring steers callers to a quoted phrase in keywords.
+            params.append(f"titleFreeText={quote_plus(title)}")
+        if first_name:
+            params.append(f"firstName={quote_plus(first_name)}")
+        if last_name:
+            params.append(f"lastName={quote_plus(last_name)}")
+        if languages:
+            params.append(f"profileLanguage={_encode_list_facet(languages)}")
 
-        url = f"https://www.linkedin.com/search/results/people/?{params}"
-        extracted = await self.extract_page(url, section_name="search_results")
+        base_url = "https://www.linkedin.com/search/results/people/?" + "&".join(params)
 
-        sections: dict[str, str] = {}
-        references: dict[str, list[Reference]] = {}
+        page_texts: list[str] = []
+        page_references: list[Reference] = []
+        pages: list[ExtractedSection] = []
         section_errors: dict[str, dict[str, Any]] = {}
-        if extracted.text and extracted.text != _RATE_LIMITED_MSG:
-            sections["search_results"] = extracted.text
-            if extracted.references:
-                references["search_results"] = extracted.references
-        elif extracted.text == _RATE_LIMITED_MSG:
-            section_errors["search_results"] = rate_limited_section_error()
-        elif extracted.error:
-            section_errors["search_results"] = extracted.error
+        seen_person_urls: set[str] = set()
 
+        # A facet resolution may have just navigated (company search, About
+        # page); the first results page gets the same spacing as every later
+        # one.
+        resolved = bool(current_ids or past_ids)
+        for page_num in range(1, max_pages + 1):
+            if page_num > 1 or resolved:
+                await human_pause(_nav_delay())
+
+            url = base_url if page_num == 1 else f"{base_url}&page={page_num}"
+            # Uncapped: the rows pair against every anchor on the page, and
+            # a people card carries up to two mutual-connection anchors of
+            # its own, so the section cap would strand the later cards
+            # without a URL. The cap is applied to ``references`` below.
+            extracted = await self.extract_page(
+                url, section_name="search_results", apply_cap=False
+            )
+
+            if not extracted.text or extracted.text == _RATE_LIMITED_MSG:
+                # Rate limit first: it is the more specific diagnosis, and a
+                # page that was throttled may carry a generic error too.
+                if extracted.text == _RATE_LIMITED_MSG:
+                    section_errors["search_results"] = rate_limited_section_error()
+                elif extracted.error:
+                    section_errors["search_results"] = extracted.error
+                # Pages gathered so far are kept and returned.
+                break
+
+            page_texts.append(extracted.text)
+            pages.append(extracted)
+            if extracted.references:
+                page_references.extend(
+                    dedupe_references(
+                        extracted.references, cap=_SEARCH_RESULTS_REFERENCE_CAP
+                    )
+                )
+
+            # Running past the last page yields a results page with no people on
+            # it. Detect that by URL rather than by parsing LinkedIn's
+            # "no results" copy, which is localized.
+            new_people = {
+                ref["url"] for ref in extracted.references if ref["kind"] == "person"
+            } - seen_person_urls
+            if not new_people:
+                logger.debug("No new people on page %d, stopping", page_num)
+                break
+            seen_person_urls |= new_people
+
+        people, result_count = _search_rows(parse_people_cards, pages, "person")
         result: dict[str, Any] = {
-            "url": url,
-            "sections": sections,
+            "url": base_url,
+            "sections": {"search_results": "\n---\n".join(page_texts)}
+            if page_texts
+            else {},
+            "people": people,
+            "result_count": result_count,
         }
-        if references:
-            result["references"] = references
+        if page_references:
+            result["references"] = {
+                "search_results": dedupe_references(page_references)
+            }
         if section_errors:
             result["section_errors"] = section_errors
         return result
 
     async def search_companies(
         self,
-        keywords: str,
+        keywords: str | None = None,
+        industry: list[str] | None = None,
+        size: list[str] | None = None,
+        hq_location: str | None = None,
+        has_jobs: bool | None = None,
+        max_pages: int = 1,
     ) -> dict[str, Any]:
-        """Search for companies and extract the results page.
+        """Search for companies and extract the results pages.
+
+        Facets narrow the result set on LinkedIn's side, so a shortlist
+        built here costs one navigation per page rather than one per
+        company; ``enrich_companies`` then only pays for the companies that
+        survived the filter.
+
+        Args:
+            keywords: Free-text query ("fintech", "electric vehicles").
+                Optional when at least one of ``industry``, ``size`` or
+                ``hq_location`` is given.
+            industry: Optional ``industryCompanyVertical`` facet. Each element is
+                either a numeric LinkedIn industry id (always accepted, e.g.
+                ``"4"``) or one of the names in ``_COMPANY_INDUSTRY_IDS``
+                (case-insensitive, e.g. ``"Software Development"``). The name
+                table is partial; an unknown name raises
+                ``FilterValidationError`` listing the names it does know.
+            size: Optional ``companySize`` facet. Each element is a headcount
+                bucket as LinkedIn labels it (``"self-employed"``, ``"1-10"``,
+                ``"11-50"``, ``"51-200"``, ``"201-500"``, ``"501-1000"``,
+                ``"1001-5000"``, ``"5001-10000"``, ``"10001+"``) or the
+                facet letter it maps to (``"A"``-``"I"`` in that order, see
+                ``_COMPANY_SIZE_LETTERS``). Anything else raises
+                ``FilterValidationError``.
+            hq_location: Optional headquarters filter, a free-text country or
+                city name resolved to LinkedIn's numeric geo id via the site's
+                own location dropdown (see ``_resolve_geo_urn``) and sent as
+                ``companyHqGeo``. An unrecognized name raises
+                ``FilterValidationError`` rather than silently returning
+                worldwide results.
+            has_jobs: When true, only companies with live job listings
+                (``hasJobs="true"``, the JSON-string form LinkedIn normalises
+                a bare ``true`` to).
+            max_pages: Maximum result pages to load (10 companies per page).
+                Stops early once a page adds no new companies. Default 1.
 
         Returns:
-            {url, sections: {search_results: text}}
+            {url, sections: {search_results: text}, companies: [...],
+            result_count} -- pages joined by ``\\n---\\n``; ``companies`` holds
+            one row per card parsed from each page's text
+            (``search_parse.parse_company_cards``), deduped by URL, and
+            ``result_count`` the first page's "About N results" header or None.
         """
-        url = f"https://www.linkedin.com/search/results/companies/?keywords={quote_plus(keywords)}"
-        extracted = await self.extract_page(url, section_name="search_results")
+        industry_ids: list[str] = []
+        for raw in industry or []:
+            token = raw.strip()
+            if re.fullmatch(r"[0-9]+", token):
+                industry_ids.append(token)
+                continue
+            mapped = _COMPANY_INDUSTRY_IDS.get(_normalize_industry_name(token))
+            if mapped is None:
+                raise FilterValidationError(
+                    f"Unknown industry {raw!r}; pass LinkedIn's numeric industry "
+                    f"id, or one of the names this server knows: "
+                    f"{list(_COMPANY_INDUSTRY_IDS)!r}"
+                )
+            industry_ids.append(mapped)
 
-        sections: dict[str, str] = {}
-        references: dict[str, list[Reference]] = {}
+        size_letters: list[str] = []
+        for raw in size or []:
+            token = raw.strip()
+            if token.upper() in _COMPANY_SIZE_LETTERS.values():
+                size_letters.append(token.upper())
+                continue
+            mapped = _COMPANY_SIZE_LETTERS.get(token.casefold())
+            if mapped is None:
+                raise FilterValidationError(
+                    f"Unknown company size {raw!r}; expected a headcount bucket "
+                    f"{list(_COMPANY_SIZE_LETTERS)!r} or a facet letter "
+                    f"{list(_COMPANY_SIZE_LETTERS.values())!r}"
+                )
+            size_letters.append(mapped)
+
+        if not (keywords or industry_ids or size_letters or hq_location):
+            raise FilterValidationError(
+                "search_companies needs at least one of keywords, industry, "
+                "size or hq_location"
+            )
+
+        params: list[str] = []
+        if keywords:
+            params.append(f"keywords={quote_plus(keywords)}")
+        if industry_ids:
+            # ``companyIndustry`` is stripped by LinkedIn (measured live
+            # 2026-09-12); this is the name its own company-filter UI writes.
+            # TODO(live-verify): industryCompanyVertical unconfirmed
+            params.append(f"industryCompanyVertical={_encode_list_facet(industry_ids)}")
+        if size_letters:
+            params.append(f"companySize={_encode_list_facet(size_letters)}")
+        if hq_location:
+            geo_id = await self._resolve_geo_urn(hq_location)
+            if not geo_id:
+                raise FilterValidationError(
+                    f"Could not resolve hq_location {hq_location!r} to a "
+                    f"LinkedIn region. Use a country or city name as it "
+                    f"appears in LinkedIn's location dropdown."
+                )
+            params.append(f"companyHqGeo={_encode_list_facet([geo_id])}")
+        if has_jobs:
+            params.append("hasJobs=%22true%22")
+
+        base_url = "https://www.linkedin.com/search/results/companies/?" + "&".join(
+            params
+        )
+
+        page_texts: list[str] = []
+        page_references: list[Reference] = []
+        pages: list[ExtractedSection] = []
         section_errors: dict[str, dict[str, Any]] = {}
-        if extracted.text and extracted.text != _RATE_LIMITED_MSG:
-            sections["search_results"] = extracted.text
-            if extracted.references:
-                references["search_results"] = extracted.references
-        elif extracted.text == _RATE_LIMITED_MSG:
-            section_errors["search_results"] = rate_limited_section_error()
-        elif extracted.error:
-            section_errors["search_results"] = extracted.error
+        seen_company_urls: set[str] = set()
 
+        for page_num in range(1, max_pages + 1):
+            if page_num > 1:
+                await human_pause(_nav_delay())
+
+            url = base_url if page_num == 1 else f"{base_url}&page={page_num}"
+            # Uncapped: the rows pair against every anchor on the page, and
+            # a people card carries up to two mutual-connection anchors of
+            # its own, so the section cap would strand the later cards
+            # without a URL. The cap is applied to ``references`` below.
+            extracted = await self.extract_page(
+                url, section_name="search_results", apply_cap=False
+            )
+
+            if not extracted.text or extracted.text == _RATE_LIMITED_MSG:
+                if extracted.text == _RATE_LIMITED_MSG:
+                    section_errors["search_results"] = rate_limited_section_error()
+                elif extracted.error:
+                    section_errors["search_results"] = extracted.error
+                break
+
+            page_texts.append(extracted.text)
+            pages.append(extracted)
+            if extracted.references:
+                page_references.extend(
+                    dedupe_references(
+                        extracted.references, cap=_SEARCH_RESULTS_REFERENCE_CAP
+                    )
+                )
+
+            new_companies = {
+                ref["url"] for ref in extracted.references if ref["kind"] == "company"
+            } - seen_company_urls
+            if not new_companies:
+                logger.debug("No new companies on page %d, stopping", page_num)
+                break
+            seen_company_urls |= new_companies
+
+        companies, result_count = _search_rows(parse_company_cards, pages, "company")
         result: dict[str, Any] = {
-            "url": url,
-            "sections": sections,
+            "url": base_url,
+            "sections": {"search_results": "\n---\n".join(page_texts)}
+            if page_texts
+            else {},
+            "companies": companies,
+            "result_count": result_count,
         }
-        if references:
-            result["references"] = references
+        if page_references:
+            result["references"] = {
+                "search_results": dedupe_references(page_references)
+            }
         if section_errors:
             result["section_errors"] = section_errors
         return result
@@ -5617,7 +6720,7 @@ class LinkedInExtractor:
         self,
         keywords: str,
         date_posted: str | None = None,
-        max_pages: int = 3,
+        max_posts: int = 10,
     ) -> dict[str, Any]:
         """Search LinkedIn posts/content and extract the results page.
 
@@ -5632,19 +6735,21 @@ class LinkedInExtractor:
                 ``FilterValidationError`` (a ``ValueError`` subclass) rather
                 than reaching LinkedIn, which would ignore them silently and
                 return unfiltered results that look filtered.
-            max_pages: Scroll depth, expressed in result "pages" of roughly
-                ``_CONTENT_SCROLLS_PER_REQUESTED_PAGE`` scrolls each (default
-                3). Content search is an infinite scroll with no per-page URL,
-                so this caps how far the page is scrolled rather than fetching
-                discrete ``&start=`` pages.
+            max_posts: Stop scrolling once this many result cards are loaded
+                (default 10). Content search is an infinite scroll with no
+                per-page URL, so the loop counts cards rather than pages; the
+                page may hold a few more than this when a scroll batch
+                overshoots.
 
         Returns:
             {url, sections: {search_results: text}} plus optional ``references``
             (post authors, companies, linked jobs) and ``section_errors``.
             Verified live: the results page carries no per-post permalink
-            anchors, so a post is addressable only through its author.
-            The LLM should parse the raw text to extract each post's author,
-            headline, body, date, and reaction counts.
+            anchors, so a post is addressable only through its author; the
+            ``/in/`` entries in ``references["search_results"]`` make the
+            result usable as a prospect list. The LLM should parse the raw
+            text to extract each post's author, headline, body, date, and
+            reaction counts.
         """
         if (
             date_posted is not None
@@ -5657,9 +6762,8 @@ class LinkedInExtractor:
             )
 
         url = self._build_content_search_url(keywords, date_posted=date_posted)
-        max_scrolls = max(1, max_pages) * _CONTENT_SCROLLS_PER_REQUESTED_PAGE
         extracted = await self.extract_page(
-            url, section_name="search_results", max_scrolls=max_scrolls
+            url, section_name="search_results", max_posts=max_posts
         )
 
         sections: dict[str, str] = {}
