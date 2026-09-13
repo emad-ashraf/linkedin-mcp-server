@@ -41,14 +41,17 @@ classifiers = [
 ]
 dependencies = [
     "anyio>=4.13.0",
-    "cryptography>=48.0.1",
-    "fastmcp>=3.4.4,<4",
+    "cryptography>=50.0.1",
+    "fastmcp>=3.4.7,<4",
     "inquirer>=3.4.0",
+    "mcp>=1.28.1",
     "packaging>=26.2",
     "patchright>=1.55.0",
+    "pydantic-settings>=2.14.2",
     "python-dotenv>=1.1.1",
     "pywin32>=312 ; sys_platform == 'win32'",
     "rich>=15.0.0",
+    "starlette>=1.3.1",
 ]
 
 [project.urls]
@@ -72,14 +75,23 @@ exclude = ["assets*", "docs*", "tests*"]
 [tool.setuptools.package-data]
 linkedin_mcp_server = ["py.typed"]
 
+[tool.ruff.lint]
+# Preserve Ruff's pre-0.16 default rule set instead of adopting new rules implicitly.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.format]
+# Ruff 0.16 added Markdown formatting; keep the formatter's previous file scope.
+exclude = ["*.md"]
+
 [dependency-groups]
 dev = [
-    "aiohttp>=3.12.13",
-    "pre-commit>=4.2.0",
+    "aiohttp>=3.14.3",
+    "pre-commit>=4.6.2",
     "pytest>=8.3.5",
     "pytest-asyncio>=1.0.0",
     "pytest-cov>=6.1.1",
     "pytest-xdist>=3.8.0",
-    "ruff>=0.11.11",
+    "pyyaml>=6.0.3",
+    "ruff==0.16.7",
     "ty>=0.0.1a12",
 ]

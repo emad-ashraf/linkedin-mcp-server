@@ -75,6 +75,13 @@
     },
     {
       "type": "git",
+      "name": "pyyaml",
+      "url": "https://github.com/yaml/pyyaml",
+      "branch": "main",
+      "specialNotes": "YAML parser used by the Ruff toolchain contract test."
+    },
+    {
+      "type": "git",
       "name": "patchright",
       "url": "https://github.com/Kaliiiiiiiiii-Vinyzu/patchright-python",
       "branch": "main"
@@ -141,6 +148,34 @@
       "url": "https://github.com/agronholm/anyio",
       "branch": "master",
       "specialNotes": "Structured-concurrency layer FastMCP runs on. Its asyncio CancelScope is what shields the feed listener teardown from the tool-call deadline."
+    },
+    {
+      "type": "git",
+      "name": "githubDependencyReviewAction",
+      "url": "https://github.com/actions/dependency-review-action",
+      "branch": "main",
+      "specialNotes": "GitHub dependency graph comparison action used to block newly introduced high and critical advisories."
+    },
+    {
+      "type": "git",
+      "name": "mcpPythonSdk",
+      "url": "https://github.com/modelcontextprotocol/python-sdk",
+      "branch": "main",
+      "specialNotes": "Model Context Protocol Python SDK used directly for protocol types and transitively by FastMCP."
+    },
+    {
+      "type": "git",
+      "name": "pydanticSettings",
+      "url": "https://github.com/pydantic/pydantic-settings",
+      "branch": "main",
+      "specialNotes": "Settings dependency constrained directly to keep FastMCP installations above known security advisories."
+    },
+    {
+      "type": "git",
+      "name": "starlette",
+      "url": "https://github.com/Kludex/starlette",
+      "branch": "main",
+      "specialNotes": "ASGI framework constrained directly to keep MCP transports above known security advisories."
     }
   ]
 }
