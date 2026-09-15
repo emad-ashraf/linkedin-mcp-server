@@ -44,6 +44,8 @@ from linkedin_mcp_server.scraping.connection import (
     detect_connection_state,
 )
 from linkedin_mcp_server.scraping.connection_actions import (
+    _MODAL_DIALOG_INDEX_JS,
+    _SENT_LIST_HAS_USER_JS,
     ACTION_SIGNALS_JS,
     CLICK_INCOMING_ACCEPT_JS,
     OPEN_MORE_BUTTON_JS,
@@ -592,3 +594,94 @@ class TestActionChoiceIsStructural:
             (False, None),
             lambda page, html: _click(page, html, OPEN_MORE_BUTTON_JS),
         )
+
+
+# The three kinds of dialog a profile page carries at once, in a synthetic
+# container: a messaging-overlay chat window pinned bottom-right, the modal a
+# deeplink opened (centred on the horizontal axis only, as measured), and a
+# closed one that still holds its role. Nothing here imitates LinkedIn's
+# markup; the claim is about the geometry the index reads.
+_CHAT_WINDOW = (
+    '<div role="dialog" style="position:fixed; right:0; bottom:0;'
+    ' width:300px; height:400px">chat</div>'
+)
+_HIDDEN_DIALOG = '<div role="dialog" style="display:none">closed</div>'
+_MODAL = (
+    '<div role="dialog" style="position:fixed; top:32px; left:50%;'
+    ' transform:translateX(-50%); width:552px; height:300px">modal</div>'
+)
+
+
+class TestModalDialogIndex:
+    async def test_picks_the_centred_dialog_by_geometry_not_order(self, dom_page):
+        # The modal is last in document order and the chat window first, so
+        # a read that took the first dialog, the first visible one, or any
+        # count of them answers 0 or 1 here, never 2.
+        await dom_page.set_content(
+            f"<html><body>{_CHAT_WINDOW}{_HIDDEN_DIALOG}{_MODAL}</body></html>"
+        )
+        assert await dom_page.evaluate(_MODAL_DIALOG_INDEX_JS) == 2
+
+        # A chat window alone is not a modal: nothing is centred, so the
+        # answer is the sentinel the caller turns into "no dialog".
+        await dom_page.set_content(f"<html><body>{_CHAT_WINDOW}</body></html>")
+        assert await dom_page.evaluate(_MODAL_DIALOG_INDEX_JS) == -1
+
+
+_SENT_URL = "https://www.linkedin.com/mynetwork/invitation-manager/sent/"
+
+
+async def _sent_list_has(page: Page, hrefs: list[str], username: str) -> bool:
+    """Serve a sent list of ``hrefs`` from the LinkedIn origin and ask.
+
+    Served rather than ``set_content``: the program resolves each href
+    against ``location.origin``, which on ``about:blank`` is the string
+    ``"null"`` and makes every ``new URL`` throw. A relative href is only
+    a claim on a page that has an origin to be relative to.
+    """
+    anchors = "".join(f'<a href="{href}">row</a>' for href in hrefs)
+    html = (
+        '<html><head><meta charset="utf-8"></head>'
+        f"<body><main>{anchors}</main></body></html>"
+    )
+    await page.route(
+        "https://www.linkedin.com/**",
+        lambda route: route.fulfill(content_type="text/html", body=html),
+    )
+    try:
+        await page.goto(_SENT_URL)
+    finally:
+        await page.unroute("https://www.linkedin.com/**")
+    return bool(await page.evaluate(_SENT_LIST_HAS_USER_JS, username))
+
+
+class TestSentListHasUser:
+    """A vanity-URL match on the sent list, and only a whole one.
+
+    The rows are synthetic anchors, so this is a claim about the matcher,
+    not about the page: what an href may look like and still name the
+    user, and what looks alike and does not.
+    """
+
+    @pytest.mark.parametrize(
+        ("href", "username"),
+        [
+            ("https://www.linkedin.com/in/itadic/", "itadic"),
+            ("/in/itadic", "itadic"),
+            ("/in/ItAdIc/", "itadic"),
+            # Non-ASCII vanity names: the browser hands back the pathname
+            # percent-encoded whether the markup carried it that way or not.
+            ("/in/m%C3%BCller/", "müller"),
+            ("/in/müller/", "müller"),
+        ],
+        ids=["absolute", "relative-no-slash", "case", "encoded", "literal"],
+    )
+    async def test_matches_the_users_vanity_url(self, dom_page, href, username):
+        assert await _sent_list_has(dom_page, [href], username) is True
+
+    async def test_does_not_match_a_longer_vanity_name(self, dom_page):
+        # A prefix match would read itadic2's row as itadic's.
+        assert await _sent_list_has(dom_page, ["/in/itadic2/"], "itadic") is False
+
+    async def test_does_not_match_when_the_list_is_empty(self, dom_page):
+        assert await _sent_list_has(dom_page, [], "itadic") is False

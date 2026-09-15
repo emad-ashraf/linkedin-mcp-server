@@ -599,11 +599,16 @@ async def test_incoming_verification_resolves_classifier_at_call_time(
     assert calls == [incoming, connected]
 
 
-async def test_submitted_invite_verification_resolves_classifier_at_call_time(
-    mock_page, monkeypatch
+@pytest.mark.parametrize(
+    ("in_sent_list", "status"), [(True, "connected"), (False, "not_sent")]
+)
+async def test_submitted_invite_verification_consults_the_sent_list(
+    mock_page, monkeypatch, in_sent_list, status
 ):
-    # The fake navigator and submitter keep this entirely off LinkedIn while the
-    # verification branch still performs both classifier calls.
+    # The fake navigator and submitter keep this entirely off LinkedIn. After a
+    # submit the profile header can no longer answer whether the invite went
+    # out, so the classifier runs once, on the initial decision, and the
+    # sent-invitations list alone decides between connected and not_sent.
     extractor = LinkedInExtractor(cast(Page, mock_page))
     extractor.scrape_person = AsyncMock(  # ty: ignore[invalid-assignment]
         return_value={
@@ -612,12 +617,11 @@ async def test_submitted_invite_verification_resolves_classifier_at_call_time(
         }
     )
     connectable = ActionSignals(True, False, False, False, False, False)
-    pending = ActionSignals(False, True, False, False, True, False)
     calls: list[ActionSignals] = []
 
     def classify(value: ActionSignals) -> connection.ConnectionState:
         calls.append(value)
-        return "connectable" if value is connectable else "pending"
+        return "connectable"
 
     monkeypatch.setattr(connection, "detect_connection_state", classify)
     with (
@@ -625,17 +629,24 @@ async def test_submitted_invite_verification_resolves_classifier_at_call_time(
             ConnectionActions,
             "_read_action_signals",
             new_callable=AsyncMock,
-            side_effect=[connectable, pending],
+            return_value=connectable,
         ),
         patch.object(PageNavigator, "_navigate_to_page", new_callable=AsyncMock),
         patch.object(
             ConnectionActions,
             "_submit_invite_dialog",
             new_callable=AsyncMock,
-            return_value=(True, False, None),
+            return_value=(True, False, None, "Invite dialog"),
         ),
+        patch.object(
+            ConnectionActions,
+            "_invitation_in_sent_list",
+            new_callable=AsyncMock,
+            return_value=in_sent_list,
+        ) as mock_sent,
     ):
         result = await extractor.connect_with_person("target")
 
-    assert result["status"] == "connected"
-    assert calls == [connectable, pending]
+    assert result["status"] == status
+    assert calls == [connectable]
+    mock_sent.assert_awaited_once_with("target")

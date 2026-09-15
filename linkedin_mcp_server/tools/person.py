@@ -345,10 +345,18 @@ def register_person_tools(
 
         Returns:
             Dict with url, status, message, and note_sent.
-            Statuses: pending, already_connected, follow_only,
-            connect_unavailable, unavailable, send_failed,
-            note_not_supported, custom_note_limit_reached,
-            connected, or accepted.
+            Statuses: pending, already_connected, connect_unavailable,
+            unavailable, dialog_not_found, not_sent, send_unverified,
+            send_failed, custom_note_limit_reached, connected, or accepted.
+
+            ``connected`` is returned only after the invitation was found
+            on the sent-invitations list. ``not_sent`` means the invite
+            dialog was submitted but LinkedIn created no invitation (the
+            ``message`` carries the dialog's raw text, e.g. a weekly limit
+            notice). ``dialog_not_found`` means the invite deeplink opened
+            no dialog at all; the ``message`` names the landing URL and any
+            page notice. ``send_unverified`` means the dialog was submitted
+            but the sent list could not be read; check it before retrying.
 
             When status is ``custom_note_limit_reached`` LinkedIn rejected
             personalized invite notes because the free note quota for the

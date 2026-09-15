@@ -47,7 +47,88 @@ _DIALOG_SELECTOR = 'dialog[open], [role="dialog"]'
 _DIALOG_PREMIUM_LINK_SELECTOR = (
     'dialog[open] a[href*="/premium/"], [role="dialog"] a[href*="/premium/"]'
 )
-_DIALOG_TEXTAREA_SELECTOR = '[role="dialog"] textarea, dialog textarea'
+_DIALOG_BUTTONS = "button, [role='button']"
+_DIALOG_TEXTAREA = "textarea"
+
+# Which of the page's dialogs is the modal the deeplink just opened. Open
+# messaging-overlay conversation windows are role="dialog" too, survive
+# navigation, and hug the bottom-right corner; a modal is centred on the
+# horizontal axis (measured 2026-09-14: box left 364, width 552, viewport
+# 1280). Positional "last button" across all dialogs resolved to a chat
+# window's "Open send options" that day, one index away from its "Send".
+# Vertical position is deliberately ignored: the same modal sat at top 32,
+# nowhere near the vertical centre.
+_MODAL_DIALOG_INDEX_JS = r"""
+() => {
+  const dialogs = [...document.querySelectorAll('dialog[open], [role="dialog"]')];
+  let best = -1;
+  let bestOff = Infinity;
+  dialogs.forEach((d, i) => {
+    const r = d.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return;
+    const off = Math.abs(r.left + r.width / 2 - innerWidth / 2);
+    if (off <= innerWidth * 0.1 && off < bestOff) {
+      best = i;
+      bestOff = off;
+    }
+  });
+  return best;
+}
+"""
+
+# Ground truth for "did the invite go out". The profile header cannot answer
+# it any more: since LinkedIn's 2026 profile UI the sent-invite state is a
+# text-only menu item ("Pending") inside the More menu, and the header after
+# a send is structurally identical to a follow-only profile (compose anchor
+# plus labeled buttons). Measured 2026-09-14: an invite that LinkedIn quietly
+# dropped read exactly like one it delivered. The sent list is sorted newest
+# first and links every row by vanity URL, so a URL match on its first page
+# is locale-independent and needs no text.
+_SENT_INVITATIONS_URL = "https://www.linkedin.com/mynetwork/invitation-manager/sent/"
+
+# Anchors on the sent-invitations page whose path is exactly /in/<username>/.
+# ``new URL`` normalises relative and absolute hrefs; the trailing-slash
+# compare stops ``/in/itadic`` from matching ``/in/itadic2``.
+_SENT_LIST_HAS_USER_JS = r"""
+(username) => {
+  // pathname comes back percent-encoded; vanity names may be non-ASCII.
+  const want = ("/in/" + encodeURIComponent(username) + "/").toLowerCase();
+  return [...document.querySelectorAll('a[href*="/in/"]')].some((a) => {
+    try {
+      const path = new URL(a.href, location.origin).pathname.toLowerCase();
+      return path === want || path === want.slice(0, -1);
+    } catch (e) {
+      return false;
+    }
+  });
+}
+"""
+
+# Text LinkedIn surfaces outside a dialog when it refuses to open one:
+# toasts and inline banners carry a live-region role. Raw text, returned
+# verbatim for the caller to read; never classified here.
+# Every dialog control with whether it is actually rendered. Logged next to
+# the dialog text so a failed click can be read back from the log.
+_DIALOG_BUTTONS_JS = r"""
+() => [...document.querySelectorAll(
+    'dialog[open] button, [role="dialog"] button, [role="dialog"] [role="button"]'
+  )].map((b) => {
+    const r = b.closest('dialog, [role="dialog"]').getBoundingClientRect();
+    return {
+      label: b.getAttribute("aria-label"),
+      text: (b.innerText || "").trim().slice(0, 40),
+      visible: b.getBoundingClientRect().width > 0,
+      dialogBox: [Math.round(r.left), Math.round(r.top), Math.round(r.width)],
+    };
+  })
+"""
+
+_PAGE_ALERTS_JS = r"""
+() => [...document.querySelectorAll('[role="alert"], [role="status"], [role="alertdialog"]')]
+  .map((e) => (e.innerText || "").trim())
+  .filter(Boolean)
+  .join(" | ")
+"""
 
 # Shared JS function that walks up from any /messaging/compose/ anchor
 # inside <main> to find the smallest ancestor that satisfies the
@@ -311,16 +392,44 @@ class ConnectionActions:
         self._navigator = navigator
         self._read_main_profile = read_main_profile
 
-    async def _dialog_is_open(self, *, timeout: int = 1000) -> bool:
-        """Return whether a dialog is currently open (structural check)."""
-        locator = self._session.page.locator(_DIALOG_SELECTOR)
+    async def _modal_index(self) -> int:
+        """Index of the invite modal among the page's dialogs, -1 if none."""
         try:
-            if await locator.count() == 0:
-                return False
-            await locator.first.wait_for(state="visible", timeout=timeout)
-            return True
+            return int(await self._session.page.evaluate(_MODAL_DIALOG_INDEX_JS))
         except Exception:
-            return False
+            return -1
+
+    async def _dialog_is_open(self, *, timeout: int = 1000) -> bool:
+        """Poll until the invite modal is present, or ``timeout`` ms pass.
+
+        Deliberately not "any dialog is visible": chat windows are dialogs
+        that never close, so that question always answers yes.
+        """
+        return await self._poll_modal(present=True, timeout=timeout)
+
+    async def _dialog_is_closed(self, *, timeout: int = 1000) -> bool:
+        """Poll until no invite modal is present, or ``timeout`` ms pass."""
+        return await self._poll_modal(present=False, timeout=timeout)
+
+    async def _poll_modal(self, *, present: bool, timeout: int) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout / 1000
+        while True:
+            if (await self._modal_index() >= 0) == present:
+                return True
+            if asyncio.get_running_loop().time() >= deadline:
+                return False
+            await asyncio.sleep(0.25)
+
+    async def _invite_dialog(self):
+        """Locator scoped to the invite modal; ``None`` when there is none.
+
+        No fallback to "the first dialog": with the modal gone that is a
+        chat window, and one index below its last button is its Send.
+        """
+        index = await self._modal_index()
+        if index < 0:
+            return None
+        return self._session.page.locator(_DIALOG_SELECTOR).nth(index)
 
     async def _click_dialog_primary_button(self, *, timeout: int = 5000) -> bool:
         """Click the last (primary/Send) button in the open dialog.
@@ -329,9 +438,10 @@ class ConnectionActions:
         Returns False (rather than raising) when the click is intercepted or
         times out, so callers can fall back to a keyboard submit.
         """
-        buttons = self._session.page.locator(
-            f"{_DIALOG_SELECTOR} button, {_DIALOG_SELECTOR} [role='button']"
-        )
+        dialog = await self._invite_dialog()
+        if dialog is None:
+            return False
+        buttons = dialog.locator(_DIALOG_BUTTONS)
         count = await buttons.count()
         if count == 0:
             return False
@@ -344,11 +454,14 @@ class ConnectionActions:
 
     async def _fill_dialog_textarea(self, value: str, *, timeout: int = 5000) -> bool:
         """Fill the first textarea inside the open dialog (structural)."""
-        locator = self._session.page.locator(_DIALOG_TEXTAREA_SELECTOR).first
+        dialog = await self._invite_dialog()
+        if dialog is None:
+            return False
+        textareas = dialog.locator(_DIALOG_TEXTAREA)
         try:
-            if await self._session.page.locator(_DIALOG_TEXTAREA_SELECTOR).count() == 0:
+            if await textareas.count() == 0:
                 return False
-            await locator.fill(value, timeout=timeout)
+            await textareas.first.fill(value, timeout=timeout)
             return True
         except Exception:
             return False
@@ -356,12 +469,7 @@ class ConnectionActions:
     async def _dismiss_dialog(self) -> None:
         """Dismiss any open dialog via Escape key (structural)."""
         await self._session.page.keyboard.press("Escape")
-        try:
-            await self._session.page.wait_for_selector(
-                _DIALOG_SELECTOR, state="hidden", timeout=3000
-            )
-        except PlaywrightTimeoutError:
-            pass
+        await self._dialog_is_closed(timeout=3000)
 
     async def _get_premium_upsell_message(self, *, timeout: int = 2500) -> str | None:
         """Return the raw LinkedIn Premium upsell dialog text when visible.
@@ -406,6 +514,54 @@ class ConnectionActions:
         except Exception:
             pass
         return "LinkedIn Premium upsell modal detected."
+
+    async def _dialog_text(self) -> str:
+        """Raw innerText of the open dialog, empty on any failure."""
+        try:
+            dialog = await self._invite_dialog()
+            if dialog is None:
+                return ""
+            text = await dialog.inner_text(timeout=2000)
+        except Exception:
+            return ""
+        return " ".join(text.split())
+
+    async def _page_alerts(self) -> str:
+        """Raw text of live-region banners/toasts on the page, empty if none."""
+        try:
+            return str(await self._session.page.evaluate(_PAGE_ALERTS_JS) or "")
+        except Exception:
+            return ""
+
+    async def _invitation_in_sent_list(self, username: str) -> bool:
+        """Whether ``username`` appears on the first page of sent invitations.
+
+        One navigation. The first page holds the ten newest rows, so a
+        just-sent invite is there unless ten more went out in between.
+        """
+        # Let the invite request finish before leaving the page: the modal
+        # closes on click, not on the server's answer, and a navigation
+        # aborts whatever is still in flight.
+        await asyncio.sleep(1.5)
+        await self._navigator._navigate_to_page(_SENT_INVITATIONS_URL)
+        # Scoped to <main>: the global nav links /in/ too, and matched at
+        # once on a page whose list had not rendered yet (measured: a
+        # delivered invite read as absent one second after the click).
+        try:
+            await self._session.page.locator('main a[href*="/in/"]').first.wait_for(
+                timeout=10000
+            )
+        except Exception:
+            logger.debug("Sent-invitations list rendered no profile links")
+        for _ in range(4):
+            try:
+                if await self._session.page.evaluate(_SENT_LIST_HAS_USER_JS, username):
+                    return True
+            except Exception:
+                logger.debug("Sent-invitations list check failed", exc_info=True)
+                return False
+            await asyncio.sleep(1.5)
+        return False
 
     async def _open_more_menu(self) -> bool:
         """Open the profile's More (three-dot) menu in a locale-independent way.
@@ -488,10 +644,17 @@ class ConnectionActions:
 
     async def _submit_invite_dialog(
         self, note: str | None
-    ) -> tuple[bool, bool, str | None]:
+    ) -> tuple[bool, bool, str | None, str | None]:
         """Submit the invite dialog opened by the custom-invite deeplink.
 
-        Returns ``(submitted, note_sent, note_limit_message)``.
+        Returns ``(submitted, note_sent, note_limit_message, dialog_text)``.
+
+        ``dialog_text`` is the raw text of whatever dialog the deeplink
+        opened, read before anything is clicked, and ``None`` when no
+        dialog opened at all. It is the only record of what LinkedIn
+        actually showed: a weekly-limit or add-an-email dialog closes on
+        its last button just like the invite dialog does, so ``submitted``
+        alone cannot tell them apart.
 
         ``note_sent`` reports *delivery*, not textarea fill — it stays
         False on any failure path, including the Premium upsell that
@@ -505,13 +668,23 @@ class ConnectionActions:
         dismissed on every failure path, callers must not dismiss again.
         """
         if not await self._dialog_is_open(timeout=5000):
-            return False, False, None
+            return False, False, None, None
+        dialog = await self._invite_dialog()
+        if dialog is None:
+            return False, False, None, None
+        dialog_text = await self._dialog_text()
+        logger.info("Invite dialog text: %s", dialog_text)
+        try:
+            logger.debug(
+                "Invite dialog buttons: %s",
+                await self._session.page.evaluate(_DIALOG_BUTTONS_JS),
+            )
+        except Exception:
+            logger.debug("Invite dialog button dump failed", exc_info=True)
 
         note_filled = False
         if note:
-            textarea_count = await self._session.page.locator(
-                _DIALOG_TEXTAREA_SELECTOR
-            ).count()
+            textarea_count = await dialog.locator(_DIALOG_TEXTAREA).count()
             if textarea_count == 0:
                 # Reveal the note textarea via the secondary action.
                 # Two layouts are now in the wild and both place "Add a
@@ -527,17 +700,13 @@ class ConnectionActions:
                 # the textarea-presence recheck via _fill_dialog_textarea
                 # then fails and the caller returns connect_unavailable
                 # without sending — the same outcome as today.
-                buttons = self._session.page.locator(
-                    f"{_DIALOG_SELECTOR} button, {_DIALOG_SELECTOR} [role='button']"
-                )
+                buttons = dialog.locator(_DIALOG_BUTTONS)
                 btn_count = await buttons.count()
                 if btn_count >= 2:
                     await buttons.nth(btn_count - 2).click()
                     try:
-                        await self._session.page.wait_for_selector(
-                            _DIALOG_TEXTAREA_SELECTOR,
-                            state="visible",
-                            timeout=3000,
+                        await dialog.locator(_DIALOG_TEXTAREA).first.wait_for(
+                            state="visible", timeout=3000
                         )
                     except PlaywrightTimeoutError:
                         logger.debug("Note textarea did not appear")
@@ -545,7 +714,7 @@ class ConnectionActions:
                     if note_limit_message is not None:
                         logger.info("Premium upsell blocked opening invite note editor")
                         await self._dismiss_dialog()
-                        return False, False, note_limit_message
+                        return False, False, note_limit_message, dialog_text
 
             note_filled = await self._fill_dialog_textarea(note)
             if not note_filled:
@@ -553,24 +722,22 @@ class ConnectionActions:
                 if note_limit_message is not None:
                     logger.info("Premium upsell blocked filling invite note")
                     await self._dismiss_dialog()
-                    return False, False, note_limit_message
+                    return False, False, note_limit_message, dialog_text
                 await self._dismiss_dialog()
-                return False, False, None
+                return False, False, None, dialog_text
 
         sent = await self._click_dialog_primary_button()
         if not sent:
             # Fallback: focus the primary button positionally so a subsequent
             # Enter targets it instead of a focused textarea (where Enter
             # would just insert a newline).
-            buttons = self._session.page.locator(
-                f"{_DIALOG_SELECTOR} button, {_DIALOG_SELECTOR} [role='button']"
-            )
+            buttons = dialog.locator(_DIALOG_BUTTONS)
             btn_count = await buttons.count()
             if btn_count > 0:
                 try:
                     await buttons.nth(btn_count - 1).focus()
                     await self._session.page.keyboard.press("Enter")
-                    sent = not await self._dialog_is_open(timeout=2000)
+                    sent = await self._dialog_is_closed(timeout=2000)
                 except Exception:
                     logger.debug("Keyboard submit fallback failed", exc_info=True)
             if not sent:
@@ -588,9 +755,9 @@ class ConnectionActions:
                             "Premium upsell modal intercepted invite submit click"
                         )
                         await self._dismiss_dialog()
-                        return False, False, note_limit_message
+                        return False, False, note_limit_message, dialog_text
                 await self._dismiss_dialog()
-                return False, False, None
+                return False, False, None, dialog_text
 
         # LinkedIn may swap the invite dialog for a Premium upsell when the
         # free note quota is exhausted. The textarea was filled but the
@@ -600,16 +767,12 @@ class ConnectionActions:
             if note_limit_message is not None:
                 logger.info("Premium upsell modal intercepted invite submit")
                 await self._dismiss_dialog()
-                return False, False, note_limit_message
+                return False, False, note_limit_message, dialog_text
 
-        try:
-            await self._session.page.wait_for_selector(
-                _DIALOG_SELECTOR, state="hidden", timeout=5000
-            )
-        except PlaywrightTimeoutError:
+        if not await self._dialog_is_closed(timeout=5000):
             logger.debug("Invite dialog did not close after submit")
 
-        return True, note_filled, None
+        return True, note_filled, None, dialog_text
 
     async def _probe_invite_note_limit(self) -> str | None:
         """Open the note editor only to read a Premium note-quota message.
@@ -624,24 +787,23 @@ class ConnectionActions:
         """
         if not await self._dialog_is_open(timeout=5000):
             return None
+        dialog = await self._invite_dialog()
+        if dialog is None:
+            return None
         note_limit_message = await self._get_premium_upsell_message(timeout=500)
         if note_limit_message is not None:
             await self._dismiss_dialog()
             return note_limit_message
 
         try:
-            textarea_count = await self._session.page.locator(
-                _DIALOG_TEXTAREA_SELECTOR
-            ).count()
+            textarea_count = await dialog.locator(_DIALOG_TEXTAREA).count()
         except Exception:
             textarea_count = 0
         if textarea_count > 0:
             await self._dismiss_dialog()
             return None
 
-        buttons = self._session.page.locator(
-            f"{_DIALOG_SELECTOR} button, {_DIALOG_SELECTOR} [role='button']"
-        )
+        buttons = dialog.locator(_DIALOG_BUTTONS)
         try:
             btn_count = await buttons.count()
         except Exception:
@@ -652,10 +814,8 @@ class ConnectionActions:
             except Exception:
                 logger.debug("Could not open invite note editor", exc_info=True)
             try:
-                await self._session.page.wait_for_selector(
-                    _DIALOG_TEXTAREA_SELECTOR,
-                    state="visible",
-                    timeout=3000,
+                await dialog.locator(_DIALOG_TEXTAREA).first.wait_for(
+                    state="visible", timeout=3000
                 )
             except PlaywrightTimeoutError:
                 logger.debug("Note textarea did not appear during quota probe")
@@ -823,9 +983,12 @@ class ConnectionActions:
 
         await self._navigator._navigate_to_page(invite_url)
 
-        submitted, note_sent, note_limit_message = await self._submit_invite_dialog(
-            note
-        )
+        (
+            submitted,
+            note_sent,
+            note_limit_message,
+            dialog_text,
+        ) = await self._submit_invite_dialog(note)
         if note_limit_message is not None:
             return _connection_result(
                 url,
@@ -835,32 +998,56 @@ class ConnectionActions:
                 profile=page_text,
             )
         if not submitted:
+            if dialog_text is None:
+                # The deeplink opened nothing. Measured 2026-09-14 on an
+                # account with ~255 pending invites: the same profile's
+                # Connect button also did nothing when clicked by hand, so
+                # this is LinkedIn refusing, not a selector miss. Hand the
+                # caller where the page landed and whatever LinkedIn said.
+                landed = self._session.page.url
+                alerts = await self._page_alerts()
+                return _connection_result(
+                    url,
+                    "dialog_not_found",
+                    f"LinkedIn did not open an invite dialog at {invite_url}"
+                    f" (landed on {landed}; selector {_DIALOG_SELECTOR!r})."
+                    + (f" Page notice: {alerts}" if alerts else ""),
+                    profile=page_text,
+                )
             return _connection_result(
                 url,
                 "connect_unavailable",
-                "LinkedIn did not open a usable invite dialog for this profile.",
+                "LinkedIn opened a dialog that could not be submitted as an invite."
+                f" Dialog text: {dialog_text}",
                 profile=page_text,
             )
 
-        verified = await self._read_main_profile(username)
-        verified_text = verified.get("sections", {}).get("main_profile", "")
-        verified_signals = await self._read_action_signals(username)
-        verified_state = connection.detect_connection_state(verified_signals)
-
-        if verified_signals.has_invite_anchor:
+        try:
+            listed = await self._invitation_in_sent_list(username)
+        except Exception as exc:
+            # The write already happened; a failed read must not hide it.
+            logger.warning("Could not verify invitation to %s: %s", username, exc)
             return _connection_result(
                 url,
-                "send_failed",
-                "Submitted the invite dialog but the profile still exposes Connect.",
+                "send_unverified",
+                "Submitted the invite dialog but could not read the sent"
+                f" invitations list to confirm it: {exc}",
                 note_sent=note_sent,
-                profile=verified_text or page_text,
+                profile=page_text,
             )
-
+        if listed:
+            return _connection_result(
+                url,
+                "connected",
+                "Connection request sent; it appears in the sent invitations list.",
+                note_sent=note_sent,
+                profile=page_text,
+            )
         return _connection_result(
             url,
-            "connected",
-            "Connection request sent."
-            + (f" State after send: {verified_state}." if verified_state else ""),
-            note_sent=note_sent,
-            profile=verified_text or page_text,
+            "not_sent",
+            "Submitted the invite dialog but the invitation does not appear in"
+            f" the sent invitations list. Dialog text: {dialog_text}",
+            note_sent=False,
+            profile=page_text,
         )
