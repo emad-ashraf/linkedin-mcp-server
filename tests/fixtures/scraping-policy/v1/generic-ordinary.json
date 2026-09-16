@@ -36,7 +36,7 @@
     },
     {
       "call": "extract_page",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null,
       "section": "section"

@@ -617,6 +617,7 @@ def semantic_program_id(program: str) -> str:
         ("delete owner.__linkedinMcpComposer", "message_composer_dispose"),
         ("return {ids: ids, scoped", "job_ids"),
         ("const heading = document.querySelector('main h1')", "profile_display_name"),
+        ("credentials: 'same-origin'", "messaging_api_fetch"),
         ("main li label[aria-label]", "conversation_thread_refs"),
         ("isScrollable", "scroll_main_region"),
         ("jobs-search-pagination__page-state", "job_total_pages"),

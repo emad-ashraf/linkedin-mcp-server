@@ -9,6 +9,20 @@
     {
       "call": "get_inbox",
       "callback_id": "callback-1",
+      "event": "response",
+      "kind": "listener.add",
+      "section": "conversation"
+    },
+    {
+      "call": "get_inbox",
+      "callback_id": "callback-2",
+      "event": "request",
+      "kind": "listener.add",
+      "section": "conversation"
+    },
+    {
+      "call": "get_inbox",
+      "callback_id": "callback-3",
       "event": "framenavigated",
       "kind": "listener.add",
       "section": "conversation"
@@ -34,7 +48,14 @@
     },
     {
       "call": "get_inbox",
-      "description": "goto https://www.linkedin.com/messaging/",
+      "count": 1,
+      "event": "response",
+      "kind": "listener.emit",
+      "section": "conversation"
+    },
+    {
+      "call": "get_inbox",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null,
       "section": "conversation"
@@ -57,7 +78,7 @@
     },
     {
       "call": "get_inbox",
-      "callback_id": "callback-1",
+      "callback_id": "callback-3",
       "event": "framenavigated",
       "kind": "listener.remove",
       "section": "conversation"
@@ -115,15 +136,30 @@
     },
     {
       "call": "get_inbox",
-      "kind": "wait_for_selector",
-      "operation": "conversation_rows",
-      "section": "conversation",
-      "selector": "main li label[aria-label]",
-      "state": "attached",
-      "timeout_ms": 10000
+      "callback_id": "callback-1",
+      "event": "response",
+      "kind": "listener.remove",
+      "section": "conversation"
+    },
+    {
+      "call": "get_inbox",
+      "callback_id": "callback-2",
+      "event": "request",
+      "kind": "listener.remove",
+      "section": "conversation"
     }
   ],
   "result": {
+    "references": {
+      "inbox": [
+        {
+          "context": "inbox",
+          "kind": "conversation",
+          "text": "Policy conversation",
+          "url": "/messaging/thread/2-abc/"
+        }
+      ]
+    },
     "section_names": [
       "inbox"
     ],

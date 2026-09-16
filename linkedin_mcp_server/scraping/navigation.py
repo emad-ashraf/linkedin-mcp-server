@@ -23,6 +23,10 @@ from linkedin_mcp_server.core.proxy_errors import (
 )
 from linkedin_mcp_server.debug_trace import record_page_trace
 from linkedin_mcp_server.debug_utils import stabilize_navigation
+from linkedin_mcp_server.privacy import (
+    is_private_linkedin_navigation_url,
+    redact_private_navigation_value,
+)
 from linkedin_mcp_server.scraping.rate_limit import (
     HTTP_STATUS_NAV_FAILURE,
     HTTP_STATUS_ON_INTERSTITIAL,
@@ -89,10 +93,16 @@ class PageNavigator:
     ) -> None:
         """Emit structured diagnostics for a failed target navigation."""
         page = self._session.page
-        try:
-            title = await page.title()
-        except Exception:
+        private_navigation = is_private_linkedin_navigation_url(
+            target_url
+        ) or is_private_linkedin_navigation_url(page.url)
+        if private_navigation:
             title = ""
+        else:
+            try:
+                title = await page.title()
+            except Exception:
+                title = ""
 
         try:
             auth_barrier = await detect_auth_barrier(page)
@@ -104,28 +114,35 @@ class PageNavigator:
         except Exception:
             remember_me_visible = False
 
-        try:
-            body_marker = self._normalize_body_marker(
-                await page.evaluate("() => document.body?.innerText || ''")
-            )
-        except Exception:
+        if private_navigation:
             body_marker = ""
+        else:
+            try:
+                body_marker = self._normalize_body_marker(
+                    await page.evaluate("() => document.body?.innerText || ''")
+                )
+            except Exception:
+                body_marker = ""
 
+        safe_target = redact_private_navigation_value(target_url)
+        safe_current = redact_private_navigation_value(page.url)
+        safe_hops = redact_private_navigation_value(hops)
+        safe_error = redact_private_navigation_value(
+            redact_proxy_credentials(
+                f"{type(navigation_error).__name__}: {navigation_error}"
+            )
+        )
         logger.warning(
             "Navigation to %s failed (wait_until=%s, error=%s). "
             "current_url=%s title=%r auth_barrier=%s remember_me=%s hops=%s body_marker=%r",
-            target_url,
+            safe_target,
             wait_until,
-            # Redacted like the traces above: a driver error can quote the
-            # proxy URL, and this log is what users paste into issue reports.
-            redact_proxy_credentials(
-                f"{type(navigation_error).__name__}: {navigation_error}"
-            ),
-            page.url,
+            safe_error,
+            safe_current,
             title,
             auth_barrier,
             remember_me_visible,
-            hops,
+            safe_hops,
             body_marker,
         )
 
@@ -140,13 +157,17 @@ class PageNavigator:
         if not barrier:
             return
 
-        logger.warning("Authentication barrier detected on %s: %s", url, barrier)
+        logger.warning(
+            "Authentication barrier detected on %s: %s",
+            redact_private_navigation_value(url),
+            barrier,
+        )
         message = (
             "LinkedIn requires interactive re-authentication. "
             "Run with --login and complete the account selection/sign-in flow."
         )
         if navigation_error is not None:
-            raise AuthenticationError(message) from navigation_error
+            raise AuthenticationError(message) from redacted_copy(navigation_error)
         raise AuthenticationError(message)
 
     async def _refusal_was_a_rate_limit(self) -> bool:
@@ -191,15 +212,16 @@ class PageNavigator:
             ),
         )
         budget.rate_limit_hits += 1
+        safe_url = redact_private_navigation_value(url)
         logger.warning(
             "LinkedIn rate-limited %s (retry-after: %s); backing off %.1fs",
-            url,
+            safe_url,
             retry_after if retry_after is not None else "not sent",
             delay,
         )
         await self._session.delay(delay)
 
-        message = f"LinkedIn refused {url} with HTTP 429 (too many requests)."
+        message = f"LinkedIn refused {safe_url} with HTTP 429 (too many requests)."
         if retry_after is None:
             return RateLimitError(f"{message} Wait before scraping again.")
         return RateLimitError(
@@ -244,7 +266,9 @@ class PageNavigator:
             )
             try:
                 response = await page.goto(url, wait_until=wait_until, timeout=30000)
-                await stabilize_navigation(f"goto {url}", logger)
+                await stabilize_navigation(
+                    f"goto {redact_private_navigation_value(url)}", logger
+                )
                 # A little cursor entropy after each load: a frozen mouse across
                 # navigations is a cheap bot tell. Best-effort, never fatal.
                 await humanize_after_nav(page)
@@ -273,7 +297,8 @@ class PageNavigator:
                     raise error from None
                 if allow_remember_me and await resolve_remember_me_prompt(page):
                     await stabilize_navigation(
-                        f"remember-me resolution for {url}", logger
+                        f"remember-me resolution for {redact_private_navigation_value(url)}",
+                        logger,
                     )
                     await record_page_trace(
                         page,
@@ -341,7 +366,10 @@ class PageNavigator:
                 return
 
             if allow_remember_me and await resolve_remember_me_prompt(page):
-                await stabilize_navigation(f"remember-me retry for {url}", logger)
+                await stabilize_navigation(
+                    f"remember-me retry for {redact_private_navigation_value(url)}",
+                    logger,
+                )
                 await record_page_trace(
                     page,
                     "extractor-after-remember-me-retry",
@@ -360,7 +388,11 @@ class PageNavigator:
                 "extractor-auth-barrier",
                 extra={"target_url": url, "barrier": barrier},
             )
-            logger.warning("Authentication barrier detected on %s: %s", url, barrier)
+            logger.warning(
+                "Authentication barrier detected on %s: %s",
+                redact_private_navigation_value(url),
+                barrier,
+            )
             raise AuthenticationError(
                 "LinkedIn requires interactive re-authentication. "
                 "Run with --login and complete the account selection/sign-in flow."
@@ -370,7 +402,9 @@ class PageNavigator:
 
     async def _navigate_to_page(self, url: str) -> None:
         """Navigate to a LinkedIn page and fail fast on auth barriers."""
-        logger.debug("_navigate_to_page: target=%s", url)
+        logger.debug(
+            "_navigate_to_page: target=%s", redact_private_navigation_value(url)
+        )
         await self._goto_with_auth_checks(url)
 
     @contextmanager

@@ -9,6 +9,20 @@
     {
       "call": "get_conversation",
       "callback_id": "callback-1",
+      "event": "response",
+      "kind": "listener.add",
+      "section": "conversation"
+    },
+    {
+      "call": "get_conversation",
+      "callback_id": "callback-2",
+      "event": "request",
+      "kind": "listener.add",
+      "section": "conversation"
+    },
+    {
+      "call": "get_conversation",
+      "callback_id": "callback-3",
       "event": "framenavigated",
       "kind": "listener.add",
       "section": "conversation"
@@ -16,7 +30,7 @@
     {
       "call": "get_conversation",
       "extra": {
-        "target_url": "https://www.linkedin.com/messaging/thread/2-abc/",
+        "target_url": "https://www.linkedin.com/messaging/",
         "wait_until": "domcontentloaded"
       },
       "kind": "boundary.trace",
@@ -26,15 +40,29 @@
     {
       "call": "get_conversation",
       "kind": "navigate",
-      "landed_url": "https://www.linkedin.com/messaging/thread/2-abc/",
-      "requested_url": "https://www.linkedin.com/messaging/thread/2-abc/",
+      "landed_url": "https://www.linkedin.com/messaging/",
+      "requested_url": "https://www.linkedin.com/messaging/",
       "section": "conversation",
       "timeout_ms": 30000,
       "wait_until": "domcontentloaded"
     },
     {
       "call": "get_conversation",
-      "description": "goto https://www.linkedin.com/messaging/thread/2-abc/",
+      "count": 1,
+      "event": "response",
+      "kind": "listener.emit",
+      "section": "conversation"
+    },
+    {
+      "call": "get_conversation",
+      "count": 1,
+      "event": "request",
+      "kind": "listener.emit",
+      "section": "conversation"
+    },
+    {
+      "call": "get_conversation",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null,
       "section": "conversation"
@@ -42,7 +70,7 @@
     {
       "call": "get_conversation",
       "extra": {
-        "target_url": "https://www.linkedin.com/messaging/thread/2-abc/",
+        "target_url": "https://www.linkedin.com/messaging/",
         "wait_until": "domcontentloaded"
       },
       "kind": "boundary.trace",
@@ -57,7 +85,7 @@
     },
     {
       "call": "get_conversation",
-      "callback_id": "callback-1",
+      "callback_id": "callback-3",
       "event": "framenavigated",
       "kind": "listener.remove",
       "section": "conversation"
@@ -86,7 +114,7 @@
     },
     {
       "arg": {
-        "position": "top"
+        "position": "bottom"
       },
       "call": "get_conversation",
       "kind": "evaluate",
@@ -103,48 +131,30 @@
     },
     {
       "arg": {
-        "position": "top"
+        "headers": {
+          "accept": "application/json",
+          "csrf-token": "policy-token"
+        },
+        "url": "https://www.linkedin.com/voyager/api/graphql?variables=(conversationUrn%3Aurn%3Ali%3Amsg_conversation%3A%282-abc%29)&queryId=messengerMessages.hash"
       },
       "call": "get_conversation",
       "kind": "evaluate",
-      "operation": "scroll_main_region",
-      "program_digest": "2a74f7f069d9",
+      "operation": "messaging_api_fetch",
+      "program_digest": "04a442da8cab",
       "section": "conversation"
     },
     {
       "call": "get_conversation",
-      "kind": "sleep",
-      "reason": "sleep",
-      "seconds": 0.5,
-      "section": "conversation"
-    },
-    {
-      "arg": {
-        "position": "top"
-      },
-      "call": "get_conversation",
-      "kind": "evaluate",
-      "operation": "scroll_main_region",
-      "program_digest": "2a74f7f069d9",
+      "callback_id": "callback-1",
+      "event": "response",
+      "kind": "listener.remove",
       "section": "conversation"
     },
     {
       "call": "get_conversation",
-      "kind": "sleep",
-      "reason": "sleep",
-      "seconds": 0.5,
-      "section": "conversation"
-    },
-    {
-      "arg": {
-        "selectors": [
-          "main"
-        ]
-      },
-      "call": "get_conversation",
-      "kind": "evaluate",
-      "operation": "root_content",
-      "program_digest": "e8a0e21ac6f5",
+      "callback_id": "callback-2",
+      "event": "request",
+      "kind": "listener.remove",
       "section": "conversation"
     }
   ],
@@ -153,7 +163,7 @@
       "conversation"
     ],
     "sections": {
-      "conversation": "Conversation content"
+      "conversation": "Policy message"
     },
     "url": "https://www.linkedin.com/messaging/thread/2-abc/"
   },

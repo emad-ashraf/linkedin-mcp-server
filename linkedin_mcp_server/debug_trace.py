@@ -11,6 +11,10 @@ import tempfile
 from typing import Any, Literal
 
 from linkedin_mcp_server.common_utils import secure_mkdir, slugify_fragment
+from linkedin_mcp_server.privacy import (
+    is_private_linkedin_navigation_url,
+    redact_private_navigation_value,
+)
 from linkedin_mcp_server.session_state import auth_root_dir, get_source_profile_dir
 
 TraceMode = Literal["off", "on_error", "always"]
@@ -127,16 +131,27 @@ async def record_page_trace(
     secure_mkdir(screenshot_dir)
     step_id = next(_TRACE_COUNTER)
     slug = _slugify_step(step) or "step"
+    raw_page_url = getattr(page, "url", "")
+    safe_extra = redact_private_navigation_value(extra or {})
+    private_navigation = is_private_linkedin_navigation_url(raw_page_url) or (
+        safe_extra != (extra or {})
+    )
 
-    try:
-        title = await page.title()
-    except Exception as exc:  # pragma: no cover - best effort diagnostics
-        title = f"<error: {exc}>"
+    if private_navigation:
+        title = ""
+    else:
+        try:
+            title = await page.title()
+        except Exception as exc:  # pragma: no cover - best effort diagnostics
+            title = f"<error: {exc}>"
 
-    try:
-        body_text = await page.evaluate("() => document.body?.innerText || ''")
-    except Exception as exc:  # pragma: no cover - best effort diagnostics
-        body_text = f"<error: {exc}>"
+    if private_navigation:
+        body_text = ""
+    else:
+        try:
+            body_text = await page.evaluate("() => document.body?.innerText || ''")
+        except Exception as exc:  # pragma: no cover - best effort diagnostics
+            body_text = f"<error: {exc}>"
 
     if not isinstance(body_text, str):
         body_text = ""
@@ -146,10 +161,13 @@ async def record_page_trace(
     except Exception:  # pragma: no cover - best effort diagnostics
         remember_me = False
 
-    try:
-        cookies = await page.context.cookies()
-    except Exception:  # pragma: no cover - best effort diagnostics
+    if private_navigation:
         cookies = []
+    else:
+        try:
+            cookies = await page.context.cookies()
+        except Exception:  # pragma: no cover - best effort diagnostics
+            cookies = []
 
     linkedin_cookie_names = sorted(
         {
@@ -161,23 +179,24 @@ async def record_page_trace(
 
     screenshot_path = screenshot_dir / f"{step_id:03d}-{slug}.png"
     screenshot: str | None = None
-    try:
-        await page.screenshot(path=str(screenshot_path), full_page=True)
-        screenshot = str(screenshot_path)
-    except Exception as exc:  # pragma: no cover - best effort diagnostics
-        screenshot = f"<error: {exc}>"
+    if not private_navigation:
+        try:
+            await page.screenshot(path=str(screenshot_path), full_page=True)
+            screenshot = str(screenshot_path)
+        except Exception as exc:  # pragma: no cover - best effort diagnostics
+            screenshot = f"<error: {exc}>"
 
     payload = {
         "step_id": step_id,
         "step": step,
-        "url": getattr(page, "url", ""),
+        "url": redact_private_navigation_value(raw_page_url),
         "title": title,
         "remember_me": remember_me,
         "body_length": len(body_text),
         "body_marker": " ".join(body_text.split())[:200],
         "linkedin_cookie_names": linkedin_cookie_names,
         "screenshot": screenshot,
-        "extra": extra or {},
+        "extra": safe_extra,
     }
 
     trace_jsonl = trace_dir / "trace.jsonl"

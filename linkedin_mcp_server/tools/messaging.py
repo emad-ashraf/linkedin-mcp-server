@@ -79,11 +79,7 @@ def register_messaging_tools(
     @mcp.tool(
         timeout=tool_timeout,
         title="Get Conversation",
-        # Not read-only, though it reads: resolving a username enumerates the
-        # inbox by click-visiting rows, and LinkedIn marks a visited row as read.
-        # The docstring below has always said so. An unread message the user has
-        # not seen is state, and losing it is not something a reader should do.
-        annotations={"openWorldHint": True},
+        annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"messaging", "scraping"},
         exclude_args=["extractor"],
     )
@@ -99,12 +95,9 @@ def register_messaging_tools(
 
         Provide either linkedin_username or thread_id to identify the conversation.
 
-        When looked up by linkedin_username, resolution searches the messaging
-        inbox for the participant's display name and click-visits every
-        matching row to capture its thread ID — LinkedIn's sidebar has no
-        anchor hrefs or thread-id attributes, so this is the only available
-        path. Each visit selects the row in the LinkedIn UI and may mark it
-        as read. Pass thread_id directly to skip this enumeration.
+        Conversation identity and messages are read from LinkedIn's passive
+        messaging data responses. The conversation row is never selected, so
+        an unread conversation remains unread.
 
         Args:
             ctx: FastMCP context for progress reporting
@@ -130,12 +123,7 @@ def register_messaging_tools(
             extractor = extractor or await get_ready_extractor(
                 ctx, tool_name="get_conversation"
             )
-            logger.info(
-                "Fetching conversation: username=%s, thread_id=%s, index=%d",
-                linkedin_username,
-                thread_id,
-                index,
-            )
+            logger.info("Fetching conversation (index=%d)", index)
 
             await ctx.report_progress(
                 progress=0, total=100, message="Loading conversation"
@@ -162,10 +150,7 @@ def register_messaging_tools(
     @mcp.tool(
         timeout=tool_timeout,
         title="Search Conversations",
-        # Same reason as `get_conversation`: enumerating result rows selects them
-        # in LinkedIn's UI, which can mark them read. Its own `limit` argument is
-        # documented in those terms.
-        annotations={"openWorldHint": True},
+        annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"messaging", "search"},
         exclude_args=["extractor"],
     )
@@ -181,10 +166,7 @@ def register_messaging_tools(
         Args:
             keywords: Search keywords to filter conversations
             ctx: FastMCP context for progress reporting
-            limit: Maximum number of search-result rows to enumerate as
-                conversation references (1-50, default 20). Each enumeration
-                selects the row in LinkedIn's UI and may mark it as read, so
-                a low cap is preferable for noisy queries.
+            limit: Maximum number of conversation references (1-50, default 20)
 
         Returns:
             Dict with url, sections (search_results -> raw text), and optional references.
@@ -193,9 +175,7 @@ def register_messaging_tools(
             extractor = extractor or await get_ready_extractor(
                 ctx, tool_name="search_conversations"
             )
-            logger.info(
-                "Searching conversations: keywords='%s', limit=%d", keywords, limit
-            )
+            logger.info("Searching conversations (limit=%d)", limit)
 
             await ctx.report_progress(
                 progress=0, total=100, message="Searching messages"

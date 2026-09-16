@@ -10,6 +10,20 @@
     {
       "call": "search_conversations",
       "callback_id": "callback-1",
+      "event": "response",
+      "kind": "listener.add",
+      "section": "conversation"
+    },
+    {
+      "call": "search_conversations",
+      "callback_id": "callback-2",
+      "event": "request",
+      "kind": "listener.add",
+      "section": "conversation"
+    },
+    {
+      "call": "search_conversations",
+      "callback_id": "callback-3",
       "event": "framenavigated",
       "kind": "listener.add",
       "section": "conversation"
@@ -35,7 +49,14 @@
     },
     {
       "call": "search_conversations",
-      "description": "goto https://www.linkedin.com/messaging/?searchTerm=engine",
+      "count": 1,
+      "event": "response",
+      "kind": "listener.emit",
+      "section": "conversation"
+    },
+    {
+      "call": "search_conversations",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null,
       "section": "conversation"
@@ -58,7 +79,7 @@
     },
     {
       "call": "search_conversations",
-      "callback_id": "callback-1",
+      "callback_id": "callback-3",
       "event": "framenavigated",
       "kind": "listener.remove",
       "section": "conversation"
@@ -66,12 +87,6 @@
     {
       "call": "search_conversations",
       "kind": "boundary.rate_limit",
-      "section": "conversation"
-    },
-    {
-      "call": "search_conversations",
-      "dismissed": false,
-      "kind": "boundary.modal",
       "section": "conversation"
     },
     {
@@ -84,6 +99,12 @@
       "program_digest": "9ab4343bf5cb",
       "section": "conversation",
       "timeout_ms": 10000
+    },
+    {
+      "call": "search_conversations",
+      "dismissed": false,
+      "kind": "boundary.modal",
+      "section": "conversation"
     },
     {
       "arg": {
@@ -99,15 +120,30 @@
     },
     {
       "call": "search_conversations",
-      "kind": "wait_for_selector",
-      "operation": "conversation_rows",
-      "section": "conversation",
-      "selector": "main li label[aria-label]",
-      "state": "attached",
-      "timeout_ms": 10000
+      "callback_id": "callback-1",
+      "event": "response",
+      "kind": "listener.remove",
+      "section": "conversation"
+    },
+    {
+      "call": "search_conversations",
+      "callback_id": "callback-2",
+      "event": "request",
+      "kind": "listener.remove",
+      "section": "conversation"
     }
   ],
   "result": {
+    "references": {
+      "search_results": [
+        {
+          "context": "search_results",
+          "kind": "conversation",
+          "text": "Policy conversation",
+          "url": "/messaging/thread/2-abc/"
+        }
+      ]
+    },
     "section_names": [
       "search_results"
     ],
