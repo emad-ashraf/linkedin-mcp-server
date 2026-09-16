@@ -23,7 +23,7 @@ a page-owning collaborator.
 | `connection_actions` | `ACTION_SIGNALS_JS`, `CLICK_INCOMING_ACCEPT_JS`, `ConnectionActions`, `OPEN_MORE_BUTTON_JS`, `ReadMainProfile` | `page-owning` |
 | `content` | `PageContentReader` | `page-owning` |
 | `contracts` | `ExtractedSection`, `FilterValidationError`, `RATE_LIMITED_SECTION_TEXT`, `SEND_INTERRUPTED_WARNING`, `message_action_result()`, `rate_limited_section_error()`, `refuse_an_invalid_message()` | `browser-free` |
-| `conversations` | `ConversationReader`, `strip_select_conversation_prefix()` | `page-owning` |
+| `conversations` | `ConversationReader` | `page-owning` |
 | `extractor` | `LinkedInExtractor` | `page-owning` |
 | `facets` | `FacetResolver`, `GEO_ID_PATTERN`, `LOCATION_BOX_SELECTOR`, `TYPEAHEAD_TIMEOUT_MS` | `page-owning` |
 | `feed` | `FeedScraper` | `page-owning` |
@@ -35,6 +35,8 @@ a page-owning collaborator.
 | `jobs` | `JobScraper` | `browser-free` |
 | `link_metadata` | `JOB_PATH_RE`, `RawReference`, `Reference`, `ReferenceKind`, `build_references()`, `choose_reference_text()`, `classify_link()`, `clean_heading()`, `clean_label()`, `dedupe_references()`, `derive_context()`, `normalize_reference()`, `normalize_url()` | `browser-free` |
 | `message_sender` | `MessageSender` | `page-owning` |
+| `messaging_api` | `MessagingApiCapture` | `browser-free` |
+| `messaging_payload` | `build_conversation_references()`, `build_message_page_url()`, `build_message_references()`, `conversation_elements()`, `conversation_matches_username()`, `conversation_thread_path()`, `find_conversation_by_thread_id()`, `format_message_elements()`, `merge_message_elements()`, `message_elements()`, `replace_conversation_urn()` | `browser-free` |
 | `navigation` | `PageNavigator`, `WaitUntil` | `page-owning` |
 | `person` | `PersonScraper` | `page-owning` |
 | `posts` | `PostSearch` | `browser-free` |
@@ -56,7 +58,7 @@ a page-owning collaborator.
 - `connection_actions` -> `connection`, `identifiers`, `navigation`, `session`
 - `content` -> `session`, `text`
 - `contracts` -> `identifiers`, `link_metadata`
-- `conversations` -> `content`, `identifiers`, `link_metadata`, `navigation`, `profile_page`, `session`, `text`
+- `conversations` -> `content`, `identifiers`, `link_metadata`, `messaging_api`, `messaging_payload`, `navigation`, `profile_page`, `session`, `text`
 - `extractor` -> `capture`, `company`, `connection_actions`, `content`, `contracts`, `conversations`, `facets`, `feed`, `job_pages`, `jobs`, `message_sender`, `navigation`, `person`, `posts`, `profile_page`, `session`, `text`
 - `facets` -> `capture`, `company_parse`, `contracts`, `identifiers`, `link_metadata`, `navigation`, `session`
 - `feed` -> `content`, `contracts`, `feed_payload`, `navigation`, `session`, `text`
@@ -68,6 +70,8 @@ a page-owning collaborator.
 - `jobs` -> `capture`, `contracts`, `identifiers`, `job_pages`, `job_policy`, `link_metadata`, `navigation`, `search_urls`, `session`
 - `link_metadata` -> _(none)_
 - `message_sender` -> `contracts`, `identifiers`, `navigation`, `session`
+- `messaging_api` -> `messaging_payload`
+- `messaging_payload` -> `identifiers`, `link_metadata`
 - `navigation` -> `rate_limit`, `session`
 - `person` -> `capture`, `contracts`, `facets`, `fields`, `identifiers`, `link_metadata`, `navigation`, `profile_page`, `search_pages`, `search_parse`, `search_urls`, `session`, `text`
 - `posts` -> `capture`, `contracts`, `link_metadata`, `search_urls`

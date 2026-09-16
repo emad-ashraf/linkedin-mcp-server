@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import quote
 
 from linkedin_mcp_server.config.schema import BrowserConfig
+from linkedin_mcp_server.privacy import redact_private_navigation_value
 
 from .exceptions import ProxyConnectionError
 
@@ -112,7 +113,7 @@ def raise_if_proxy_error(error: BaseException) -> None:
 
 
 def redacted_copy(error: Exception) -> Exception:
-    """Return *error* with the proxy credentials stripped from its message.
+    """Return *error* without proxy credentials or private navigation routes.
 
     For re-raising across a boundary that logs exceptions. The type is
     preserved so callers branching on it are unaffected; only the message is
@@ -121,7 +122,7 @@ def redacted_copy(error: Exception) -> Exception:
     redaction is better than losing the error.
     """
     message = str(error)
-    redacted = redact_proxy_credentials(message)
+    redacted = redact_private_navigation_value(redact_proxy_credentials(message))
     if redacted == message:
         return error
     try:

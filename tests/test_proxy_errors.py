@@ -11,6 +11,7 @@ from linkedin_mcp_server.core.proxy_errors import (
     proxy_hint,
     raise_if_proxy_error,
     redact_proxy_credentials,
+    redacted_copy,
 )
 
 
@@ -96,6 +97,17 @@ class TestRedaction:
             "linkedin_mcp_server.config.get_config", lambda: AppConfig()
         )
         assert redact_proxy_credentials("untouched") == "untouched"
+
+    @pytest.mark.parametrize(
+        "route", ["messaging/thread/private-id", "in/private-user"]
+    )
+    def test_exception_copy_removes_private_linkedin_routes(self, route):
+        copied = redacted_copy(
+            RuntimeError(f"Page.goto failed at https://www.linkedin.com/{route}/")
+        )
+
+        assert "private-id" not in str(copied)
+        assert "private-user" not in str(copied)
 
     def test_reporting_survives_an_unreadable_config(self, monkeypatch):
         def explode():

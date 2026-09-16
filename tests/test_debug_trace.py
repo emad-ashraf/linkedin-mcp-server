@@ -104,6 +104,46 @@ async def test_reset_trace_state_resets_step_counter(monkeypatch, tmp_path):
     assert second_payload["step_id"] == 1
 
 
+@pytest.mark.asyncio
+async def test_messaging_trace_never_captures_private_page_content(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("USER_DATA_DIR", str(tmp_path / "profile"))
+    page = MagicMock()
+    page.url = "https://www.linkedin.com/messaging/thread/private-id/"
+    page.title = AsyncMock(return_value="Private participant")
+    page.evaluate = AsyncMock(return_value="Private message body")
+    page.locator = MagicMock()
+    page.context.cookies = AsyncMock(
+        return_value=[{"name": "private-cookie", "domain": ".linkedin.com"}]
+    )
+    page.screenshot = AsyncMock()
+
+    await record_page_trace(
+        page,
+        "messaging-failure",
+        extra={
+            "target_url": (
+                "https://www.linkedin.com/messaging/?searchTerm=private+query"
+            )
+        },
+    )
+
+    trace_dir = get_trace_dir()
+    assert trace_dir is not None
+    payload = json.loads((trace_dir / "trace.jsonl").read_text())
+    rendered = json.dumps(payload)
+    assert "private-id" not in rendered
+    assert "private query" not in rendered
+    assert "Private participant" not in rendered
+    assert "Private message body" not in rendered
+    assert "private-cookie" not in rendered
+    assert payload["body_marker"] == ""
+    assert payload["screenshot"] is None
+    page.evaluate.assert_not_awaited()
+    page.screenshot.assert_not_awaited()
+
+
 def test_safe_source_profile_dir_ignores_generic_env_fallback(monkeypatch):
     monkeypatch.setenv("USER_DATA_DIR", "/tmp/unrelated-user-data")
     monkeypatch.setattr(
