@@ -904,25 +904,17 @@ class TestServerVersion:
 class TestWhatTheToolsPromise:
     """``readOnlyHint`` is a claim the daemon acts on, not documentation.
 
-    A tool that declares it is replayed automatically after the frontend repairs
-    auth, with no second confirmation from anyone. So the annotation has to mean
-    what it says: anything that can change LinkedIn's state, however slightly,
-    must not carry it.
+    A tool that declares it may be replayed automatically after the frontend
+    repairs auth, with no second confirmation from anyone. The messaging reads
+    therefore claim this only while their passive response capture preserves
+    conversation state.
     """
 
-    async def test_no_tool_claims_read_only_while_changing_state(self):
-        """The two messaging tools that read by clicking are the reason for this.
-
-        Resolving a conversation by username enumerates the inbox by visiting
-        rows, and LinkedIn marks a visited row as read. Both tools' own
-        docstrings say so, and both carried ``readOnlyHint`` anyway. An unread
-        message the user has not seen is state, and a replay that silently clears
-        it is not something a reader should do.
-        """
+    async def test_passive_messaging_reads_claim_read_only(self):
         mcp = create_mcp_server()
-        marks_things_read = {"get_conversation", "search_conversations"}
+        passive_reads = {"get_inbox", "get_conversation", "search_conversations"}
         claiming = set()
-        for name in marks_things_read:
+        for name in passive_reads:
             tool = await mcp.get_tool(name)
             # A missing tool means this test is guarding a name that no longer
             # exists, which is worse than a wrong annotation: it would pass
@@ -931,7 +923,4 @@ class TestWhatTheToolsPromise:
             if tool.annotations and tool.annotations.readOnlyHint:
                 claiming.add(name)
 
-        assert not (marks_things_read & claiming), (
-            "these tools mark conversations as read, so they cannot be replayed "
-            f"unattended: {sorted(marks_things_read & claiming)}"
-        )
+        assert claiming == passive_reads

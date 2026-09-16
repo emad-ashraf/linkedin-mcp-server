@@ -50,9 +50,9 @@ This MCP server is **free** and **open source**, supported by [**Unipile**](http
 | `get_my_profile` | Get the authenticated user's own LinkedIn profile (same sections as get_person_profile) |
 | `connect_with_person` | Send a connection request or accept an incoming one, with optional note |
 | `get_sidebar_profiles` | Extract profile URLs from sidebar recommendation sections ("More profiles for you", "Explore premium profiles", "People you may know") on a profile page |
-| `get_inbox` | List recent conversations from the LinkedIn messaging inbox |
-| `get_conversation` | Read a specific messaging conversation by username or thread ID |
-| `search_conversations` | Search messages by keyword |
+| `get_inbox` | List recent conversations without changing their read/unread state |
+| `get_conversation` | Read a conversation by username or thread ID without marking it read |
+| `search_conversations` | Search messages by keyword without changing read/unread state |
 | `send_message` | Compose/send a new message to a LinkedIn user (requires confirmation; profile-based targeting may open a separate DM instead of replying in an existing thread — see #483) |
 | `get_company_profile` | Extract company information with explicit section selection (posts, jobs); about-section references may include a `company_urn` entry carrying the numeric id used by LinkedIn's people-search `currentCompany` URL facet |
 | `get_company_posts` | Get recent posts from a company's LinkedIn feed |

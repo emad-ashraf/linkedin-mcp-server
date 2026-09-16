@@ -50,7 +50,7 @@
     },
     {
       "call": "scrape_person",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null
     },
@@ -160,7 +160,7 @@
     },
     {
       "call": "scrape_person",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/details/experience/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null
     },
@@ -283,7 +283,7 @@
     },
     {
       "call": "scrape_person",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/details/education/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null
     },
@@ -406,7 +406,7 @@
     },
     {
       "call": "scrape_person",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/details/interests/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null
     },
@@ -529,7 +529,7 @@
     },
     {
       "call": "scrape_person",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/details/honors/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null
     },
@@ -652,7 +652,7 @@
     },
     {
       "call": "scrape_person",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/details/languages/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null
     },
@@ -775,7 +775,7 @@
     },
     {
       "call": "scrape_person",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/details/certifications/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null
     },
@@ -898,7 +898,7 @@
     },
     {
       "call": "scrape_person",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/details/skills/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null
     },
@@ -1021,7 +1021,7 @@
     },
     {
       "call": "scrape_person",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/details/projects/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null
     },
@@ -1144,7 +1144,7 @@
     },
     {
       "call": "scrape_person",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/overlay/contact-info/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null
     },
@@ -1230,7 +1230,7 @@
     },
     {
       "call": "scrape_person",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/recent-activity/all/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null
     },

@@ -969,14 +969,67 @@ async def _conversation_scenario(method: str) -> dict[str, Any]:
     recorder = TraceRecorder(name, _COMMON_ALLOWED)
     clock = FakeClock(recorder)
     page = _page(recorder)
-    if method != "search_conversations":
-        scrolls = 3 if method == "get_conversation" else 1
-        page.script("evaluate:scroll_main_region", *([True] * scrolls))
-    page.script("evaluate:root_content", _root("Conversation content"))
+    conversation = {
+        "entityUrn": "urn:li:msg_conversation:(2-abc)",
+        "backendUrn": "urn:li:messagingThread:2-abc",
+        "conversationUrl": "https://www.linkedin.com/messaging/thread/2-abc/",
+        "conversationParticipants": [],
+        "title": {"text": "Policy conversation"},
+        "read": False,
+    }
+    inbox_payload = {
+        "data": {"messengerConversationsByCategoryQuery": {"elements": [conversation]}}
+    }
+
+    class Request:
+        method = "GET"
+        url = (
+            "https://www.linkedin.com/voyager/api/graphql?"
+            "variables=(conversationUrn%3Aurn%3Ali%3Amsg_conversation%3A"
+            "%282-abc%29)&queryId=messengerMessages.hash"
+        )
+
+        async def all_headers(self) -> dict[str, str]:
+            return {"accept": "application/json", "csrf-token": "policy-token"}
+
+    class Response:
+        url = (
+            "https://www.linkedin.com/voyager/api/graphql?"
+            "queryId=messengerConversations.hash"
+        )
+
+        async def json(self) -> dict[str, Any]:
+            return inbox_payload
+
+    def emit_messaging() -> None:
+        page.emit("response", Response())
+        if method == "get_conversation":
+            page.emit("request", Request())
+
+    page.script("goto", emit_messaging)
+    if method in {"get_inbox", "get_conversation"}:
+        page.script("evaluate:scroll_main_region", True)
     if method != "get_conversation":
+        page.script("evaluate:root_content", _root("Conversation content"))
+    if method == "get_conversation":
         page.script(
-            "wait_for_selector:conversation_rows",
-            PlaywrightTimeoutError("no scripted rows"),
+            "evaluate:messaging_api_fetch",
+            {
+                "status": 200,
+                "payload": {
+                    "data": {
+                        "messengerMessagesBySyncToken": {
+                            "elements": [
+                                {
+                                    "backendConversationUrn": conversation["entityUrn"],
+                                    "deliveredAt": 1,
+                                    "body": {"text": "Policy message"},
+                                }
+                            ]
+                        }
+                    }
+                },
+            },
         )
     extractor = _extractor(page)
     async with boundaries(recorder, clock):

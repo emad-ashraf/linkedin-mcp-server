@@ -32,7 +32,7 @@
     },
     {
       "call": "get_my_profile",
-      "description": "goto https://www.linkedin.com/in/me/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null,
       "section": "main_profile"

@@ -37,7 +37,7 @@
     },
     {
       "call": "send_message",
-      "description": "goto https://www.linkedin.com/in/ada-lovelace/",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null,
       "section": "message"
@@ -123,7 +123,7 @@
     },
     {
       "call": "send_message",
-      "description": "goto https://www.linkedin.com/messaging/compose/?recipient=ACoAA-policy&profileUrn=urn%3Ali%3Afsd_profile%3AACoAA-policy",
+      "description": "goto https://www.linkedin.com/<private-route>",
       "kind": "boundary.stabilize",
       "result": null,
       "section": "message"

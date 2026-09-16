@@ -11,6 +11,8 @@ from patchright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+from linkedin_mcp_server.privacy import redact_private_navigation_value
+
 from .exceptions import AuthenticationError
 
 logger = logging.getLogger(__name__)
@@ -94,11 +96,14 @@ async def is_logged_in(page: Page) -> bool:
     except PlaywrightTimeoutError:
         logger.warning(
             "Timeout checking login status on %s — treating as not logged in",
-            page.url,
+            redact_private_navigation_value(page.url),
         )
         return False
-    except Exception:
-        logger.error("Unexpected error checking login status", exc_info=True)
+    except Exception as exc:
+        logger.error(
+            "Unexpected error checking login status: %s",
+            redact_private_navigation_value(str(exc)),
+        )
         raise
 
 
@@ -162,11 +167,14 @@ async def _detect_auth_barrier(
     except PlaywrightTimeoutError:
         logger.warning(
             "Timeout checking auth barrier on %s — continuing without barrier detection",
-            page.url,
+            redact_private_navigation_value(page.url),
         )
         return None
-    except Exception:
-        logger.error("Unexpected error checking auth barrier", exc_info=True)
+    except Exception as exc:
+        logger.error(
+            "Unexpected error checking auth barrier: %s",
+            redact_private_navigation_value(str(exc)),
+        )
         return None
 
 
@@ -199,7 +207,10 @@ async def resolve_remember_me_prompt(page: Page, *, timeout: int | None = None) 
         return min(default, remaining)
 
     try:
-        logger.debug("Checking remember-me prompt on %s", page.url)
+        logger.debug(
+            "Checking remember-me prompt on %s",
+            redact_private_navigation_value(page.url),
+        )
         try:
             operation_timeout = _operation_timeout(3000)
             if operation_timeout is None:
