@@ -81,6 +81,66 @@ _PROFILE_MESSAGE_TARGET_JS = r"""() => {
     const main = document.querySelector('main');
     if (!main) return {status: 'unresolved'};
 
+    // LinkedIn's 2026 profile layout (SDUI, measured 2026-09-16) has no <h1>
+    // and no <section> child of <main>, and renders the top-card Message
+    // control up to three times (one copy in a sticky header outside <main>),
+    // with identical hrefs and only some of them visible. Counting anchors
+    // therefore says nothing. What does identify the viewed member is their
+    // profile URN: the top card is a container whose element id carries it,
+    // and the in-<main> copies sit inside that container. A sidebar card for
+    // another member offers a compose anchor too, but no ancestor of it is
+    // keyed by that member's URN. The key is tied to the anchor's own
+    // ancestry on purpose: an id elsewhere on the page (an open chat window
+    // in the messaging overlay) must not vouch for a sidebar anchor.
+    const normalizeUrn = value => {
+        const text = (value || '').trim();
+        const prefix = 'urn:li:fsd_profile:';
+        const identifier = text.startsWith(prefix) ? text.slice(prefix.length) : text;
+        return /^[A-Za-z0-9_-]+$/.test(identifier) ? identifier : null;
+    };
+    const urnOf = anchor => {
+        try {
+            const url = new URL(anchor.getAttribute('href') || anchor.href || '', window.location.href);
+            return normalizeUrn(url.searchParams.get('profileUrn') || url.searchParams.get('recipient'));
+        } catch {
+            return null;
+        }
+    };
+    // Substring match, not a bounded one: the measured id is
+    // "com.linkedin.sdui.profile.card.ref<URN>Topcard" with no separator on
+    // either side. Real fsd_profile ids are all the same length, so one can
+    // never be a substring of another; the length floor only rejects a
+    // degenerate href whose one-letter id would match almost anything.
+    const keyedUrnOf = anchor => {
+        const urn = urnOf(anchor);
+        if (!urn || urn.length < 8) return null;
+        for (let node = anchor.parentElement; node && node !== document.documentElement; node = node.parentElement) {
+            if (node.id && node.id.includes(urn)) return urn;
+        }
+        return null;
+    };
+    const composeAnchorsOnPage = Array.from(
+        document.querySelectorAll('a[href*="/messaging/compose/"]')
+    ).filter(anchor => visible(anchor) && validComposeHref(anchor.getAttribute('href') || anchor.href || ''));
+    const keyedUrns = new Set(composeAnchorsOnPage.filter(active).map(keyedUrnOf).filter(Boolean));
+    if (keyedUrns.size > 1) return {status: 'unresolved'};
+    if (keyedUrns.size === 1) {
+        const [urn] = keyedUrns;
+        const copies = composeAnchorsOnPage.filter(candidate => urnOf(candidate) === urn);
+        // A visible copy that is disabled while another is not is a
+        // contradiction, refused the same way the legacy top card refuses it.
+        if (!copies.every(active)) return {status: 'unresolved'};
+        const heading = main.querySelector('h1');
+        return {
+            status: 'resolved',
+            pageUrl: window.location.href,
+            displayName: normalize(
+                heading ? heading.innerText || heading.textContent || '' : ''
+            ),
+            composeHrefs: [copies[0].getAttribute('href') || copies[0].href || ''],
+        };
+    }
+
     const section = Array.from(main.children).find(
         element => element.matches('section') && visible(element)
     );

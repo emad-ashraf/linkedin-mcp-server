@@ -140,6 +140,69 @@ async def _state(page, html: str) -> dict:
     return await page.evaluate(_MESSAGE_COMPOSER_STATE_JS, TARGET)
 
 
+PROFILE_URL = "https://www.linkedin.com/in/testuser/"
+# Both ids clear the 8-character floor and neither is a substring of the
+# other, so a keyed container can only ever vouch for its own member.
+_VIEWED_URN = "ACoAAVIEWED"
+_OTHER_URN = "ACoAAOTHER"
+_VIEWED_COMPOSE_HREF = (
+    "https://www.linkedin.com/messaging/compose/"
+    f"?profileUrn=urn%3Ali%3Afsd_profile%3A{_VIEWED_URN}"
+)
+_VIEWED_MESSAGE = (
+    f'<a style="display:block" href="{_VIEWED_COMPOSE_HREF}"'
+    ' aria-label="Message Test User">Message</a>'
+)
+_VIEWED_MESSAGE_DISABLED = _VIEWED_MESSAGE.replace("<a ", '<a aria-disabled="true" ', 1)
+_SIDEBAR_MESSAGE = (
+    '<a style="display:block" href="https://www.linkedin.com/messaging/compose/'
+    f'?profileUrn=urn%3Ali%3Afsd_profile%3A{_OTHER_URN}"'
+    ' aria-label="Message Other Member">Message</a>'
+)
+
+
+def _sdui_profile(
+    *,
+    header: str = "",
+    cards: dict[str, str] | None = None,
+    sidebar: str = _SIDEBAR_MESSAGE,
+    extra: str = "",
+) -> str:
+    """Profile page in the SDUI layout measured 2026-09-16.
+
+    ``<main>`` has a single ``<div>`` child, no ``<section>`` and no ``<h1>``;
+    each member in ``cards`` gets a top-card container whose id carries their
+    URN (``com.linkedin.sdui.profile.card.ref<URN>Topcard``, no separators)
+    wrapping the given markup; the top card's Message control is repeated in a
+    sticky header outside ``<main>`` with no keyed ancestor; the sidebar's
+    "people also viewed" card offers its own compose anchor, also unkeyed.
+    ``extra`` lands as a sibling of ``<main>``, outside every anchor's ancestry.
+    """
+    if cards is None:
+        cards = {_VIEWED_URN: ""}
+    card_html = "".join(
+        f'<div id="com.linkedin.sdui.profile.card.ref{urn}Topcard">{inner}</div>'
+        f'<div id="com.linkedin.sdui.profile.card.ref{urn}About"></div>'
+        for urn, inner in cards.items()
+    )
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head><body>
+      <header style="position:sticky;top:0">{header}</header>
+      <main>
+        <div>
+          {card_html}
+        </div>
+      </main>
+      {extra}
+      <aside>{sidebar}</aside>
+    </body></html>
+    """
+
+
+async def _set_profile_content(page, html: str) -> None:
+    await page.goto(PROFILE_URL)
+    await page.set_content(html)
+
+
 class TestMessageSurfaceDom:
     async def test_waits_for_delayed_editor(self, dom_page):
         await _set_composer_content(
@@ -244,6 +307,129 @@ class TestProfileMessageTargetDom:
 
         assert result["displayName"] == "Test User"
         assert result["composeHrefs"] == ["/messaging/compose/?recipient=ACoAAB"]
+
+    async def test_sdui_layout_resolves_by_urn_keyed_into_card_ids(self, dom_page):
+        await _set_profile_content(
+            dom_page,
+            _sdui_profile(
+                header=_VIEWED_MESSAGE, cards={_VIEWED_URN: _VIEWED_MESSAGE * 2}
+            ),
+        )
+
+        result = await dom_page.evaluate(_PROFILE_MESSAGE_TARGET_JS)
+
+        assert result == {
+            "status": "resolved",
+            "pageUrl": PROFILE_URL,
+            "displayName": "",
+            "composeHrefs": [_VIEWED_COMPOSE_HREF],
+        }
+
+    async def test_sdui_layout_hidden_duplicate_does_not_count(self, dom_page):
+        # The measured page renders one of the two in-main copies display:none.
+        await _set_profile_content(
+            dom_page,
+            _sdui_profile(
+                header=_VIEWED_MESSAGE,
+                cards={
+                    _VIEWED_URN: _VIEWED_MESSAGE
+                    + _VIEWED_MESSAGE.replace("block", "none")
+                },
+            ),
+        )
+
+        result = await dom_page.evaluate(_PROFILE_MESSAGE_TARGET_JS)
+
+        assert result["status"] == "resolved"
+        assert result["composeHrefs"] == [_VIEWED_COMPOSE_HREF]
+        assert result["displayName"] == ""
+
+    async def test_sdui_layout_two_keyed_urns_is_unresolved(self, dom_page):
+        other_message = _VIEWED_MESSAGE.replace(_VIEWED_URN, _OTHER_URN)
+        await _set_profile_content(
+            dom_page,
+            _sdui_profile(
+                header=_VIEWED_MESSAGE,
+                cards={_VIEWED_URN: _VIEWED_MESSAGE, _OTHER_URN: other_message},
+            ),
+        )
+
+        result = await dom_page.evaluate(_PROFILE_MESSAGE_TARGET_JS)
+
+        assert result == {"status": "unresolved"}
+
+    async def test_sdui_layout_without_own_message_control_is_unresolved(
+        self, dom_page
+    ):
+        # Only the sidebar offers a compose anchor, and nothing keys it. The
+        # legacy fallback finds no <section> and cannot claim "unavailable".
+        await _set_profile_content(dom_page, _sdui_profile())
+
+        result = await dom_page.evaluate(_PROFILE_MESSAGE_TARGET_JS)
+
+        assert result == {"status": "unresolved"}
+
+    async def test_sdui_layout_id_outside_anchor_ancestry_does_not_vouch(
+        self, dom_page
+    ):
+        # An open chat window in the messaging overlay carries the other
+        # member's URN in its id. It is not an ancestor of the sidebar anchor,
+        # so it must not turn that anchor into the viewed member's control.
+        await _set_profile_content(
+            dom_page,
+            _sdui_profile(extra=f'<div id="msg-overlay-{_OTHER_URN}"></div>'),
+        )
+
+        result = await dom_page.evaluate(_PROFILE_MESSAGE_TARGET_JS)
+
+        assert result == {"status": "unresolved"}
+        assert "composeHrefs" not in result
+
+    async def test_sdui_layout_without_any_compose_anchor_is_unresolved(self, dom_page):
+        await _set_profile_content(dom_page, _sdui_profile(sidebar=""))
+
+        result = await dom_page.evaluate(_PROFILE_MESSAGE_TARGET_JS)
+
+        assert result == {"status": "unresolved"}
+
+    async def test_sdui_layout_disabled_copy_beside_active_is_unresolved(
+        self, dom_page
+    ):
+        # The sticky-header copy is disabled while the keyed in-main copy is
+        # not: a visible contradiction, refused rather than picked from.
+        await _set_profile_content(
+            dom_page,
+            _sdui_profile(
+                header=_VIEWED_MESSAGE_DISABLED, cards={_VIEWED_URN: _VIEWED_MESSAGE}
+            ),
+        )
+
+        result = await dom_page.evaluate(_PROFILE_MESSAGE_TARGET_JS)
+
+        assert result == {"status": "unresolved"}
+
+    async def test_sdui_layout_only_disabled_copies_are_not_resolved(self, dom_page):
+        await _set_profile_content(
+            dom_page,
+            _sdui_profile(
+                header=_VIEWED_MESSAGE_DISABLED,
+                cards={_VIEWED_URN: _VIEWED_MESSAGE_DISABLED * 2},
+            ),
+        )
+
+        result = await dom_page.evaluate(_PROFILE_MESSAGE_TARGET_JS)
+
+        assert result == {"status": "unresolved"}
+
+    async def test_sdui_layout_only_hidden_copies_are_not_resolved(self, dom_page):
+        hidden = _VIEWED_MESSAGE.replace("block", "none")
+        await _set_profile_content(
+            dom_page, _sdui_profile(header=hidden, cards={_VIEWED_URN: hidden * 2})
+        )
+
+        result = await dom_page.evaluate(_PROFILE_MESSAGE_TARGET_JS)
+
+        assert result == {"status": "unresolved"}
 
 
 class TestMessageComposerDom:
