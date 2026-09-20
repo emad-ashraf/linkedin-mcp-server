@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from patchright.async_api import Route
 
 from linkedin_mcp_server.core.exceptions import (
     InvalidReferenceError,
@@ -216,6 +217,84 @@ class TestGetInbox:
             "url": "https://www.linkedin.com/messaging/",
             "sections": {},
         }
+
+
+class TestReadStateWrites:
+    @pytest.mark.parametrize("navigation_fails", [False, True])
+    async def test_inbox_routes_read_flag_writes_around_navigation(
+        self, mock_page, navigation_fails
+    ):
+        calls: list[tuple[Any, ...]] = []
+
+        async def route(pattern: str, handler: Any) -> None:
+            calls.append(("route", pattern, handler))
+
+        async def unroute(pattern: str, handler: Any) -> None:
+            calls.append(("unroute", pattern, handler))
+
+        async def nav(url: str) -> None:
+            calls.append(("navigate", url))
+            if navigation_fails:
+                raise LinkedInScraperException("navigation failed")
+
+        mock_page.route = AsyncMock(side_effect=route)
+        mock_page.unroute = AsyncMock(side_effect=unroute)
+        capture = FakeCapture([_inbox(_conversation("2-a"))])
+        reader = _reader(mock_page)
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.conversations.MessagingApiCapture",
+                return_value=capture,
+            ),
+            patch.object(
+                PageNavigator, "_navigate_to_page", AsyncMock(side_effect=nav)
+            ),
+            patch.object(reader, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                reader, "_scroll_main_scrollable_region", new_callable=AsyncMock
+            ),
+            patch.object(
+                PageContentReader,
+                "_extract_root_content",
+                new_callable=AsyncMock,
+                return_value=_root("Ada Lovelace"),
+            ),
+        ):
+            if navigation_fails:
+                with pytest.raises(LinkedInScraperException):
+                    await reader.get_inbox(limit=5)
+            else:
+                await reader.get_inbox(limit=5)
+
+        handler = ConversationReader._abort_read_state_write
+        conversations = "**/voyager/api/voyagerMessagingDashMessengerConversations*"
+        badge = "**/voyager/api/voyagerMessagingDashMessagingBadge*"
+        assert calls == [
+            ("route", conversations, handler),
+            ("route", badge, handler),
+            ("navigate", "https://www.linkedin.com/messaging/"),
+            ("unroute", conversations, handler),
+            ("unroute", badge, handler),
+        ], "both read-flag routes are aborted around the navigation and removed after"
+
+    @pytest.mark.parametrize(
+        ("method", "aborted"), [("POST", True), ("GET", False), ("OPTIONS", False)]
+    )
+    async def test_handler_aborts_only_post(self, method, aborted):
+        route = SimpleNamespace(
+            request=SimpleNamespace(method=method),
+            abort=AsyncMock(),
+            continue_=AsyncMock(),
+        )
+
+        await ConversationReader._abort_read_state_write(cast(Route, route))
+
+        assert route.abort.await_count == (1 if aborted else 0), (
+            f"{method} read-flag request abort count"
+        )
+        assert route.continue_.await_count == (0 if aborted else 1), (
+            f"{method} read-flag request continue count"
+        )
 
 
 class TestGetConversation:

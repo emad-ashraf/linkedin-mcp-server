@@ -75,6 +75,8 @@ _COMMON_ALLOWED = {
     "mouse.move",
     "mouse.wheel",
     "navigate",
+    "route.add",
+    "route.remove",
     "sleep",
     "wait_for_function",
     "wait_for_load_state",

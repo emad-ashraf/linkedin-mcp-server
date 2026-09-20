@@ -308,6 +308,7 @@ class ScriptedPage:
         self.locator_ids: dict[tuple[str | None, str], str] = {}
         self.derived_ids: dict[tuple[str, str], str] = {}
         self.listeners: dict[str, list[Callable[..., Any]]] = defaultdict(list)
+        self.routes: dict[str, list[Callable[..., Any]]] = defaultdict(list)
         self.goto_landings: deque[str] = deque()
         self.handles: list[ScriptedHandle] = []
 
@@ -385,6 +386,31 @@ class ScriptedPage:
             "listener.remove",
             event=event,
             callback_id=self.recorder.callback_id(callback),
+        )
+
+    async def route(self, pattern: str, handler: Callable[..., Any]) -> None:
+        if handler in self.routes[pattern]:
+            raise AssertionError(
+                f"{self.recorder.scenario}: handler already registered for {pattern}"
+            )
+        self.routes[pattern].append(handler)
+        self.recorder.record(
+            "route.add",
+            pattern=pattern,
+            callback_id=self.recorder.callback_id(handler),
+        )
+
+    async def unroute(self, pattern: str, handler: Callable[..., Any]) -> None:
+        if handler not in self.routes[pattern]:
+            raise AssertionError(
+                f"{self.recorder.scenario}: handler identity was not registered "
+                f"for {pattern}"
+            )
+        self.routes[pattern].remove(handler)
+        self.recorder.record(
+            "route.remove",
+            pattern=pattern,
+            callback_id=self.recorder.callback_id(handler),
         )
 
     async def goto(
@@ -507,6 +533,8 @@ class ScriptedPage:
             name: len(values) for name, values in self.listeners.items() if values
         }
         assert not remaining, f"{self.recorder.scenario}: listeners remain: {remaining}"
+        routed = {name: len(values) for name, values in self.routes.items() if values}
+        assert not routed, f"{self.recorder.scenario}: routes remain: {routed}"
         unused = {
             name: len(script.values)
             for name, script in self.scripts.items()

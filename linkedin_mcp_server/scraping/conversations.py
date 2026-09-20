@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import quote_plus
 
 import logging
 
+from patchright.async_api import Route
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core.exceptions import LinkedInScraperException
@@ -38,6 +41,15 @@ from linkedin_mcp_server.scraping.session import ScrapingSession
 from linkedin_mcp_server.scraping.text import strip_linkedin_noise
 
 logger = logging.getLogger(__name__)
+
+# ponytail: LinkedIn's /messaging/ page redirects to the newest thread and
+# POSTs its read flag here (measured 2026-09-20, same call as the "Mark as
+# unread" menu); aborting the POST keeps the user's unread state, GETs still
+# flow so the passive capture works
+_READ_STATE_WRITE_ROUTES = (
+    "**/voyager/api/voyagerMessagingDashMessengerConversations*",
+    "**/voyager/api/voyagerMessagingDashMessagingBadge*",
+)
 
 
 class ConversationReader:
@@ -153,6 +165,26 @@ class ConversationReader:
         return offset
 
     @staticmethod
+    async def _abort_read_state_write(route: Route) -> None:
+        if route.request.method == "POST":
+            await route.abort()
+        else:
+            await route.continue_()
+
+    @contextlib.asynccontextmanager
+    async def _without_read_state_writes(self) -> AsyncIterator[None]:
+        """Run a messaging workflow with LinkedIn's read-flag POSTs aborted."""
+        page = self._session.page
+        handler = self._abort_read_state_write
+        for pattern in _READ_STATE_WRITE_ROUTES:
+            await page.route(pattern, handler)
+        try:
+            yield
+        finally:
+            for pattern in _READ_STATE_WRITE_ROUTES:
+                await page.unroute(pattern, handler)
+
+    @staticmethod
     def _unique_conversations(
         conversations: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
@@ -227,28 +259,31 @@ class ConversationReader:
 
     async def get_inbox(self, limit: int = 20) -> dict[str, Any]:
         """List recent conversations without selecting any sidebar row."""
-        url = "https://www.linkedin.com/messaging/"
-        async with MessagingApiCapture(self._session.page) as capture:
-            offset = await self._load_messaging_page(
-                capture,
-                url,
-                log_context="Messaging inbox",
-                scroll_attempts=max(1, limit // 10),
-            )
-            raw_result = await self._content._extract_root_content(["main"])
-            payloads = capture.payloads[offset:]
+        async with self._without_read_state_writes():
+            url = "https://www.linkedin.com/messaging/"
+            async with MessagingApiCapture(self._session.page) as capture:
+                offset = await self._load_messaging_page(
+                    capture,
+                    url,
+                    log_context="Messaging inbox",
+                    scroll_attempts=max(1, limit // 10),
+                )
+                raw_result = await self._content._extract_root_content(["main"])
+                payloads = capture.payloads[offset:]
 
-        raw = raw_result["text"]
-        cleaned = strip_linkedin_noise(raw) if raw else ""
-        references: list[Reference] = (
-            build_references(raw_result["references"], "inbox") if cleaned else []
-        )
-        conversation_refs = build_conversation_references(
-            payloads, limit=limit, context="inbox"
-        )
-        if conversation_refs:
-            references = dedupe_references(conversation_refs + references)
-        return self._single_section_result(url, "inbox", cleaned, references=references)
+            raw = raw_result["text"]
+            cleaned = strip_linkedin_noise(raw) if raw else ""
+            references: list[Reference] = (
+                build_references(raw_result["references"], "inbox") if cleaned else []
+            )
+            conversation_refs = build_conversation_references(
+                payloads, limit=limit, context="inbox"
+            )
+            if conversation_refs:
+                references = dedupe_references(conversation_refs + references)
+            return self._single_section_result(
+                url, "inbox", cleaned, references=references
+            )
 
     async def get_conversation(
         self,
@@ -262,96 +297,100 @@ class ConversationReader:
                 "Provide at least one of linkedin_username or thread_id"
             )
 
-        async with MessagingApiCapture(self._session.page) as capture:
-            if thread_id:
-                normalized_thread_id = normalize_thread_id(thread_id)
-                offset = await self._load_messaging_page(
-                    capture,
-                    "https://www.linkedin.com/messaging/",
-                    log_context="Messaging inbox",
-                    scroll_attempts=1,
-                )
-                conversations = self._unique_conversations(
-                    capture.conversations_since(offset)
-                )
-                target = find_conversation_by_thread_id(
-                    conversations, normalized_thread_id
-                )
-                if target is None:
-                    await self._scroll_main_scrollable_region(
-                        position="bottom", attempts=5, pause_time=0.5
+        async with self._without_read_state_writes():
+            async with MessagingApiCapture(self._session.page) as capture:
+                if thread_id:
+                    normalized_thread_id = normalize_thread_id(thread_id)
+                    offset = await self._load_messaging_page(
+                        capture,
+                        "https://www.linkedin.com/messaging/",
+                        log_context="Messaging inbox",
+                        scroll_attempts=1,
                     )
-                    await capture.settle()
                     conversations = self._unique_conversations(
                         capture.conversations_since(offset)
                     )
                     target = find_conversation_by_thread_id(
                         conversations, normalized_thread_id
                     )
-                if target is None:
-                    raise LinkedInScraperException(
-                        "Could not map that thread ID to a passive conversation response."
+                    if target is None:
+                        await self._scroll_main_scrollable_region(
+                            position="bottom", attempts=5, pause_time=0.5
+                        )
+                        await capture.settle()
+                        conversations = self._unique_conversations(
+                            capture.conversations_since(offset)
+                        )
+                        target = find_conversation_by_thread_id(
+                            conversations, normalized_thread_id
+                        )
+                    if target is None:
+                        raise LinkedInScraperException(
+                            "Could not map that thread ID to a passive conversation response."
+                        )
+                else:
+                    target, conversations = await self._conversation_for_username(
+                        capture, linkedin_username or "", index
                     )
-            else:
-                target, conversations = await self._conversation_for_username(
-                    capture, linkedin_username or "", index
-                )
-                path = conversation_thread_path(target)
-                if path is None:
-                    raise LinkedInScraperException(
-                        "The matched conversation has no stable thread URL."
+                    path = conversation_thread_path(target)
+                    if path is None:
+                        raise LinkedInScraperException(
+                            "The matched conversation has no stable thread URL."
+                        )
+                    normalized_thread_id = normalize_thread_id(
+                        path.removeprefix("/messaging/thread/").removesuffix("/")
                     )
-                normalized_thread_id = normalize_thread_id(
-                    path.removeprefix("/messaging/thread/").removesuffix("/")
+
+                messages = await capture.fetch_message_history(
+                    target,
+                    conversations=conversations,
                 )
 
-            messages = await capture.fetch_message_history(
-                target,
-                conversations=conversations,
+            cleaned = format_message_elements(
+                messages, timezone=datetime.now().astimezone().tzinfo
             )
-
-        cleaned = format_message_elements(
-            messages, timezone=datetime.now().astimezone().tzinfo
-        )
-        references = (
-            build_message_references(messages, conversation=target) if cleaned else []
-        )
-        return self._single_section_result(
-            messaging_thread_url(normalized_thread_id, "/"),
-            "conversation",
-            cleaned,
-            references=references,
-        )
+            references = (
+                build_message_references(messages, conversation=target)
+                if cleaned
+                else []
+            )
+            return self._single_section_result(
+                messaging_thread_url(normalized_thread_id, "/"),
+                "conversation",
+                cleaned,
+                references=references,
+            )
 
     async def search_conversations(
         self, keywords: str, limit: int = 20
     ) -> dict[str, Any]:
         """Search messages without selecting any result row."""
-        search_url = (
-            f"https://www.linkedin.com/messaging/?searchTerm={quote_plus(keywords)}"
-        )
-        async with MessagingApiCapture(self._session.page) as capture:
-            offset = await self._load_messaging_page(
-                capture, search_url, log_context="Messaging search"
+        async with self._without_read_state_writes():
+            search_url = (
+                f"https://www.linkedin.com/messaging/?searchTerm={quote_plus(keywords)}"
             )
-            raw_result = await self._content._extract_root_content(["main"])
-            payloads = capture.payloads[offset:]
+            async with MessagingApiCapture(self._session.page) as capture:
+                offset = await self._load_messaging_page(
+                    capture, search_url, log_context="Messaging search"
+                )
+                raw_result = await self._content._extract_root_content(["main"])
+                payloads = capture.payloads[offset:]
 
-        raw = raw_result["text"]
-        cleaned = strip_linkedin_noise(raw) if raw else ""
-        references: list[Reference] = (
-            build_references(raw_result["references"], "search_results")
-            if cleaned
-            else []
-        )
-        conversation_refs = build_conversation_references(
-            payloads, limit=limit, context="search_results"
-        )
-        if conversation_refs:
-            references = dedupe_references(conversation_refs + references)
-        return self._single_section_result(
-            self._session.page.url,
-            "search_results",
-            cleaned,
-            references=references,
-        )
+            raw = raw_result["text"]
+            cleaned = strip_linkedin_noise(raw) if raw else ""
+            references: list[Reference] = (
+                build_references(raw_result["references"], "search_results")
+                if cleaned
+                else []
+            )
+            conversation_refs = build_conversation_references(
+                payloads, limit=limit, context="search_results"
+            )
+            if conversation_refs:
+                references = dedupe_references(conversation_refs + references)
+            return self._single_section_result(
+                self._session.page.url,
+                "search_results",
+                cleaned,
+                references=references,
+            )

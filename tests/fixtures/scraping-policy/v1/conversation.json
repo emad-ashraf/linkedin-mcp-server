@@ -9,20 +9,34 @@
     {
       "call": "get_conversation",
       "callback_id": "callback-1",
+      "kind": "route.add",
+      "pattern": "**/voyager/api/voyagerMessagingDashMessengerConversations*",
+      "section": "conversation"
+    },
+    {
+      "call": "get_conversation",
+      "callback_id": "callback-1",
+      "kind": "route.add",
+      "pattern": "**/voyager/api/voyagerMessagingDashMessagingBadge*",
+      "section": "conversation"
+    },
+    {
+      "call": "get_conversation",
+      "callback_id": "callback-2",
       "event": "response",
       "kind": "listener.add",
       "section": "conversation"
     },
     {
       "call": "get_conversation",
-      "callback_id": "callback-2",
+      "callback_id": "callback-3",
       "event": "request",
       "kind": "listener.add",
       "section": "conversation"
     },
     {
       "call": "get_conversation",
-      "callback_id": "callback-3",
+      "callback_id": "callback-4",
       "event": "framenavigated",
       "kind": "listener.add",
       "section": "conversation"
@@ -93,7 +107,7 @@
     },
     {
       "call": "get_conversation",
-      "callback_id": "callback-3",
+      "callback_id": "callback-4",
       "event": "framenavigated",
       "kind": "listener.remove",
       "section": "conversation"
@@ -153,16 +167,30 @@
     },
     {
       "call": "get_conversation",
-      "callback_id": "callback-1",
+      "callback_id": "callback-2",
       "event": "response",
       "kind": "listener.remove",
       "section": "conversation"
     },
     {
       "call": "get_conversation",
-      "callback_id": "callback-2",
+      "callback_id": "callback-3",
       "event": "request",
       "kind": "listener.remove",
+      "section": "conversation"
+    },
+    {
+      "call": "get_conversation",
+      "callback_id": "callback-1",
+      "kind": "route.remove",
+      "pattern": "**/voyager/api/voyagerMessagingDashMessengerConversations*",
+      "section": "conversation"
+    },
+    {
+      "call": "get_conversation",
+      "callback_id": "callback-1",
+      "kind": "route.remove",
+      "pattern": "**/voyager/api/voyagerMessagingDashMessagingBadge*",
       "section": "conversation"
     }
   ],
