@@ -30,7 +30,14 @@
       "requested_url": "https://www.linkedin.com/in/ada-lovelace/",
       "section": "main_profile",
       "timeout_ms": 30000,
-      "wait_until": "domcontentloaded"
+      "wait_until": "commit"
+    },
+    {
+      "call": "connect_with_person",
+      "kind": "wait_for_load_state",
+      "section": "main_profile",
+      "state": "domcontentloaded",
+      "timeout_ms": 30000
     },
     {
       "call": "connect_with_person",
@@ -42,6 +49,7 @@
     {
       "call": "connect_with_person",
       "extra": {
+        "load_state_lagged": false,
         "target_url": "https://www.linkedin.com/in/ada-lovelace/",
         "wait_until": "domcontentloaded"
       },

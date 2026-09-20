@@ -30,7 +30,13 @@
       "landed_url": "https://www.linkedin.com/search/results/people/?keywords=analyst&network=%5B%22F%22%5D",
       "requested_url": "https://www.linkedin.com/search/results/people/?keywords=analyst&network=%5B%22F%22%5D",
       "timeout_ms": 30000,
-      "wait_until": "domcontentloaded"
+      "wait_until": "commit"
+    },
+    {
+      "call": "search_people",
+      "kind": "wait_for_load_state",
+      "state": "domcontentloaded",
+      "timeout_ms": 30000
     },
     {
       "call": "search_people",
@@ -41,6 +47,7 @@
     {
       "call": "search_people",
       "extra": {
+        "load_state_lagged": false,
         "target_url": "https://www.linkedin.com/search/results/people/?keywords=analyst&network=%5B%22F%22%5D",
         "wait_until": "domcontentloaded"
       },

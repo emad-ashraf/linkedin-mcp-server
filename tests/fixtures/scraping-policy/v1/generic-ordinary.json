@@ -32,7 +32,14 @@
       "requested_url": "https://www.linkedin.com/in/ada-lovelace/",
       "section": "section",
       "timeout_ms": 30000,
-      "wait_until": "domcontentloaded"
+      "wait_until": "commit"
+    },
+    {
+      "call": "extract_page",
+      "kind": "wait_for_load_state",
+      "section": "section",
+      "state": "domcontentloaded",
+      "timeout_ms": 30000
     },
     {
       "call": "extract_page",
@@ -44,6 +51,7 @@
     {
       "call": "extract_page",
       "extra": {
+        "load_state_lagged": false,
         "target_url": "https://www.linkedin.com/in/ada-lovelace/",
         "wait_until": "domcontentloaded"
       },

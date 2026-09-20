@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import logging
 
 from patchright.async_api import Error as PatchrightError
+from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import pytest
 
@@ -225,6 +226,201 @@ class TestNavigationDiagnostics:
         mock_log_failure.assert_awaited_once()
         mock_page.on.assert_called_once()
         mock_page.remove_listener.assert_called_once()
+
+
+class TestCommittedNavigation:
+    """`goto` waits for the commit; the load state is a second, softer wait.
+
+    A LinkedIn SDUI page keeps a request open long after its DOM has
+    rendered, so `domcontentloaded` can lag past the budget on a page that is
+    already usable (#42). Folding both waits into one `goto` made that lag a
+    hard failure and dropped the response the 429 check needs.
+    """
+
+    URL = "https://www.linkedin.com/in/testuser/"
+
+    @staticmethod
+    def _no_barrier():
+        return patch(
+            "linkedin_mcp_server.scraping.navigation.detect_auth_barrier_quick",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+
+    @staticmethod
+    def _committed_but_never_loaded(page, response=None) -> None:
+        """A page whose load state never arrives, the way the browser has it.
+
+        `goto` returns on commit and times out on anything later, so a double
+        that answered every `wait_until` alike would let a single combined
+        `goto` pass the lag cases it exists to fail.
+        """
+
+        async def goto(url, *, wait_until, timeout):
+            if wait_until == "commit":
+                return response
+            raise PlaywrightTimeoutError(f"Timeout {timeout}ms exceeded.")
+
+        page.goto = AsyncMock(side_effect=goto)
+        page.wait_for_load_state = AsyncMock(
+            side_effect=PlaywrightTimeoutError("Timeout 10000ms exceeded.")
+        )
+
+    async def test_goto_commits_and_the_load_state_is_waited_for_separately(
+        self, mock_page
+    ):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+
+        with self._no_barrier():
+            await navigator._goto_with_auth_checks(self.URL)
+
+        mock_page.goto.assert_awaited_once_with(
+            self.URL, wait_until="commit", timeout=30000
+        )
+        mock_page.wait_for_load_state.assert_awaited_once_with(
+            "domcontentloaded", timeout=int(PageNavigator._LOAD_STATE_TIMEOUT * 1000)
+        )
+
+    async def test_a_commit_request_waits_for_nothing_more(self, mock_page):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+
+        with self._no_barrier():
+            await navigator._goto_with_auth_checks(self.URL, wait_until="commit")
+
+        mock_page.goto.assert_awaited_once_with(
+            self.URL, wait_until="commit", timeout=30000
+        )
+        mock_page.wait_for_load_state.assert_not_awaited()
+
+    async def test_a_lagging_load_state_warns_and_proceeds(self, mock_page, caplog):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+        self._committed_but_never_loaded(mock_page)
+
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.navigation.stabilize_navigation",
+                new_callable=AsyncMock,
+            ) as stabilize,
+            patch(
+                "linkedin_mcp_server.scraping.navigation.humanize_after_nav",
+                new_callable=AsyncMock,
+            ) as humanize,
+            patch.object(
+                navigator, "_log_navigation_failure", new_callable=AsyncMock
+            ) as log_failure,
+            patch.object(
+                navigator, "_raise_if_auth_barrier", new_callable=AsyncMock
+            ) as raise_if_barrier,
+            self._no_barrier() as barrier,
+            caplog.at_level(logging.WARNING),
+        ):
+            await navigator._goto_with_auth_checks(self.URL)
+
+        assert any(
+            r.levelno == logging.WARNING
+            and "lagged behind a committed navigation" in r.getMessage()
+            for r in caplog.records
+        )
+        stabilize.assert_awaited_once()
+        humanize.assert_awaited_once_with(mock_page)
+        barrier.assert_awaited_once()
+        log_failure.assert_not_awaited()
+        raise_if_barrier.assert_not_awaited()
+
+    async def test_a_lagging_load_state_keeps_the_response_for_the_429_check(
+        self, mock_page
+    ):
+        """The one wait discarded the response on timeout; the split keeps it."""
+        response = MagicMock()
+        response.status = 429
+        response.headers = {"retry-after": "7"}
+        self._committed_but_never_loaded(mock_page, response)
+        navigator = PageNavigator(ScrapingSession(mock_page))
+
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+            pytest.raises(RateLimitError) as raised,
+        ):
+            await navigator._goto_with_auth_checks(self.URL)
+
+        assert raised.value.suggested_wait_time == 7
+        assert navigator._session.rate_limit.rate_limit_hits == 1
+
+    async def test_a_navigation_that_never_commits_still_fails(self, mock_page):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+        mock_page.goto = AsyncMock(
+            side_effect=PlaywrightTimeoutError("Timeout 30000ms")
+        )
+        prompt, barrier = _no_prompt_no_barrier()
+
+        with (
+            prompt,
+            barrier,
+            patch.object(
+                navigator, "_log_navigation_failure", new_callable=AsyncMock
+            ) as log_failure,
+            patch(
+                "linkedin_mcp_server.scraping.navigation.humanize_after_nav",
+                new_callable=AsyncMock,
+            ) as humanize,
+            pytest.raises(PlaywrightTimeoutError, match="Timeout 30000ms"),
+        ):
+            await navigator._goto_with_auth_checks(self.URL)
+
+        log_failure.assert_awaited_once()
+        humanize.assert_not_awaited()
+        mock_page.wait_for_load_state.assert_not_awaited()
+
+    async def test_a_load_state_failure_that_is_not_a_timeout_still_fails(
+        self, mock_page
+    ):
+        """Only the lag is forgiven: a closed page is a navigation failure."""
+        navigator = PageNavigator(ScrapingSession(mock_page))
+        mock_page.wait_for_load_state = AsyncMock(
+            side_effect=PatchrightError(
+                "Target page, context or browser has been closed"
+            )
+        )
+        prompt, barrier = _no_prompt_no_barrier()
+
+        with (
+            prompt,
+            barrier,
+            patch.object(
+                navigator, "_log_navigation_failure", new_callable=AsyncMock
+            ) as log_failure,
+            pytest.raises(PatchrightError, match="has been closed"),
+        ):
+            await navigator._goto_with_auth_checks(self.URL)
+
+        log_failure.assert_awaited_once()
+
+    @pytest.mark.parametrize("lagged", [True, False], ids=["lagged", "on-time"])
+    async def test_the_after_goto_trace_says_whether_the_load_state_lagged(
+        self, mock_page, lagged
+    ):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+        if lagged:
+            self._committed_but_never_loaded(mock_page)
+
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.navigation.record_page_trace",
+                new_callable=AsyncMock,
+            ) as mock_trace,
+            self._no_barrier(),
+        ):
+            await navigator._goto_with_auth_checks(self.URL)
+
+        after_goto = next(
+            call
+            for call in mock_trace.await_args_list
+            if call.args[1] == "extractor-after-goto"
+        )
+        assert after_goto.kwargs["extra"]["load_state_lagged"] is lagged
 
 
 class TestNavigationListenerIdentity:

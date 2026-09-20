@@ -45,7 +45,7 @@
       "requested_url": "https://www.linkedin.com/messaging/?searchTerm=engine",
       "section": "conversation",
       "timeout_ms": 30000,
-      "wait_until": "domcontentloaded"
+      "wait_until": "commit"
     },
     {
       "call": "search_conversations",
@@ -53,6 +53,13 @@
       "event": "response",
       "kind": "listener.emit",
       "section": "conversation"
+    },
+    {
+      "call": "search_conversations",
+      "kind": "wait_for_load_state",
+      "section": "conversation",
+      "state": "domcontentloaded",
+      "timeout_ms": 30000
     },
     {
       "call": "search_conversations",
@@ -64,6 +71,7 @@
     {
       "call": "search_conversations",
       "extra": {
+        "load_state_lagged": false,
         "target_url": "https://www.linkedin.com/messaging/?searchTerm=engine",
         "wait_until": "domcontentloaded"
       },

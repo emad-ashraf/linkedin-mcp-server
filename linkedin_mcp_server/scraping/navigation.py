@@ -9,6 +9,8 @@ from typing import Any, Literal
 import logging
 import re
 
+from patchright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from linkedin_mcp_server.core.auth import (
     detect_auth_barrier,
     detect_auth_barrier_quick,
@@ -73,6 +75,18 @@ class PageNavigator:
     # renders after it commits, and an account picker was measured 200ms behind
     # its own navigation, so a page judged on arrival is judged empty.
     _DOCUMENT_READY_TIMEOUT = 5.0
+
+    # How long a committed navigation gets to reach the requested load state
+    # before the navigator proceeds without it. This wait can only add
+    # latency, never fail. It stays at the old ``goto`` budget on purpose:
+    # ``person.py`` gives ``main`` only 5s after this returns, and a slow
+    # proxy that needs 20s to reach ``domcontentloaded`` used to have the
+    # full 30s in front of that wait. A shorter budget here would move that
+    # wait earlier and turn a slow-but-honest page into a failure. The lag
+    # this guards against (#42) ran past 30s on pages whose DOM was already
+    # usable, and those failed outright before, so paying the budget and then
+    # succeeding is the improvement, not the cost.
+    _LOAD_STATE_TIMEOUT = 30.0
 
     def __init__(self, session: ScrapingSession):
         self._session = session
@@ -265,7 +279,33 @@ class PageNavigator:
                 extra={"target_url": url, "wait_until": wait_until},
             )
             try:
-                response = await page.goto(url, wait_until=wait_until, timeout=30000)
+                # Two waits, not one. ``goto`` returns once the navigation has
+                # committed, which is the part that can genuinely fail (DNS,
+                # refused, proxy, an auth redirect that never lands). The load
+                # state is then waited for separately and only ever warns:
+                # LinkedIn's SDUI pages keep a request open long after the DOM
+                # has rendered, and ``domcontentloaded`` lagging past the budget
+                # on a page whose invite dialog was already on screen was
+                # reported as a hard failure three times in one session (#42).
+                # Whether the page is *usable* is the caller's question, and
+                # every caller already waits for the element it needs. Splitting
+                # the wait also keeps ``response`` for the 429 check below,
+                # which a timeout used to discard.
+                response = await page.goto(url, wait_until="commit", timeout=30000)
+                load_state_lagged = False
+                if wait_until != "commit":
+                    try:
+                        await page.wait_for_load_state(
+                            wait_until, timeout=int(self._LOAD_STATE_TIMEOUT * 1000)
+                        )
+                    except PlaywrightTimeoutError:
+                        load_state_lagged = True
+                        logger.warning(
+                            "Load state %r lagged behind a committed navigation "
+                            "to %s; proceeding on the committed page",
+                            wait_until,
+                            redact_private_navigation_value(url),
+                        )
                 await stabilize_navigation(
                     f"goto {redact_private_navigation_value(url)}", logger
                 )
@@ -275,7 +315,11 @@ class PageNavigator:
                 await record_page_trace(
                     page,
                     "extractor-after-goto",
-                    extra={"target_url": url, "wait_until": wait_until},
+                    extra={
+                        "target_url": url,
+                        "wait_until": wait_until,
+                        "load_state_lagged": load_state_lagged,
+                    },
                 )
             except Exception as exc:
                 # Ahead of the traces below: they record the raw exception text,
