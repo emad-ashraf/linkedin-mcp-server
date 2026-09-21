@@ -24,9 +24,9 @@ the child reports `prepared`; no globally discoverable state exists before that
 proof. Publication belongs to the lock holder, so a stale Windows frontend can
 never outlive its child and overwrite the next winner.
 
-The child opens its own log and competes for the lock on every platform. Keeping
-those potentially blocking state-storage operations behind the process boundary
-lets the frontend enforce its deadline by killing this process. A timed-out
+The child competes for the lock before opening its own log on every platform.
+Keeping those potentially blocking state-storage operations behind the process
+boundary lets the frontend enforce its deadline by killing this process. A timed-out
 thread could later acquire the lock or publish over an in-process fallback; a
 process with a pending hard kill cannot return to user space and do either.
 """
@@ -67,7 +67,7 @@ from linkedin_mcp_server.bootstrap import (
 from linkedin_mcp_server.common_utils import is_still_at
 from linkedin_mcp_server.config import set_config
 from linkedin_mcp_server.config.schema import AppConfig
-from linkedin_mcp_server.daemon_lock import DaemonLock, DaemonLockError
+from linkedin_mcp_server.daemon_lock import DaemonLock
 from linkedin_mcp_server.daemon_liveness import (
     CALL_HEADER,
     HEARTBEAT_PATH,
@@ -108,13 +108,17 @@ ABORTED = "aborted"
 RETRY = "retry"
 UNCERTAIN = "uncertain"
 
-#: Fixed bootstrap records carried on standard error before the daemon log is
-#: available. They contain no configuration values or exception text.
+#: Bounded bootstrap records carried on the original standard error. Stage
+#: records contain no values; the post-attach hint carries only its nonce and log path.
 BOOTSTRAP_PREFIX = "daemon-bootstrap:"
 BOOTSTRAP_CONFIGURATION = "configuration"
 BOOTSTRAP_STATE = "state"
+BOOTSTRAP_LOCK = "lock"
 BOOTSTRAP_LOG = "log"
 BOOTSTRAP_ATTACHED = "attached"
+BOOTSTRAP_LOG_HINT_PREFIX = "daemon-bootstrap-log:"
+BOOTSTRAP_LOG_HINT_VERSION = "1"
+BOOTSTRAP_LOG_HINT_MAX_PATH_BYTES = 2048
 
 #: Where the owner serves MCP. Fixed rather than configurable: the frontend
 #: reads it out of the descriptor, and the only thing a second value would do is
@@ -1244,19 +1248,40 @@ def _forget_superseded_tokens(auth_root: Path) -> None:
 
 
 class _BootstrapDiagnostics:
-    """One fixed diagnostic record before the daemon log can be used."""
+    """Bounded startup diagnostics kept separate from the daemon log."""
 
     def __init__(self, stream: TextIO | None) -> None:
         self._stream = stream
 
     def report(self, code: str) -> None:
+        self._write((f"{BOOTSTRAP_PREFIX} {code}\n",))
+
+    def attached(self, log_path: Path, handshake_nonce: str) -> None:
+        """Preserve the legacy record, then optionally identify the opened log."""
+        records = [f"{BOOTSTRAP_PREFIX} {BOOTSTRAP_ATTACHED}\n"]
+        candidate = str(log_path)
+        encoded = candidate.encode("utf-8", "surrogatepass")
+        if (
+            log_path.is_absolute()
+            and log_path.name == _LOG_FILE
+            and len(encoded) <= BOOTSTRAP_LOG_HINT_MAX_PATH_BYTES
+            and all(character.isprintable() for character in candidate)
+        ):
+            records.append(
+                f"{BOOTSTRAP_LOG_HINT_PREFIX} {BOOTSTRAP_LOG_HINT_VERSION} "
+                f"{handshake_nonce} {candidate}\n"
+            )
+        self._write(records)
+
+    def _write(self, records: tuple[str, ...] | list[str]) -> None:
         stream, self._stream = self._stream, None
         if stream is None:
             return
         try:
-            stream.write(f"{BOOTSTRAP_PREFIX} {code}\n")
-            stream.flush()
-        except (OSError, ValueError):
+            for record in records:
+                stream.write(record)
+                stream.flush()
+        except (OSError, UnicodeError, ValueError):
             pass
         finally:
             with contextlib.suppress(OSError, ValueError):
@@ -1511,50 +1536,54 @@ def main(argv: list[str] | None = None) -> int:
             handshake.close()
             return 1
 
-    try:
-        log_path = _attach_daemon_log(auth_root)
-    except BaseException:
-        abandon_pending_inherited_lock()
-        bootstrap.report(BOOTSTRAP_LOG)
-        handshake.abort()
-        handshake.close()
-        _close_owned_control(control)
-        return 1
-    bootstrap.report(BOOTSTRAP_ATTACHED)
-
     lock: DaemonLock | None = None
     try:
-        configure_logging(log_level=config.server.log_level, json_format=True)
-        lock = _take_lock(auth_root, args.lock_fd)
+        try:
+            lock = _take_lock(auth_root, args.lock_fd)
+        except Exception:
+            bootstrap.report(BOOTSTRAP_LOCK)
+            handshake.abort()
+            return 1
+        # Once adoption succeeds this process owns the inherited descriptor. It
+        # must never pass through the pending-handoff cleanup again.
         args.lock_fd = None
         if lock is None:
-            logger.info("Another process won the daemon election")
             handshake.retry()
             return 0
-        return asyncio.run(
-            _serve(
-                lock=lock,
-                auth_root=auth_root,
-                profile=profile,
-                config=config,
-                log_path=log_path,
-                handshake=handshake,
-                handshake_nonce=handover.handshake_nonce,
-                startup_protocol=handover.startup_protocol,
-                control=control,
-                job_name=args.job_name,
+
+        try:
+            log_path = _attach_daemon_log(auth_root)
+        except BaseException:
+            bootstrap.report(BOOTSTRAP_LOG)
+            handshake.abort()
+            return 1
+        bootstrap.attached(log_path, handover.handshake_nonce)
+
+        try:
+            configure_logging(log_level=config.server.log_level, json_format=True)
+        except BaseException:
+            handshake.fail()
+            return 1
+
+        try:
+            return asyncio.run(
+                _serve(
+                    lock=lock,
+                    auth_root=auth_root,
+                    profile=profile,
+                    config=config,
+                    log_path=log_path,
+                    handshake=handshake,
+                    handshake_nonce=handover.handshake_nonce,
+                    startup_protocol=handover.startup_protocol,
+                    control=control,
+                    job_name=args.job_name,
+                )
             )
-        )
-    except DaemonLockError:
-        abandon_pending_inherited_lock()
-        logger.exception("The daemon could not take ownership")
-        handshake.abort()
-        return 1
-    except Exception:
-        abandon_pending_inherited_lock()
-        logger.exception("The daemon stopped with an error")
-        handshake.fail()
-        return 1
+        except Exception:
+            logger.exception("The daemon stopped with an error")
+            handshake.fail()
+            return 1
     finally:
         # After the verdict either way, so a frontend blocked on the pipe is
         # released even by a path that forgot to answer.

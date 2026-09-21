@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import datetime
 import logging
 from collections.abc import Awaitable
 from dataclasses import dataclass
@@ -45,8 +46,13 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 import mcp.types as mt
+from fastmcp.client.progress import ProgressHandler
+from fastmcp.client.telemetry import client_span
 from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
+from fastmcp.telemetry import inject_trace_context
 from fastmcp.tools import ToolResult
+from fastmcp.utilities.timeout import normalize_timeout_to_timedelta
+from opentelemetry.trace import Status, StatusCode
 
 from linkedin_mcp_server import daemon_owner
 from linkedin_mcp_server.daemon_auth import a_repeat_could_change_something
@@ -317,6 +323,10 @@ def _tells_which_owner_failed() -> type:
         * ``call_tool_mcp`` — only a failure to establish the connection proves
           it. A read timeout or a protocol error may mean the owner is scraping
           right now.
+
+        ``__aexit__`` is a boundary of the opposite kind and tags nothing: it
+        runs once the operation has an answer, so the only thing a failure there
+        can do is take that answer's place. See its own docstring.
         """
 
         def __init__(self, *args: Any, instance_id: str, **kwargs: Any) -> None:
@@ -355,6 +365,73 @@ def _tells_which_owner_failed() -> type:
                 super().__aenter__(), nothing_was_sent=True
             )
 
+        async def __aexit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_val: BaseException | None,
+            exc_tb: Any,
+        ) -> bool | None:
+            """Close the session, and let nothing here decide the outcome.
+
+            The one boundary that runs *after* an answer exists, and the reason
+            it needs guarding at all is that the answer is already on its way
+            out. ``ProxyTool.run`` makes its call inside ``async with client``
+            and all four provider listings do the same (``proxy.py``, ``run``
+            and ``_list_tools`` with its siblings), while ``Client._disconnect``
+            awaits the session task under
+            ``suppress(asyncio.CancelledError)`` (``client.py``). Only
+            cancellation is suppressed, so an ordinary exception from that task
+            leaves this context manager and replaces whatever the operation had
+            decided.
+
+            Both directions are damage, measured through the real stack. With a
+            tagged ``OwnerUnreachableError`` in flight, the replacement reaches
+            the middleware carrying the tag in ``__context__`` only, which
+            ``unreachable_owner_in`` does not walk and must not start walking:
+            Python sets ``__context__`` on *any* exception raised while another
+            is being handled, and this middleware raises its repeat inside the
+            ``except`` that holds the first failure, so every unrelated failure
+            of a repeat would resolve to the owner loss before it — absorbed by
+            today's branches, which read that first failure's own
+            ``nothing_was_sent``, and one edit away from not being. The
+            middleware therefore re-raises at its ``failure is None`` branch and
+            masking flattens that to ``Error calling tool
+            'send_connection_request'`` — nothing about a call that may have
+            acted. With nothing in flight it is the *result* that is replaced,
+            and the owner had already run the tool: the same generic failure for
+            a call that did send the connection request, and this half carries no
+            tag anywhere, so no detector could have found it.
+
+            Swallowing adds no leak of its own here, which is a narrower claim
+            than a promise about every way cleanup can fail. A client here is
+            built for one operation and dropped (``open_client``), and
+            ``_disconnect`` drops the session task in its own ``finally`` —
+            cancelling it first if it is still running — before this is reached,
+            so what arrives is the report of a failure and not a resource still
+            held; what a future ``_disconnect`` might leave behind when *it*
+            fails is its own to answer for. The operation succeeded or it
+            failed, and a departure this one misses is found by the next
+            operation, which opens a client of its own.
+            Cancellation is not caught, because ``CancelledError`` is a
+            ``BaseException`` and a caller giving up is not the session's own
+            failure.
+
+            One falsy return says both things. Python consults it only while an
+            exception is in flight, where falsy means "do not suppress" and the
+            tagged failure goes on propagating; with nothing in flight it is
+            ignored and the result stands.
+            """
+            try:
+                return await super().__aexit__(exc_type, exc_val, exc_tb)
+            except Exception as closing:
+                logger.debug(
+                    "The shared browser owner's session failed while closing, "
+                    "after the operation had already %s",
+                    "failed" if exc_val is not None else "answered",
+                    exc_info=closing,
+                )
+                return False
+
         async def list_tools_mcp(self, *args: Any, **kwargs: Any) -> Any:
             return await self._saying_which_owner(
                 super().list_tools_mcp(*args, **kwargs), nothing_was_sent=True
@@ -376,10 +453,70 @@ def _tells_which_owner_failed() -> type:
                 super().list_prompts_mcp(*args, **kwargs), nothing_was_sent=True
             )
 
-        async def call_tool_mcp(self, *args: Any, **kwargs: Any) -> Any:
-            return await self._saying_which_owner(
-                super().call_tool_mcp(*args, **kwargs), nothing_was_sent=None
-            )
+        async def call_tool_mcp(
+            self,
+            name: str,
+            arguments: dict[str, Any],
+            progress_handler: ProgressHandler | None = None,
+            timeout: datetime.timedelta | float | int | None = None,
+            meta: dict[str, Any] | None = None,
+        ) -> mt.CallToolResult:
+            """Call the owner without discovering its schema after it answers.
+
+            ``ClientSession.call_tool`` validates a successful result by listing
+            tools when this fresh session has no cached output schema. A failure in
+            that second request replaces an answer to a call that may already have
+            changed LinkedIn, and its ``ConnectError`` then looks safe to repeat.
+            The owner already validates declared output schemas before answering;
+            this boundary only needs the protocol result it received.
+            """
+
+            async def send_request() -> mt.CallToolResult:
+                with client_span(
+                    f"tools/call {name}",
+                    "tools/call",
+                    name,
+                    session_id=self.transport.get_session_id(),
+                    tool_name=name,
+                ) as span:
+                    logger.debug("[%s] called call_tool: %s", self.name, name)
+                    propagated_meta = inject_trace_context(meta)
+                    request_meta = (
+                        mt.RequestParams.Meta(**propagated_meta)
+                        if propagated_meta
+                        else None
+                    )
+                    result = await self._await_with_session_monitoring(
+                        self.session.send_request(
+                            mt.ClientRequest(
+                                mt.CallToolRequest(
+                                    params=mt.CallToolRequestParams(
+                                        name=name,
+                                        arguments=arguments,
+                                        _meta=request_meta,
+                                    )
+                                )
+                            ),
+                            mt.CallToolResult,
+                            request_read_timeout_seconds=(
+                                normalize_timeout_to_timedelta(timeout)
+                            ),
+                            progress_callback=(
+                                progress_handler or self._progress_handler
+                            ),
+                        )
+                    )
+                    if result.isError and span.is_recording():
+                        span.set_attribute("error.type", "tool_error")
+                        description = ""
+                        if result.content and isinstance(
+                            result.content[0], mt.TextContent
+                        ):
+                            description = result.content[0].text
+                        span.set_status(Status(StatusCode.ERROR, description))
+                    return result
+
+            return await self._saying_which_owner(send_request(), nothing_was_sent=None)
 
     return TellsWhichOwnerFailed
 
@@ -587,6 +724,38 @@ def create_proxy_provider(
     )
 
 
+# What a client is told when the owner vanished with a mutating call in flight.
+# A value of its own rather than messaging's `send_unconfirmed`, which already
+# says a submission was attempted: here even that is unknown, and the same answer
+# has to fit a connection request as well as a message.
+UNKNOWN_OUTCOME_STATUS = "outcome_unknown"
+
+
+def _unknown_outcome(*, tool: str, reason: str) -> dict[str, Any]:
+    """The structured half of an owner-loss failure, in terms a client knows.
+
+    The field names are `scraping.contracts.message_action_result`'s, so a client
+    that already reads `status` and `retry_safe` on a send needs nothing new for
+    this one. Built here rather than imported from there because no daemon module
+    reaches into `scraping/`: this is not a scraping outcome but the transport
+    saying it knows nothing, and it answers for every mutating tool.
+
+    `url`, `sent` and `recipient_selected` are left out rather than set to null.
+    `sent` is the one thing nobody here knows, and a null reads as a "no" to any
+    client that tests the value rather than the key's presence.
+    """
+    return {
+        "status": UNKNOWN_OUTCOME_STATUS,
+        "message": (
+            f"{tool} was in flight when the shared browser process went away "
+            f"({reason}). Whether the action reached LinkedIn is unknown. Check "
+            "LinkedIn before calling again, because a repeat may perform the "
+            "action a second time."
+        ),
+        "retry_safe": False,
+    }
+
+
 class FrontendOwnerRecoveryMiddleware(Middleware):
     """Find a replacement owner when this one is gone, and repeat what is safe.
 
@@ -654,6 +823,55 @@ class FrontendOwnerRecoveryMiddleware(Middleware):
     ) -> Any:
         return await self._repeat_the_listing(context, call_next)
 
+    def _report_an_unknown_outcome(
+        self,
+        context: MiddlewareContext[mt.CallToolRequestParams],
+        failure: OwnerUnreachableError,
+    ) -> ToolResult:
+        """Say that nobody here knows whether the call acted.
+
+        The one case where the honest answer is to report the failure. Nothing in
+        the protocol says whether the departed owner had already sent the
+        connection request or the message, and asking costs one retry while
+        guessing wrong sends it twice. The user knows which happened; this
+        process does not.
+
+        A result rather than a raise, and what decides that is the payload rather
+        than the masking. Two raises have to be told apart, both measured against
+        fastmcp 3.4.7 with the masking this server switches on (``server.py``,
+        ``mask_error_details=True``). Re-raising the failure that arrived says
+        nothing: ``OwnerUnreachableError`` is a plain ``Exception``, so the call
+        below has already replaced it with ``ToolError("Error calling tool
+        'send_message'")`` (``fastmcp/server/server.py:1342-1358``), and that is
+        the whole of what the client gets on the one call that most needs to
+        hear a retry can deliver the message twice. A ``ToolError`` raised
+        *here* keeps its own text: the masking sits below this middleware, and
+        even there a ``FastMCPError`` — which ``ToolError`` is — is re-raised
+        untouched (``:1327-1331``). What neither raise carries is ``status`` and
+        ``retry_safe``, the two fields a client can act on without reading
+        prose, and they are why this answer is a result.
+
+        ``is_error`` stays true so a client that reads no structured content
+        still sees a failure rather than a success carrying no data, the way
+        ``daemon_auth`` answers a sign-in.
+
+        Keeping it true is also what lets this payload ignore the tool's declared
+        output schema: an error result travels as a whole ``CallToolResult``,
+        which ``mcp.server.lowlevel.server`` returns unchanged instead of
+        validating it. A success-shaped dict would be checked against the schema
+        of whichever tool was called, and this one is a stand-in for all of them.
+        """
+        logger.info(
+            "Owner lost mid-call; reporting an unknown outcome rather "
+            "than repeating a call that could change something"
+        )
+        answer = _unknown_outcome(tool=context.message.name, reason=str(failure))
+        return ToolResult(
+            content=[mt.TextContent(type="text", text=answer["message"])],
+            structured_content=answer,
+            is_error=True,
+        )
+
     async def on_call_tool(
         self,
         context: MiddlewareContext[mt.CallToolRequestParams],
@@ -668,25 +886,86 @@ class FrontendOwnerRecoveryMiddleware(Middleware):
 
             # Before deciding whether to repeat anything: a replacement is worth
             # having for the *next* call even when this one cannot be repeated.
-            if await self._backend.recover(failure.instance_id) is None:
-                raise
+            replacement = await self._backend.recover(failure.instance_id)
 
-            if not failure.nothing_was_sent and await a_repeat_could_change_something(
-                context
-            ):
-                # The one case where the honest answer is to report the failure.
-                # Nothing in the protocol says whether the departed owner had
-                # already sent the connection request or the message, and asking
-                # costs one retry while guessing wrong sends it twice. The user
-                # knows which happened; this process does not.
-                logger.info(
-                    "Attached to a replacement owner; not repeating a call that "
-                    "could change something"
-                )
+            # Asked before the replacement is looked at, because the answer does
+            # not depend on it: whether the departed owner already acted is
+            # unknown either way, and an election that found nobody makes it no
+            # more knowable. The cost of the new order is that
+            # `a_repeat_could_change_something` now also runs when the election
+            # failed; it catches its own exceptions and answers `True`, so a
+            # lookup against a dead backend lands on the cautious side.
+            #
+            # Not bounded by the owner's tool timeout, which bounds the forwarded
+            # call that has already failed and never enclosed this middleware.
+            # Several separate budgets do bound it: the lookup goes through
+            # `fastmcp.get_tool`, and with the component cache off
+            # (`_NO_COMPONENT_CACHE`) that is a fresh forwarded listing carrying
+            # the client's own deadline (`create_proxy_provider`, `tool_timeout +
+            # _TIMEOUT_MARGIN_SECONDS`), after a `recover` above that may already
+            # have spent `daemon_election.DEFAULT_ELECTION_SECONDS`. And a
+            # cancellation is not one of the exceptions that lands on the
+            # cautious side: `CancelledError` is a `BaseException`, so it passes
+            # that `except Exception` and leaves through here, which is what
+            # should happen to it.
+            #
+            # Kept rather than dropped, because the second `except` below needs
+            # the same answer and by then there is nobody left to give it. It
+            # stays `None` when the short-circuit means the question was never
+            # put, which is the one case with nothing to remember.
+            could_change_something: bool | None = None
+            if not failure.nothing_was_sent:
+                could_change_something = await a_repeat_could_change_something(context)
+                if could_change_something:
+                    return self._report_an_unknown_outcome(context, failure)
+
+            if replacement is None:
                 raise
 
             logger.info("Attached to a replacement owner; running the call again")
-            return await call_next(context)
+            try:
+                return await call_next(context)
+            except Exception as again:
+                # The replacement can go away exactly like the first owner, and
+                # by then the repeat may have acted: it was made only because
+                # nothing left this process the first time, which says nothing
+                # about the second. Left to escape, it reaches the client as
+                # `Error calling tool 'send_message'` and nothing else, which is
+                # the #891 damage one round later — a client told nothing repeats
+                # a message that may already be delivered.
+                #
+                # Classified again rather than attempted again. Exactly two
+                # attempts: no recursion here and no second `recover`, because a
+                # third attempt would be a guess about an owner that has now
+                # failed twice, and the question it raises — whether the second
+                # attempt acted — is the one nothing here can answer.
+                repeat = unreachable_owner_in(again)
+                if repeat is not None and not repeat.nothing_was_sent:
+                    # The answer the first attempt already has, rather than the
+                    # same question put to an owner that has just died. Both
+                    # readings are about one tool and the tool did not change;
+                    # what changed is who is left to answer. The lookup goes
+                    # through `fastmcp.get_tool`, which with the component cache
+                    # off is a forwarded listing against exactly that departed
+                    # owner, so it raises and `a_repeat_could_change_something`
+                    # answers `True` on the cautious side. Caution about a
+                    # question already answered is not caution: it turns a read
+                    # repeated *because* the first lookup called it read-only
+                    # into an `outcome_unknown` carrying `retry_safe: False`,
+                    # which sends the user to look on LinkedIn for an effect a
+                    # read cannot have had.
+                    if could_change_something is None:
+                        # Nothing was remembered, because the first pass
+                        # short-circuited on `nothing_was_sent` and never asked.
+                        # Here the lookup is the only source there is, and its
+                        # failing open is still the right side to fail on: an
+                        # unreadable annotation is not a promise of safety.
+                        could_change_something = await a_repeat_could_change_something(
+                            context
+                        )
+                    if could_change_something:
+                        return self._report_an_unknown_outcome(context, repeat)
+                raise
 
 
 class FrontendCallHeartbeatMiddleware(Middleware):

@@ -774,6 +774,9 @@ class TestOwnerFinalization:
             def report(self, code: str) -> None:
                 pass
 
+            def attached(self, _log_path: Path, _nonce: str) -> None:
+                pass
+
             def close(self) -> None:
                 pass
 
