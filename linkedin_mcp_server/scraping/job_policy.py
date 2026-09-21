@@ -50,6 +50,23 @@ def reconcile_search_references(
     return out
 
 
+def label_similar_jobs(references: list[Reference], job_id: str) -> list[Reference]:
+    """Mark every job a posting links to, other than itself, as a similar job.
+
+    Compared by id rather than by where the link sits, so the posting's own
+    apply link keeps the section's context and the "More jobs" cards do not
+    read as the posting.
+    """
+    own_url = f"/jobs/view/{job_id}/"
+    out: list[Reference] = []
+    for ref in references:
+        if ref["kind"] == "job" and ref["url"] != own_url:
+            ref = Reference(**ref)
+            ref["context"] = "similar job"
+        out.append(ref)
+    return out
+
+
 def lost_keywords_section_error(asked: str, landed: str) -> dict[str, str]:
     """The ``section_errors`` entry for a search that is not the one asked for.
 
@@ -65,6 +82,23 @@ def lost_keywords_section_error(asked: str, landed: str) -> dict[str, str]:
         "error_message": (
             f"LinkedIn answered a search for {landed!r} where {asked!r} was "
             "asked for, so the results are about something else."
+        ),
+    }
+
+
+def no_matching_jobs_section_error(keywords: str) -> dict[str, str]:
+    """The ``section_errors`` entry for a search LinkedIn found nothing for.
+
+    LinkedIn answers it with unrelated postings on the same route and query,
+    and those came back as `job_ids`. They are dropped, and the empty list is
+    explained, because an empty list alone also describes a page that did not
+    render.
+    """
+    return {
+        "error_type": "no_matching_jobs",
+        "error_message": (
+            f"LinkedIn found no jobs matching {keywords!r} and showed unrelated "
+            "recommendations instead, so none are returned."
         ),
     }
 

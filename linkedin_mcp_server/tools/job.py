@@ -45,7 +45,9 @@ def register_job_tools(
 
         Returns:
             Dict with url, sections (name -> raw text), and optional references.
-            The LLM should parse the raw text to extract job details.
+            The LLM should parse the raw text to extract job details. Jobs in
+            the posting's "More jobs" list are references with context
+            "similar job"; their ids work with get_job_details.
         """
         try:
             extractor = extractor or await get_ready_extractor(
@@ -111,6 +113,9 @@ def register_job_tools(
         Returns:
             Dict with url, sections (name -> raw text), job_ids (list of
             numeric job ID strings usable with get_job_details), and optional references.
+            A search with no matches returns empty job_ids and a
+            section_errors entry of type no_matching_jobs, rather than the
+            unrelated recommendations LinkedIn shows in its place.
         """
         try:
             # Before the browser, because FastMCP is already timing this call
