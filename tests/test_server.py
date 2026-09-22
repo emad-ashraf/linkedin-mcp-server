@@ -275,7 +275,9 @@ class TestTheRoleAsProcessState:
 
         assert process_role() is ServerRole.OWNER
 
-    def test_the_owner_entry_point_says_so_before_it_can_fail(self, monkeypatch):
+    def test_the_owner_entry_point_says_so_before_it_can_fail(
+        self, monkeypatch, tmp_path
+    ):
         """`main` claims OWNER before anything downstream could need to know.
 
         `create_owner_server` claims it too, but that runs several steps into
@@ -283,12 +285,19 @@ class TestTheRoleAsProcessState:
         still believed it had a terminal.
 
         Driven rather than read: an earlier version of this asserted on the source
-        text of `main`, which stayed green when the call was made unreachable. The
-        child opens its log before taking the lock, so that boundary records the
-        role before its expected startup failure is translated into a verdict.
+        text of `main`, which stayed green when the call was made unreachable.
+        `_attach_daemon_log` is the first boundary past the lock, so that is where
+        the role is read before the expected startup failure becomes a verdict.
+
+        The handover config is built against ``tmp_path`` rather than left at
+        ``AppConfig()``'s default: that default is the real profile, whose
+        ``daemon.lock`` a running owner holds, and ``main`` then answers the
+        retry branch with 0 without ever reaching the checkpoint. The autouse
+        ``isolate_profile_dir`` cannot help here, because the default is a
+        module-level constant rather than a read of ``USER_DATA_DIR``.
         """
         from linkedin_mcp_server import daemon_config, daemon_owner
-        from linkedin_mcp_server.config.schema import AppConfig
+        from linkedin_mcp_server.config.schema import AppConfig, BrowserConfig
 
         class Checkpoint(BaseException):
             pass
@@ -299,10 +308,13 @@ class TestTheRoleAsProcessState:
             seen.append(process_role())
             raise Checkpoint
 
+        config = AppConfig(
+            browser=BrowserConfig(user_data_dir=str(tmp_path / "profile"))
+        )
         monkeypatch.setattr(
             daemon_owner,
             "_read_handover",
-            lambda: daemon_config.OwnerHandover(AppConfig(), "0123456789abcdef" * 4),
+            lambda: daemon_config.OwnerHandover(config, "0123456789abcdef" * 4),
         )
         monkeypatch.setattr(daemon_owner, "set_headless", lambda _headless: None)
         monkeypatch.setattr(daemon_owner, "_attach_daemon_log", at_checkpoint)
