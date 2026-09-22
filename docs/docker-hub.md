@@ -130,7 +130,7 @@ Use `$env:USERPROFILE\.linkedin-mcp` when constructing the host path outside JSO
 | `TOOL_TIMEOUT` | `180` | Timeout for a whole tool call, in seconds. Raise it for heavy scrapes, slow networks, or a cold-start browser. |
 | `LOGIN_TIMEOUT` | `1800` | How long the login browser waits for you to finish signing in, in seconds (`0` = no limit). The Docker viewer ends the login after 30 minutes either way. |
 | `LOGIN_INLINE_WAIT` | `25` | How long a tool call waits for a login to finish, in seconds (max 45). Not used in Docker, where `--login --login-viewer` is the login path. |
-| `BROWSER_WAIT` | `25` | How long to wait for another server process to hand over the shared browser, in seconds (max 45; `0` = report busy at once). |
+| `BROWSER_WAIT` | `25` | How long to wait for another server process on the same version to hand over the shared browser, in seconds (max 45; `0` = report busy at once). A holder on another version is refused at once. |
 | `BROWSER_MIN_HOLD` | `20` | Shortest time a process keeps the shared browser before handing it over, in seconds. Clamped to 3 seconds below `BROWSER_WAIT`, so raise that one along with it. Higher means fewer browser restarts but longer waits for other clients. |
 | `BROWSER_IDLE_TIMEOUT` | `600` | Close an idle browser and release the profile after this many seconds without a tool call (`0` = keep it open). |
 | `TOOL_CALL_GAP_SECONDS` | `5.0` | Minimum gap between two tool calls, in seconds, jittered by ±20% (`0` = no spacing). LinkedIn answers bursts of navigations with HTTP 429; this caps one client at roughly 12 page loads a minute. Tools answered from local disk never wait. |

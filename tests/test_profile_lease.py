@@ -17,15 +17,19 @@ import subprocess
 import sys
 import textwrap
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
+from linkedin_mcp_server import __version__
+from linkedin_mcp_server.exceptions import BrowserBusyError
 from linkedin_mcp_server.profile_lease import (
     ProfileLease,
     ProfileLeaseUnavailableError,
     get_profile_lease,
 )
+from linkedin_mcp_server.server_role import ServerRole, set_process_role
 
 _WORKER = Path(__file__).parent / "helpers" / "profile_lease_worker.py"
 
@@ -408,6 +412,110 @@ class TestAsyncAcquire:
             assert not lease.handoff_requested()
         finally:
             holder.kill()
+
+
+class TestHolderRecord:
+    def test_the_record_names_this_process(self, tmp_path: Path) -> None:
+        lease = ProfileLease(tmp_path)
+        before = datetime.now(timezone.utc)
+        assert lease.try_acquire()
+        try:
+            holder = lease.holder()
+            assert holder is not None
+            assert holder.pid == os.getpid()
+            assert holder.version == __version__
+            assert holder.role == "direct"
+            started = datetime.fromisoformat(holder.started_at)
+            assert started.tzinfo is not None
+            assert abs((started - before).total_seconds()) < 2
+        finally:
+            lease.release()
+
+    def test_no_record_reads_as_unknown(self, tmp_path: Path) -> None:
+        assert ProfileLease(tmp_path).holder() is None
+        (tmp_path / "profile.holder").write_text("{not json", encoding="utf-8")
+        assert ProfileLease(tmp_path).holder() is None
+
+
+class TestRefusingAForeignHolder:
+    """A holder on another package version is never waited for.
+
+    On 2026-09-17 a contender waited ``browser_wait_seconds`` and lost twenty-two
+    times in a row while the holder kept the profile for a login. Waiting is how
+    the profile changes hands between processes on one version, and the only
+    way a waiter announces itself, so it stays; a holder on another version is
+    named and refused before any browser opens.
+    """
+
+    async def test_a_holder_on_another_version_is_refused_at_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "linkedin_mcp_server.profile_lease.__version__", "0.0.0+elsewhere"
+        )
+        holder = _spawn("hold", str(tmp_path), "10")
+        try:
+            _await_line(holder, "HELD")
+            lease = ProfileLease(tmp_path)
+            started = time.monotonic()
+            with pytest.raises(BrowserBusyError) as excinfo:
+                await lease.acquire_or_refuse(timeout=3)
+            assert time.monotonic() - started < 1
+            assert not lease.held
+            message = str(excinfo.value)
+            assert f"pid {holder.pid}" in message
+            assert f"version {__version__}" in message
+            assert "0.0.0+elsewhere" in message
+            # Waiting and retrying cannot help against a version mismatch.
+            assert "--daemon" not in message
+            assert "Wait a moment" not in message
+        finally:
+            holder.kill()
+            holder.wait(timeout=10)
+
+    async def test_a_direct_server_waits_for_a_same_version_holder(
+        self, tmp_path: Path
+    ) -> None:
+        holder = _spawn("hold", str(tmp_path), "0.5")
+        try:
+            _await_line(holder, "HELD")
+            lease = ProfileLease(tmp_path)
+            started = time.monotonic()
+            assert await lease.acquire_or_refuse(timeout=10)
+            assert time.monotonic() - started >= 0.2
+            lease.release()
+        finally:
+            holder.wait(timeout=10)
+
+    async def test_a_same_version_frontend_still_waits(self, tmp_path: Path) -> None:
+        set_process_role(ServerRole.PROXY)
+        holder = _spawn("hold", str(tmp_path), "0.5")
+        try:
+            _await_line(holder, "HELD")
+            lease = ProfileLease(tmp_path)
+            started = time.monotonic()
+            assert await lease.acquire_or_refuse(timeout=10)
+            assert time.monotonic() - started >= 0.2
+            lease.release()
+        finally:
+            holder.wait(timeout=10)
+
+    async def test_an_unreadable_record_gets_the_wait(self, tmp_path: Path) -> None:
+        holder = _spawn("hold", str(tmp_path), "0.5")
+        try:
+            _await_line(holder, "HELD")
+            (tmp_path / "profile.holder").write_text("{not json", encoding="utf-8")
+            lease = ProfileLease(tmp_path)
+            assert await lease.acquire_or_refuse(timeout=10)
+            lease.release()
+        finally:
+            holder.wait(timeout=10)
+
+    async def test_a_free_lease_is_simply_taken(self, tmp_path: Path) -> None:
+        lease = ProfileLease(tmp_path)
+        assert await lease.acquire_or_refuse(timeout=0)
+        assert lease.held
+        lease.release()
 
 
 class TestCrossProcess:

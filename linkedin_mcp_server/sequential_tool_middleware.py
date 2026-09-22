@@ -36,7 +36,9 @@ class SequentialToolExecutionMiddleware(Middleware):
     * an ``asyncio.Lock`` serializes calls inside this process, where several MCP
       sessions can share one server;
     * the profile lease serializes calls across processes, where each MCP client
-      instance spawns its own server against the same Chromium profile.
+      instance spawns its own server against the same Chromium profile. A
+      process on the holder's version waits for the handoff; one on another
+      version is refused at once, with the holder named.
 
     Without the second layer two processes open that profile simultaneously and
     the last one to close silently overwrites the other's cookies.
@@ -205,20 +207,26 @@ class SequentialToolExecutionMiddleware(Middleware):
         if not acquired:
             await self._report_progress(
                 context,
-                message=(
-                    "Another LinkedIn MCP client is using the browser; "
-                    "waiting for it to hand over"
-                ),
+                message="Another LinkedIn MCP client is using the browser",
             )
             budget = get_config().browser.browser_wait_seconds
-            acquired = await lease.acquire(timeout=budget)
-
-        if not acquired:
             # Raised as a ToolError here, not via error_handler: an exception
             # thrown in middleware does not pass through raise_tool_error, and
             # mask_error_details would otherwise hide the explanation.
-            logger.info("Tool '%s' gave up waiting for the shared browser", tool_name)
-            raise ToolError(str(BrowserBusyError()))
+            try:
+                acquired = await lease.acquire_or_refuse(timeout=budget)
+            except BrowserBusyError as refusal:
+                raise ToolError(str(refusal)) from refusal
+
+        if not acquired:
+            holder = lease.holder()
+            described = holder.describe() if holder else "an unidentified process"
+            logger.warning(
+                "Tool '%s' gave up waiting for the shared browser, held by %s",
+                tool_name,
+                described,
+            )
+            raise ToolError(str(BrowserBusyError(holder=described)))
 
         hold_started = time.perf_counter()
         try:

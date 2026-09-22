@@ -274,11 +274,12 @@ class BrowserBusyError(LinkedInMCPError):
     merely lost a race destroy every other process's session.
     """
 
-    def __init__(self, message: str | None = None):
+    def __init__(self, message: str | None = None, *, holder: str | None = None):
+        who = f" ({holder})" if holder else ""
         super().__init__(
             message
             or (
-                "Another LinkedIn MCP client is currently using the browser. "
+                f"Another LinkedIn MCP client is currently using the browser{who}. "
                 "This is not a failure and your saved session was not changed. "
                 "Wait a moment and call this exact tool again. If several "
                 "clients run at once, add --daemon to each so they share one "

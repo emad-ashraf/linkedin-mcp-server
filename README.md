@@ -145,7 +145,7 @@ AI agent? Get a quick confirmation from the user before enabling automatic updat
 
 **Shared browser:**
 
-- `--browser-wait SECONDS` - How long to wait for another server process to hand over the shared browser (default: 25, max 45; 0 = report busy at once). Only matters with several MCP clients running at once.
+- `--browser-wait SECONDS` - How long to wait for another server process on the same version to hand over the shared browser (default: 25, max 45; 0 = report busy at once). A holder on another version is refused at once, naming its pid and version. Only matters with several MCP clients running at once.
 - `--browser-min-hold SECONDS` - Shortest time this process keeps the shared browser before handing it over (default: 20). Clamped to 3 seconds below `--browser-wait`, so raise that one along with it. Higher means fewer browser restarts but longer waits for other clients.
 - `--browser-idle-timeout SECONDS` - Close an idle browser and release the profile after this long without a tool call (default: 600; 0 = keep it open)
 
@@ -521,7 +521,7 @@ username.
 
 **Shared browser:**
 
-- `--browser-wait SECONDS` - How long to wait for another server process to hand over the shared browser (default: 25, max 45; 0 = report busy at once). Only matters with several MCP clients running at once.
+- `--browser-wait SECONDS` - How long to wait for another server process on the same version to hand over the shared browser (default: 25, max 45; 0 = report busy at once). A holder on another version is refused at once, naming its pid and version. Only matters with several MCP clients running at once.
 - `--browser-min-hold SECONDS` - Shortest time this process keeps the shared browser before handing it over (default: 20). Clamped to 3 seconds below `--browser-wait`, so raise that one along with it. Higher means fewer browser restarts but longer waits for other clients.
 - `--browser-idle-timeout SECONDS` - Close an idle browser and release the profile after this long without a tool call (default: 600; 0 = keep it open)
 
@@ -821,7 +821,7 @@ The local server uses the same managed-runtime flow as MCPB and `uvx`: it prepar
 
 **Shared browser:**
 
-- `--browser-wait SECONDS` - How long to wait for another server process to hand over the shared browser (default: 25, max 45; 0 = report busy at once). Only matters with several MCP clients running at once.
+- `--browser-wait SECONDS` - How long to wait for another server process on the same version to hand over the shared browser (default: 25, max 45; 0 = report busy at once). A holder on another version is refused at once, naming its pid and version. Only matters with several MCP clients running at once.
 - `--browser-min-hold SECONDS` - Shortest time this process keeps the shared browser before handing it over (default: 20). Clamped to 3 seconds below `--browser-wait`, so raise that one along with it. Higher means fewer browser restarts but longer waits for other clients.
 - `--browser-idle-timeout SECONDS` - Close an idle browser and release the profile after this long without a tool call (default: 600; 0 = keep it open)
 

@@ -78,9 +78,10 @@ _IGNORED_WHEN_JUDGING_EMPTINESS = frozenset(
     {
         CLAIM_FILE,
         CLAIM_LOCK_FILE,
-        # profile_lease._LEASE_FILE, _HANDOFF_FILE
+        # profile_lease._LEASE_FILE, _HANDOFF_FILE, _HOLDER_FILE
         "profile.lock",
         "profile.handoff",
+        "profile.holder",
         # debug_trace._trace_root
         "trace-runs",
         # error_diagnostics.issue_report_dir

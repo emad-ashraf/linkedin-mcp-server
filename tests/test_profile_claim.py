@@ -375,6 +375,7 @@ class TestClaimingACustomRoot:
         target.parent.mkdir()
         (target.parent / "profile.lock").write_text("")
         (target.parent / "profile.handoff").write_text("")
+        (target.parent / "profile.holder").write_text("{}")
 
         assert ensure_profile_claim(target) == target
 
@@ -415,6 +416,7 @@ class TestClaimingACustomRoot:
 
         assert profile_lease._LEASE_FILE in ignored
         assert profile_lease._HANDOFF_FILE in ignored
+        assert profile_lease._HOLDER_FILE in ignored
         assert bootstrap._BROWSER_DIR in ignored
         assert bootstrap._BROWSER_INSTALL_METADATA in ignored
 

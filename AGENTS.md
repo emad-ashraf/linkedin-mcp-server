@@ -63,9 +63,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   asks about a nested auth root the server deletes on purpose, while reading as
   protection.
 - **The auth root is the blast radius, not the profile.** `cookies.json`,
-  `source-state.json`, `runtime-profiles/` and every `invalid-state-*` live one
-  level *above* `USER_DATA_DIR`, so the emptiness of the profile says nothing
-  about what a rotation takes with it.
+  `source-state.json`, `profile.lock`, `profile.handoff`, `profile.holder`,
+  `runtime-profiles/` and every `invalid-state-*` live one level *above*
+  `USER_DATA_DIR`, so the emptiness of the profile says nothing about what a
+  rotation takes with it.
 - **Expand and resolve together, always.** Doing one without the other lets a
   symlink move the profile out of one directory while its sidecars come from
   another. Use `session_state.canonical()`.
