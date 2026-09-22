@@ -32,7 +32,7 @@ from linkedin_mcp_server.core.proxy_errors import (
 from linkedin_mcp_server.debug_trace import record_page_trace
 from linkedin_mcp_server.debug_utils import stabilize_navigation
 from linkedin_mcp_server.exceptions import ActionLimitError
-from linkedin_mcp_server.pacing import JobStore, charge_navigation
+from linkedin_mcp_server.pacing import JobStore, charge_navigation, note_throttle_signal
 from linkedin_mcp_server.privacy import (
     is_private_linkedin_navigation_url,
     redact_private_navigation_value,
@@ -270,6 +270,9 @@ class PageNavigator:
             ),
         )
         budget.rate_limit_hits += 1
+        # Before the backoff sleep, so every other session is refused for the
+        # whole of it rather than only once this one has handed back its error.
+        note_throttle_signal("http_429")
         safe_url = redact_private_navigation_value(url)
         logger.warning(
             "LinkedIn rate-limited %s (retry-after: %s); backing off %.1fs",

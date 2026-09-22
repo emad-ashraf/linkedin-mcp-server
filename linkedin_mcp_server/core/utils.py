@@ -124,9 +124,19 @@ async def detect_rate_limit(page: Page) -> None:
     Raises:
         RateLimitError: If any rate-limiting or security challenge is detected
     """
+    # Imported here: ``pacing`` imports the top-level ``exceptions`` module,
+    # which imports this package, so a module-level import would be a cycle.
+    from linkedin_mcp_server.pacing import note_throttle_signal
+
     # Check URL for security challenges
     current_url = page.url
+    if "linkedin.com/checkpoint" in current_url:
+        # Recorded before raising, so every other session sees the pause
+        # while this one's error is still on its way to the client.
+        note_throttle_signal("checkpoint")
     if "linkedin.com/checkpoint" in current_url or "authwall" in current_url:
+        # An authwall is not recorded: it is the session having ended, not
+        # LinkedIn throttling it, and a pause would only delay the re-login.
         raise RateLimitError(
             "LinkedIn security checkpoint detected. "
             "You may need to verify your identity or wait before continuing.",
@@ -154,6 +164,7 @@ async def detect_rate_limit(page: Page) -> None:
                     "try again later",
                 ]
             ):
+                note_throttle_signal("rate_limit_page")
                 raise RateLimitError(
                     "Rate limit message detected on page.",
                     suggested_wait_time=30,

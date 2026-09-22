@@ -13,6 +13,7 @@ from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core.exceptions import LinkedInScraperException
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
+from linkedin_mcp_server.pacing import note_throttle_signal
 from linkedin_mcp_server.scraping.content import PageContentReader
 from linkedin_mcp_server.scraping.contracts import (
     RATE_LIMITED_SECTION_TEXT,
@@ -160,6 +161,10 @@ class SectionCapture:
                 return result
 
             if not await self._session.claim_soft_retry(url):
+                # A spent budget means this scrape has already re-fetched
+                # empty pages as often as it may and got another: that is
+                # the session being throttled, not one odd page.
+                note_throttle_signal("empty_page_budget_spent")
                 return result
             return await self._capture_once(url, section_name, plan)
 

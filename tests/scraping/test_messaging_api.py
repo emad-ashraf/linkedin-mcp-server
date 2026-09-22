@@ -9,6 +9,7 @@ from urllib.parse import quote
 import pytest
 
 from linkedin_mcp_server.core.exceptions import LinkedInScraperException
+from linkedin_mcp_server.pacing import JobStore, read_account_cooldown
 from linkedin_mcp_server.scraping.messaging_api import MessagingApiCapture
 
 
@@ -313,3 +314,29 @@ async def test_full_batch_does_not_induce_history_discovery(mock_page):
 
     assert messages == elements
     assert mock_page.evaluate.await_count == 1
+
+
+async def test_a_payload_that_never_arrives_is_half_a_throttle_signal(
+    mock_page, tmp_path
+):
+    """The retry storm in issue #57 was this timeout, retried at once.
+
+    One is ambiguous with a slow proxy, so it arms rather than pauses; the
+    second inside ten minutes is the strike.
+    """
+    store = JobStore(tmp_path / "jobs")
+
+    async with MessagingApiCapture(mock_page) as capture:
+        with pytest.raises(LinkedInScraperException, match="did not return"):
+            await capture.wait_for_payload(timeout=0.01)
+        assert read_account_cooldown(store).half_at is not None
+        assert read_account_cooldown(store).until is None
+
+        with pytest.raises(LinkedInScraperException, match="did not return"):
+            await capture.wait_for_payload(timeout=0.01)
+
+    cooldown = read_account_cooldown(store)
+    assert cooldown.strikes == 1
+    assert cooldown.until is not None
+    assert cooldown.last_signal is not None
+    assert cooldown.last_signal["signal"] == "payload_timeout"

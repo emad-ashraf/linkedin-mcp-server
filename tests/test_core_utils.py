@@ -6,6 +6,13 @@ import pytest
 
 from linkedin_mcp_server.core.exceptions import RateLimitError
 from linkedin_mcp_server.core.utils import detect_rate_limit, scroll_job_sidebar
+from linkedin_mcp_server.pacing import JobStore, read_account_cooldown
+
+
+def _last_signal(tmp_path) -> str | None:
+    """The throttle signal the detector left in the (isolated) account ledger."""
+    last = read_account_cooldown(JobStore(tmp_path / "jobs")).last_signal
+    return last["signal"] if last else None
 
 
 @pytest.fixture
@@ -22,17 +29,24 @@ def mock_page():
 
 
 class TestDetectRateLimit:
-    async def test_checkpoint_url_raises(self, mock_page):
+    async def test_checkpoint_url_raises(self, mock_page, tmp_path):
         mock_page.url = "https://www.linkedin.com/checkpoint/challenge/123"
         with pytest.raises(RateLimitError, match="security checkpoint"):
             await detect_rate_limit(mock_page)
+        # And pauses the account, so no session retries into the challenge.
+        assert _last_signal(tmp_path) == "checkpoint"
 
-    async def test_authwall_url_raises(self, mock_page):
+    async def test_authwall_url_raises(self, mock_page, tmp_path):
         mock_page.url = "https://www.linkedin.com/authwall?trk=login"
         with pytest.raises(RateLimitError, match="security checkpoint"):
             await detect_rate_limit(mock_page)
+        # But records nothing: an authwall is the session having ended, not
+        # LinkedIn throttling it, and a pause would only delay the re-login.
+        assert _last_signal(tmp_path) is None
 
-    async def test_normal_page_with_main_skips_body_heuristic(self, mock_page):
+    async def test_normal_page_with_main_skips_body_heuristic(
+        self, mock_page, tmp_path
+    ):
         """A normal page with <main> should NOT trigger body text checks."""
         main_locator = MagicMock()
         main_locator.count = AsyncMock(return_value=1)
@@ -53,8 +67,11 @@ class TestDetectRateLimit:
         mock_page.locator = MagicMock(side_effect=locator_side_effect)
         # Should NOT raise — the page has <main>, so body heuristic is skipped
         await detect_rate_limit(mock_page)
+        assert _last_signal(tmp_path) is None
 
-    async def test_error_page_without_main_triggers_heuristic(self, mock_page):
+    async def test_error_page_without_main_triggers_heuristic(
+        self, mock_page, tmp_path
+    ):
         """A short error page without <main> with rate-limit text should raise."""
         main_locator = MagicMock()
         main_locator.count = AsyncMock(return_value=0)
@@ -74,6 +91,7 @@ class TestDetectRateLimit:
         mock_page.locator = MagicMock(side_effect=locator_side_effect)
         with pytest.raises(RateLimitError, match="Rate limit message"):
             await detect_rate_limit(mock_page)
+        assert _last_signal(tmp_path) == "rate_limit_page"
 
     async def test_long_body_without_main_does_not_trigger(self, mock_page):
         """A page without <main> but with long body text (>2000 chars) is not an error page."""

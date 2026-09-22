@@ -334,3 +334,34 @@ class BrowserBusyError(LinkedInMCPError):
                 "browser instead of contending for the profile."
             )
         )
+
+
+class AccountCooldownError(LinkedInMCPError):
+    """LinkedIn activity on this account is paused, and the call was refused.
+
+    Raised by the middleware before the call takes the scraper lock, so a
+    refused call costs no budget and no gap. Two things put the account here:
+    a throttle signal LinkedIn sent (a 429, a checkpoint, a rate-limit page),
+    which sets a pause that escalates with every further signal; and the
+    rolling-hour cap, which is this server holding back on its own. Both carry
+    the same ``resume_at``, because the right response is the same: do not
+    call any LinkedIn-touching tool before then.
+
+    Deliberately not an ``AuthenticationError``, for the same reason as
+    ``BrowserBusyError``: that class retires the profile, and a paused account
+    has a perfectly good session that a retry would only burn.
+    """
+
+    error_type = "account_cooldown"
+
+    def __init__(self, resume_at: datetime, *, reason: str) -> None:
+        self.resume_at = resume_at.isoformat(timespec="seconds")
+        self.reason = reason
+        super().__init__(
+            f"LinkedIn activity on this account is paused until "
+            f"{self.resume_at}: {reason}. Do not call any LinkedIn-touching "
+            f"tool before that time; retrying sooner is refused the same way "
+            f"and cannot shorten the pause. Tools that answer from local disk "
+            f"still work. "
+            f"(error_type={self.error_type}, resume_at={self.resume_at})"
+        )

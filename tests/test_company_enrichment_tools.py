@@ -32,6 +32,7 @@ from linkedin_mcp_server.pacing import (
     JobStore,
     Ledger,
     Schedule,
+    read_account_cooldown,
     request_arrived_at,
 )
 from linkedin_mcp_server.tools.enrichment import RETRY_AFTER_QUEUED_OUT
@@ -274,6 +275,55 @@ class TestEnrichCompanies:
 
         assert out["stopped_because"] == "daily_budget_spent"
         assert out["fetched"] == 0
+
+    async def test_a_bunch_is_cut_to_the_hourly_headroom(
+        self, mcp, wired, mock_context, monkeypatch
+    ):
+        """Forty an hour holds in the middle of a bunch, not only at its start."""
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        monkeypatch.setenv(EnvironmentKeys.HOURLY_ACTIONS_MAX, "10")
+        _, jobs = wired
+        now = datetime.now().astimezone()
+        budget = jobs.load(ACCOUNT_BUDGET_JOB)
+        budget.ledger = Ledger(actions=[now.timestamp()] * 8)
+        jobs.save(budget)
+        extractor = _search_extractor([])
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        out = await fn(
+            ["a", "b", "c", "d"], mock_context, bunch_searches=4, extractor=extractor
+        )
+
+        assert out["fetched"] == 2
+        assert extractor.search_companies.await_count == 2
+        assert out["stopped_because"] == "hourly_cap_reached"
+        assert 0 < out["next_run_after_seconds"] <= 3600
+
+    async def test_zero_hourly_headroom_is_a_status_not_an_error(
+        self, mcp, wired, mock_context, monkeypatch
+    ):
+        monkeypatch.setenv(EnvironmentKeys.HOURLY_ACTIONS_MAX, "3")
+        _, jobs = wired
+        oldest = datetime.now().astimezone() - timedelta(minutes=50)
+        budget = jobs.load(ACCOUNT_BUDGET_JOB)
+        budget.ledger = Ledger(actions=[oldest.timestamp()] * 3)
+        jobs.save(budget)
+
+        browser = AsyncMock()
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.get_ready_extractor",
+            browser,
+        )
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        out = await fn(["NewCo"], mock_context)
+
+        assert out["stopped_because"] == "hourly_cap_reached"
+        assert out["fetched"] == 0
+        assert 540 <= out["next_run_after_seconds"] <= 600
+        browser.assert_not_awaited()  # nothing to plan, no browser started
 
     async def test_a_company_url_is_recorded_without_a_search(
         self, mcp, wired, mock_context
@@ -943,6 +993,11 @@ class TestEnrichCompanies:
         assert first["stopped_because"] == "rate_limited"
         assert (first["fetched"], first["about_loaded"]) == (1, 1)
         assert _spent(jobs) == 2  # search + the About load LinkedIn refused
+        # Recorded for every session: the slug resolved, so the company
+        # exists, and an About that is a shell is the session throttled.
+        cooldown = read_account_cooldown(jobs)
+        assert cooldown.last_signal is not None
+        assert cooldown.last_signal["signal"] == "empty_about"
         extractor.scrape_company.assert_awaited_once()  # Acme was not attempted
         rec = cache.get("Copado")
         assert rec is not None and rec.linkedin_url
@@ -1302,6 +1357,9 @@ class TestEnrichCompanies:
         assert out["stopped_because"] == "rate_limited"
         assert _spent(jobs) == 1
         assert extractor.search_companies.await_count == 1
+        cooldown = read_account_cooldown(jobs)
+        assert cooldown.last_signal is not None
+        assert cooldown.last_signal["signal"] == "empty_search"
 
 
 class TestBunchSearchesCeiling:
@@ -1425,6 +1483,41 @@ class TestEnrichCompanyDeep:
         rec = cache.get("Acme")
         assert rec.has_firmographics() and rec.has_jobs()
         assert rec.company_urn == "9999"  # cached for later jobs-only refresh
+
+    async def test_zero_hourly_headroom_is_a_status_not_an_error(
+        self, mcp, wired, mock_context, monkeypatch
+    ):
+        monkeypatch.setenv(EnvironmentKeys.HOURLY_ACTIONS_MAX, "3")
+        _, jobs = wired
+        oldest = datetime.now().astimezone() - timedelta(minutes=50)
+        budget = jobs.load(ACCOUNT_BUDGET_JOB)
+        budget.ledger = Ledger(actions=[oldest.timestamp()] * 2)
+        jobs.save(budget)
+        extractor = self._deep_extractor()
+
+        fn = await get_tool_fn(mcp, "enrich_company_deep")
+        out = await fn("Acme", mock_context, extractor=extractor)
+
+        # Two needed (About + jobs), one of headroom: nothing is loaded.
+        assert out["status"] == "hourly_cap_reached"
+        assert 540 <= out["next_run_after_seconds"] <= 600
+        extractor.scrape_company.assert_not_awaited()
+
+    async def test_an_hourly_cap_below_the_call_cost_is_named_as_such(
+        self, mcp, wired, mock_context, monkeypatch
+    ):
+        """Reproduced as an IndexError on an empty ledger with a cap of one."""
+        monkeypatch.setenv(EnvironmentKeys.HOURLY_ACTIONS_MAX, "1")
+        extractor = self._deep_extractor()
+
+        fn = await get_tool_fn(mcp, "enrich_company_deep")
+        out = await fn("Acme", mock_context, extractor=extractor)
+
+        assert out["status"] == "hourly_cap_below_cost"
+        assert "next_run_after_seconds" not in out
+        assert "HOURLY_ACTIONS_MAX=1" in out["detail"]
+        assert "2 page loads" in out["detail"]
+        extractor.scrape_company.assert_not_awaited()
 
     async def test_cache_fresh_skips_the_fetch(self, mcp, wired, mock_context):
         cache, _ = wired

@@ -199,16 +199,20 @@ def isolate_the_account_ledger(tmp_path, monkeypatch):
     Every page load the navigator makes, and every invite or message the
     tools submit, is charged against ``~/.linkedin-mcp/jobs``, so without
     this a test run spends the daily budget of whoever ran it -- or is
-    refused by a cap the real ledger has already reached.
+    refused by a cap the real ledger has already reached. The throttle
+    detectors write a signal to the same directory through
+    ``pacing.note_throttle_signal``, which would pause the developer's real
+    account for half an hour per test that provokes one, and the middleware
+    reads that pause back on every call.
     """
     from datetime import datetime
 
-    from linkedin_mcp_server import pacing
+    from linkedin_mcp_server import pacing, sequential_tool_middleware
     from linkedin_mcp_server.pacing import JobStore, Schedule, load_account_budget
     from linkedin_mcp_server.scraping import navigation
     from linkedin_mcp_server.tools import messaging, person
 
-    for module in (navigation, person, messaging):
+    for module in (navigation, person, messaging, pacing, sequential_tool_middleware):
         monkeypatch.setattr(
             module,
             "JobStore",

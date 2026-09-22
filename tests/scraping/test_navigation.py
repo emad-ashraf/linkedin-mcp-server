@@ -20,7 +20,12 @@ from linkedin_mcp_server.core.exceptions import (
     TransientBarrierError,
 )
 from linkedin_mcp_server.exceptions import ActionLimitError
-from linkedin_mcp_server.pacing import PROFILE, JobStore, load_account_budget
+from linkedin_mcp_server.pacing import (
+    PROFILE,
+    JobStore,
+    load_account_budget,
+    read_account_cooldown,
+)
 from linkedin_mcp_server.scraping import navigation as navigation_module
 from linkedin_mcp_server.scraping import session as session_module
 from linkedin_mcp_server.scraping.navigation import PageNavigator
@@ -1238,7 +1243,9 @@ class TestHumanizeAfterNavigation:
 class TestHttp429Navigation:
     """A 429 that never becomes a page the loaded-page detector could read."""
 
-    async def test_navigation_failure_is_classified_as_rate_limit(self, mock_page):
+    async def test_navigation_failure_is_classified_as_rate_limit(
+        self, mock_page, tmp_path
+    ):
         """The live shape: Chromium refuses the 429 and `goto` raises."""
         url = "https://www.linkedin.com/messaging/thread/2-abc/"
         _refused(mock_page, url)
@@ -1263,6 +1270,12 @@ class TestHttp429Navigation:
         # limit that is still live.
         assert mock_page.goto.await_count == 1
         assert navigator._session.rate_limit.rate_limit_hits == 1
+        # And the account is paused for every session, in the shared ledger
+        # (isolated to tmp_path by conftest), not only this navigator.
+        cooldown = read_account_cooldown(JobStore(tmp_path / "jobs"))
+        assert cooldown.last_signal is not None
+        assert cooldown.last_signal["signal"] == "http_429"
+        assert cooldown.strikes == 1
 
     async def test_a_refusal_that_is_not_a_429_is_not_a_rate_limit(self, mock_page):
         """The whole reason the interstitial is read.

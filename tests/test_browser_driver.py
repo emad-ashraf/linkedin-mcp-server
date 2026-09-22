@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from linkedin_mcp_server.config.schema import AppConfig
+from linkedin_mcp_server.pacing import JobStore, read_account_cooldown
 from linkedin_mcp_server.core.exceptions import (
     NetworkError,
     ProxyConnectionError,
@@ -1515,7 +1516,7 @@ class TestThrottlingOnTheProbeIsNotExpiry:
     """
 
     @pytest.mark.asyncio
-    async def test_a_429_response_is_a_rate_limit(self):
+    async def test_a_429_response_is_a_rate_limit(self, tmp_path):
         browser = _make_mock_browser()
         response = MagicMock()
         response.status = 429
@@ -1533,6 +1534,10 @@ class TestThrottlingOnTheProbeIsNotExpiry:
 
         barrier.assert_not_awaited()
         browser.page.goto.assert_awaited_once()
+        # And the account is paused for every session, like any other 429.
+        cooldown = read_account_cooldown(JobStore(tmp_path / "jobs"))
+        assert cooldown.last_signal is not None
+        assert cooldown.last_signal["signal"] == "http_429"
 
     @pytest.mark.asyncio
     async def test_a_redirect_loop_never_reads_a_barrier(self, monkeypatch):

@@ -55,6 +55,7 @@ from linkedin_mcp_server.exceptions import (
     ProfileRootRefusedError,
 )
 from linkedin_mcp_server.limits import env_int
+from linkedin_mcp_server.pacing import note_throttle_signal
 from linkedin_mcp_server.process_tree import (
     release_browser_guardian,
     start_browser_guardian,
@@ -223,6 +224,7 @@ async def _feed_auth_succeeds(
             # Throttling, not expiry, and checked before anything reads the
             # page: a 429 on /feed/ inside the probe rotated a live profile
             # twice on 2026-09-17.
+            note_throttle_signal("http_429")
             raise RateLimitError(
                 "LinkedIn rate-limited /feed/ (HTTP 429). The saved LinkedIn "
                 "session was not changed; wait before retrying."

@@ -32,6 +32,7 @@ from linkedin_mcp_server.pacing import (
     Schedule,
     account_budget_in_use,
     charge_navigation,
+    read_account_cooldown,
     request_arrived_at,
     schedule_ignored,
 )
@@ -277,6 +278,79 @@ class TestRunBunch:
 
         assert out["stopped_because"] == "daily_budget_spent"
         assert out["next_run_after_seconds"] > 0
+        assert store.load("j").pending == ["a"]
+
+    async def test_a_bunch_is_cut_to_the_hourly_headroom(
+        self, mcp, store, mock_context, monkeypatch
+    ):
+        """Forty an hour holds in the middle of a bunch, not only at its start.
+
+        The middleware lets this tool through on purpose; a bunch of five
+        planned with two of headroom would otherwise run five.
+        """
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.enrichment.step_delay", lambda **k: 0
+        )
+        monkeypatch.setenv(EnvironmentKeys.HOURLY_ACTIONS_MAX, "10")
+        now = datetime.now().astimezone()
+        await self._seed(mcp, store, ["a", "b", "c", "d", "e"])
+        _seed_budget(store, cap=100, ledger=Ledger(actions=[now.timestamp()] * 8))
+
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        out = await fn("j", mock_context, bunch_size=5, extractor=_extractor())
+
+        assert out["done"] == 2
+        assert out["stopped_because"] == "hourly_cap_reached"
+        # Released when the hour's oldest action ages out, not in a day.
+        assert 0 < out["next_run_after_seconds"] <= 3600
+        assert store.load("j").pending == ["c", "d", "e"]
+
+    async def test_zero_hourly_headroom_is_a_status_not_an_error(
+        self, mcp, store, mock_context, monkeypatch
+    ):
+        monkeypatch.setenv(EnvironmentKeys.HOURLY_ACTIONS_MAX, "3")
+        oldest = datetime.now().astimezone() - timedelta(minutes=50)
+        await self._seed(mcp, store, ["a"])
+        _seed_budget(store, cap=100, ledger=Ledger(actions=[oldest.timestamp()] * 3))
+
+        # No extractor handed in: with nothing to plan, the browser is not
+        # even started, as with the daily budget and the schedule gates.
+        browser = AsyncMock()
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.enrichment.get_ready_extractor", browser
+        )
+
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        out = await fn("j", mock_context)
+
+        assert out["stopped_because"] == "hourly_cap_reached"
+        assert out["done"] == 0
+        # About ten minutes: when the oldest of the three ages out of the hour.
+        assert 540 <= out["next_run_after_seconds"] <= 600
+        assert store.load("j").pending == ["a"]
+        browser.assert_not_awaited()
+
+    async def test_an_hourly_cap_below_the_profile_cost_is_named_as_such(
+        self, mcp, store, mock_context, monkeypatch
+    ):
+        """Reproduced as an IndexError: no hour will ever admit three loads
+        under a cap of two, and a 0 s next_run_after would be a retry loop."""
+        monkeypatch.setenv(EnvironmentKeys.HOURLY_ACTIONS_MAX, "2")
+        await self._seed(mcp, store, ["a"])
+        _seed_budget(store, cap=100)
+
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        out = await fn(
+            "j",
+            mock_context,
+            sections="experience,contact_info",  # cost 3 > cap 2
+            extractor=_extractor(),
+        )
+
+        assert out["stopped_because"] == "hourly_cap_below_cost"
+        assert "next_run_after_seconds" not in out
+        assert "HOURLY_ACTIONS_MAX=2" in out["detail"]
+        assert "3 page loads" in out["detail"]
         assert store.load("j").pending == ["a"]
 
     async def test_a_rate_limit_keeps_the_profile_queued(
@@ -936,6 +1010,7 @@ class TestRunBunch:
 
         assert first["stopped_because"] == "rate_limited"
         assert store.load("j").strikes == {"a": 1}
+        assert read_account_cooldown(store).last_signal is None
 
         second = await fn("j", mock_context, extractor=extractor)
 
@@ -945,6 +1020,13 @@ class TestRunBunch:
         assert store.load("j").strikes == {"a": 2, "b": 1}
         # The strike-out charged a real page load; undoing it does not refund.
         assert second["account_spent_last_24h"] == 1
+        # And the judgement is recorded for every session: the account is
+        # paused. A single empty page (the first call) recorded nothing,
+        # because on its own it is ambiguous with a deleted profile.
+        cooldown = read_account_cooldown(store)
+        assert cooldown.last_signal is not None
+        assert cooldown.last_signal["signal"] == "empty_page_pair"
+        assert cooldown.strikes == 1
 
     async def test_a_strike_is_cleared_when_the_profile_fails_outright(
         self, mcp, store, mock_context

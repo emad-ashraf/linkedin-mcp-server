@@ -12,6 +12,7 @@ import anyio
 import anyio.lowlevel
 
 from linkedin_mcp_server.core.exceptions import LinkedInScraperException
+from linkedin_mcp_server.pacing import note_throttle_signal
 from linkedin_mcp_server.scraping.messaging_payload import (
     build_message_page_url,
     conversation_elements,
@@ -192,6 +193,11 @@ class MessagingApiCapture:
                     await self._payload_event.wait()
                     self._payload_event.clear()
         except TimeoutError as exc:
+            # The retry storm in issue #57 was this line, retried at once.
+            # A half signal, not a strike: one payload that never arrives is
+            # also what a slow proxy looks like, and two within ten minutes
+            # is what makes it a throttle.
+            note_throttle_signal("payload_timeout", half=True)
             raise LinkedInScraperException(
                 "LinkedIn did not return conversation data in time."
             ) from exc

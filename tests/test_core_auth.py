@@ -10,6 +10,7 @@ from patchright.async_api import (
 )
 
 from linkedin_mcp_server.core import auth as auth_module
+from linkedin_mcp_server.pacing import JobStore, read_account_cooldown
 from linkedin_mcp_server.core.exceptions import (
     AuthenticationError,
     NetworkError,
@@ -709,7 +710,7 @@ class TestBarrierConfirmed:
         assert 5.0 <= pause <= 10.0
 
     @pytest.mark.asyncio
-    async def test_a_429_on_the_second_look_is_a_rate_limit(self):
+    async def test_a_429_on_the_second_look_is_a_rate_limit(self, tmp_path):
         page = _reprobe_page()
         response = MagicMock()
         response.status = 429
@@ -723,6 +724,10 @@ class TestBarrierConfirmed:
             )
 
         detect.assert_not_awaited()
+        # And the account is paused for every session, like any other 429.
+        cooldown = read_account_cooldown(JobStore(tmp_path / "jobs"))
+        assert cooldown.last_signal is not None
+        assert cooldown.last_signal["signal"] == "http_429"
 
     @pytest.mark.asyncio
     async def test_a_redirect_loop_on_the_second_look_is_throttling(self):

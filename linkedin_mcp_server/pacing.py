@@ -36,6 +36,7 @@ The model mirrors what the established LinkedIn automation tools converged on:
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import json
 import logging
@@ -43,15 +44,25 @@ import math
 import os
 import random
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from linkedin_mcp_server.common_utils import secure_mkdir, secure_write_text
 from linkedin_mcp_server.config.loaders import TRUTHY_VALUES, EnvironmentKeys
 from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.limits import env_float, env_int, env_int_list
+
+try:  # POSIX
+    import fcntl
+
+    _HAS_FCNTL = True
+except ImportError:  # pragma: no cover - Windows
+    _HAS_FCNTL = False
 
 logger = logging.getLogger(__name__)
 
@@ -125,14 +136,38 @@ BUNCH_PAUSE_JITTER = 0.25
 BUNCH_SIZE_MAX = 25
 BUNCH_SEARCHES_MAX = 20
 
-# Minimum spacing between two consecutive MCP tool calls, in seconds
-# (TOOL_CALL_GAP_SECONDS), jittered by TOOL_CALL_GAP_JITTER. Zero turns the
-# spacing off. Five seconds is the compromise between vendor spacing (a minute
-# or more, for unattended campaigns) and an interactive MCP client where a
-# minute of silence reads as a hung server: it holds a burst to about a dozen
-# page loads a minute while staying inside what a person waits through.
-DEFAULT_TOOL_CALL_GAP = 5.0
-TOOL_CALL_GAP_JITTER = 0.2
+# Spacing between two consecutive MCP tool calls, in seconds, drawn
+# log-uniformly from one of two bands: READ for tools that only look, WRITE
+# for the ones that leave a trace on another member (an invitation, a
+# message). Log-uniform rather than uniform so short pauses stay the common
+# case while the long ones still happen, which is the skew a person's pauses
+# have; a flat draw has a fixed mean and no tail. TOOL_CALL_GAP_SECONDS
+# replaces the read minimum and scales every other bound with it, so one knob
+# moves the whole shape. Zero turns the spacing off.
+#
+# This used to be five seconds, chosen so an interactive MCP client did not
+# read a silent server as hung. The middleware now reports progress while it
+# waits out the gap, so silence is no longer what a longer gap costs, and five
+# seconds was a burst LinkedIn answered with 429s and checkpoints (issue #57).
+READ_TOOL_CALL_GAP = (8.0, 20.0)
+WRITE_TOOL_CALL_GAP = (20.0, 60.0)
+DEFAULT_TOOL_CALL_GAP = READ_TOOL_CALL_GAP[0]
+
+# The sticky account cooldown (see `record_throttle_signal`): how long each
+# consecutive throttle signal pauses the account, how long without one before
+# the count starts over, how close two signals have to be to count as one
+# incident, and how close two *half* signals have to be to make one strike.
+# ACCOUNT_COOLDOWN_DISABLED turns it off.
+COOLDOWN_STEPS_SECONDS = (30 * 60, 2 * 3600, 4 * 3600, 8 * 3600)
+COOLDOWN_STRIKES_RESET_SECONDS = 24 * 3600
+COOLDOWN_SAME_INCIDENT_SECONDS = 60
+COOLDOWN_HALF_SIGNAL_WINDOW_SECONDS = 10 * 60
+
+# LinkedIn-touching actions allowed in any rolling hour across every session
+# of the account (HOURLY_ACTIONS_MAX). Counted from the same ledger as the
+# daily budget, so an enrichment bunch counts each profile it visited.
+HOURLY_ACTIONS_MAX = 40
+HOURLY_WINDOW_SECONDS = 3600
 
 
 def max_daily_actions() -> int:
@@ -226,10 +261,6 @@ def daily_cap_jitter() -> float:
 
 def bunch_pause_jitter() -> float:
     return _fraction(EnvironmentKeys.BUNCH_PAUSE_JITTER, BUNCH_PAUSE_JITTER)
-
-
-def tool_call_gap_jitter() -> float:
-    return _fraction(EnvironmentKeys.TOOL_CALL_GAP_JITTER, TOOL_CALL_GAP_JITTER)
 
 
 def _fraction(key: str, default: float) -> float:
@@ -510,19 +541,30 @@ def step_delay(
     return rng.uniform(low, high)
 
 
-def tool_call_gap(raw: str | None = None, rng: random.Random | None = None) -> float:
+def tool_call_gap(
+    raw: str | None = None,
+    rng: random.Random | None = None,
+    *,
+    write: bool = False,
+) -> float:
     """Seconds to leave between the end of one tool call and the next.
 
-    ``raw`` is the configured gap in seconds as it arrives from the
+    ``raw`` is the configured read minimum in seconds as it arrives from the
     environment, unparsed; anything unusable falls back to the default rather
     than removing the spacing, since a typo must not be the way pacing is
-    turned off. An explicit ``0`` is that way.
+    turned off. An explicit ``0`` is that way. ``write`` picks the longer band
+    for a call that leaves a trace on another member.
     """
-    base = _configured_tool_call_gap(raw)
-    if base <= 0:
+    minimum = _configured_tool_call_gap(raw)
+    if minimum <= 0:
         return 0.0
-    spread = base * tool_call_gap_jitter()
-    return step_delay((base - spread, base + spread), rng=rng)
+    scale = minimum / READ_TOOL_CALL_GAP[0]
+    low, high = WRITE_TOOL_CALL_GAP if write else READ_TOOL_CALL_GAP
+    return _log_uniform(low * scale, high * scale, rng or random.Random())
+
+
+def _log_uniform(low: float, high: float, rng: random.Random) -> float:
+    return math.exp(rng.uniform(math.log(low), math.log(high)))
 
 
 def _configured_tool_call_gap(raw: str | None) -> float:
@@ -642,6 +684,16 @@ class JobStore:
     def __init__(self, root: Path | str = "~/.linkedin-mcp/jobs") -> None:
         self.root = Path(root).expanduser()
 
+    def locked(self) -> contextlib.AbstractContextManager[None]:
+        """Hold the root's lock across a read-modify-write of one record.
+
+        ``load`` and ``save`` each take it on their own, which keeps a reader
+        off a half-written file; a caller that loads, changes and saves has
+        to hold it across all three or another process's save lands in
+        between and one of the two writes is lost.
+        """
+        return _ledger_lock(self.root)
+
     def _path(self, name: str) -> Path:
         # The filename is the name verbatim, so distinct names cannot collide.
         # Stripping unsafe characters instead (the old behaviour) aliased
@@ -661,23 +713,72 @@ class JobStore:
 
     def load(self, name: str) -> Job:
         path = self._path(name)
-        if not path.exists():
-            raise FileNotFoundError(f"No job named {name!r} at {path}")
-        return Job.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        with self.locked():
+            if not path.exists():
+                raise FileNotFoundError(f"No job named {name!r} at {path}")
+            return Job.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
     def save(self, job: Job) -> None:
         path = self._path(job.name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Write-then-rename: a crash mid-write leaves the previous good file
-        # rather than a truncated one.
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(job.to_dict(), indent=2), encoding="utf-8")
-        tmp.replace(path)
+        # Write-then-rename through a per-process temp name: a crash mid-write
+        # leaves the previous good file rather than a truncated one, and two
+        # processes saving at once cannot rename each other's half-written
+        # temp file into place, which one shared temp name let them do.
+        with self.locked():
+            secure_write_text(path, json.dumps(job.to_dict(), indent=2))
 
     def list_jobs(self) -> list[str]:
         if not self.root.exists():
             return []
-        return sorted(p.stem for p in self.root.glob("*.json"))
+        return sorted(
+            p.stem for p in self.root.glob("*.json") if p.name != ACCOUNT_COOLDOWN_FILE
+        )
+
+
+#: Roots this process currently holds the ledger lock on, with a depth, so
+#: a caller holding it across a load-modify-save does not deadlock on the
+#: lock the load and the save take for themselves. ``flock`` conflicts
+#: between two descriptors of one process exactly as between two processes.
+_LEDGER_LOCK_DEPTH: dict[Path, int] = {}
+
+
+@contextmanager
+def _ledger_lock(root: Path) -> Iterator[None]:
+    """An exclusive, blocking lock on the records under ``root``.
+
+    One lock file for the whole directory rather than one per record: the
+    critical sections are a few milliseconds of JSON, and the cooldown file
+    is read on every tool call by every process, so contention is cheap and
+    a single file keeps the ordering obvious. Released by the kernel when
+    the process dies, so a crash cannot wedge it. Re-entrant within the
+    process; the middleware already serialises tool calls inside one.
+
+    On Windows there is no ``fcntl``; the writes are still atomic renames, so
+    a reader never sees a torn file, but two writers can lose an update.
+    """
+    root = root.resolve()
+    if _LEDGER_LOCK_DEPTH.get(root, 0) > 0:
+        _LEDGER_LOCK_DEPTH[root] += 1
+        try:
+            yield
+        finally:
+            _LEDGER_LOCK_DEPTH[root] -= 1
+        return
+
+    secure_mkdir(root)
+    fd = os.open(root / LEDGER_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if _HAS_FCNTL:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        _LEDGER_LOCK_DEPTH[root] = 1
+        try:
+            yield
+        finally:
+            del _LEDGER_LOCK_DEPTH[root]
+    finally:
+        if _HAS_FCNTL:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 # LinkedIn counts activity per *account*, not per job -- it has no idea two
@@ -687,6 +788,16 @@ class JobStore:
 # account-wide budget: its ledger, cap, warm-up and schedule. Its queue stays
 # empty; per-work queues live in their own jobs.
 ACCOUNT_BUDGET_JOB = "__account_budget__"
+
+# The account cooldown lives next to the budget, not in it. It sat inside the
+# budget record once, and the enrichment tools -- which load the budget at
+# the top of a bunch and save that same object after every profile -- wrote
+# the stale copy back over a pause another process had just recorded.
+# Reproduced. A record nobody holds in memory cannot be clobbered that way.
+ACCOUNT_COOLDOWN_FILE = "__account_cooldown__.json"
+LEDGER_LOCK_FILE = ".ledger.lock"
+#: The job name the cooldown file would answer to; reserved like the budget.
+ACCOUNT_COOLDOWN_JOB = "__account_cooldown__"
 
 
 def load_account_budget(
@@ -705,31 +816,32 @@ def load_account_budget(
     pure read (still materialising a default budget on first use, on business
     hours -- see the module docstring for why that default is safe here).
     """
-    if store.exists(ACCOUNT_BUDGET_JOB):
-        budget = store.load(ACCOUNT_BUDGET_JOB)
-        changed = False
-        if daily_cap is not None and daily_cap != budget.daily_cap:
-            budget.daily_cap = daily_cap
-            changed = True
-        if warmup is not None and warmup != budget.warmup:
-            budget.warmup = warmup
-            changed = True
-        if schedule is not None and schedule != budget.schedule:
-            budget.schedule = schedule
-            changed = True
-        if changed:
-            store.save(budget)
-        return budget
+    with store.locked():
+        if store.exists(ACCOUNT_BUDGET_JOB):
+            budget = store.load(ACCOUNT_BUDGET_JOB)
+            changed = False
+            if daily_cap is not None and daily_cap != budget.daily_cap:
+                budget.daily_cap = daily_cap
+                changed = True
+            if warmup is not None and warmup != budget.warmup:
+                budget.warmup = warmup
+                changed = True
+            if schedule is not None and schedule != budget.schedule:
+                budget.schedule = schedule
+                changed = True
+            if changed:
+                store.save(budget)
+            return budget
 
-    budget = Job(
-        name=ACCOUNT_BUDGET_JOB,
-        started_on=now.date(),
-        daily_cap=daily_cap if daily_cap is not None else default_daily_actions(),
-        warmup=warmup if warmup is not None else False,
-        schedule=schedule if schedule is not None else Schedule.business_hours(),
-    )
-    store.save(budget)
-    return budget
+        budget = Job(
+            name=ACCOUNT_BUDGET_JOB,
+            started_on=now.date(),
+            daily_cap=daily_cap if daily_cap is not None else default_daily_actions(),
+            warmup=warmup if warmup is not None else False,
+            schedule=schedule if schedule is not None else Schedule.business_hours(),
+        )
+        store.save(budget)
+        return budget
 
 
 #: The account budget a bulk tool holds in memory for the length of its call.
@@ -841,10 +953,17 @@ def charge_navigation(store: JobStore, url: str, now: datetime) -> None:
     """
     kind = navigation_kind(url)
     held = account_budget_in_use.get()
-    budget = held if held is not None else load_account_budget(store, now)
-    refuse_if_limited(budget, kind, now, ignore_schedule=schedule_ignored.get())
-    budget.ledger.record_kind(kind, now)
-    if held is None:
+    if held is not None:
+        refuse_if_limited(held, kind, now, ignore_schedule=schedule_ignored.get())
+        held.ledger.record_kind(kind, now)
+        return
+    # Held across the read and the write: another process's navigation
+    # landing in the same instant would otherwise overwrite this one with
+    # its own copy of the ledger, and one of the two is lost.
+    with store.locked():
+        budget = load_account_budget(store, now)
+        refuse_if_limited(budget, kind, now, ignore_schedule=schedule_ignored.get())
+        budget.ledger.record_kind(kind, now)
         budget.ledger.record(now)
         # Nothing else on this path prunes, and the file would carry every
         # page load of the account's life.
@@ -875,11 +994,275 @@ def record_action(store: JobStore, kind: str, now: datetime) -> None:
     must cost the count, never turn a delivered message into a tool error.
     """
     try:
-        budget = load_account_budget(store, now)
-        budget.ledger.record_kind(kind, now)
-        budget.ledger.prune(now)
-        store.save(budget)
+        with store.locked():
+            budget = load_account_budget(store, now)
+            budget.ledger.record_kind(kind, now)
+            budget.ledger.prune(now)
+            store.save(budget)
     except Exception:
         logger.warning(
             "Could not count the %s against the account budget", kind, exc_info=True
         )
+
+
+# --- Sticky account cooldown and the hourly cap ----------------------------
+#
+# A throttle signal (an HTTP 429, a checkpoint, a rate-limit page) used to
+# raise `RateLimitError` and nothing else, so the calling agent, and every
+# other session sharing the daemon, retried at once: client logs showed ten
+# calls in under five seconds right before an incident (issue #57). One signal
+# now pauses the *account*, in a file every session reads, and the pause
+# escalates with each further signal until a day passes without one.
+
+
+def account_cooldown_disabled() -> bool:
+    raw = os.environ.get(EnvironmentKeys.ACCOUNT_COOLDOWN_DISABLED, "")
+    return raw.strip().lower() in TRUTHY_VALUES
+
+
+def hourly_actions_max() -> int:
+    return env_int(EnvironmentKeys.HOURLY_ACTIONS_MAX, HOURLY_ACTIONS_MAX, minimum=1)
+
+
+def _utc(now: datetime) -> datetime:
+    """`now` as an aware UTC instant.
+
+    A naive value is taken as local time, which is what ``datetime.now()``
+    hands the rest of this module.
+    """
+    return now.astimezone(timezone.utc)
+
+
+def _parse_utc(raw: Any) -> datetime | None:
+    """An ISO-8601 instant from the cooldown file, or None for anything else.
+
+    Tolerant on purpose: the file is documented as hand-editable, and a key
+    nulled or mistyped by hand must read as "no cooldown", never as a broken
+    ledger that stops every tool.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    # A hand-edited value without an offset is read as UTC, which is what the
+    # server writes; comparing it as local time would shift the pause by the
+    # operator's offset in whichever direction they did not expect.
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+@dataclass
+class AccountCooldown:
+    """The contents of ``__account_cooldown__.json``."""
+
+    until: datetime | None = None
+    strikes: int = 0
+    last_signal: dict[str, str] | None = None
+    #: When the last unconfirmed half signal landed; see `record_throttle_signal`.
+    half_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "until": self.until.isoformat() if self.until else None,
+            "strikes": self.strikes,
+            "last_signal": self.last_signal,
+            "half_at": self.half_at.isoformat() if self.half_at else None,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> AccountCooldown:
+        if not isinstance(raw, dict):
+            return cls()
+        strikes = raw.get("strikes")
+        last = raw.get("last_signal")
+        return cls(
+            until=_parse_utc(raw.get("until")),
+            strikes=strikes if isinstance(strikes, int) and strikes > 0 else 0,
+            last_signal=last if isinstance(last, dict) else None,
+            half_at=_parse_utc(raw.get("half_at")),
+        )
+
+
+def read_account_cooldown(store: JobStore) -> AccountCooldown:
+    """The cooldown as it is on disk right now; empty when unreadable.
+
+    Read fresh on every call rather than cached: the pause is written by
+    whichever process saw LinkedIn push back, so any copy held in memory is
+    stale by definition.
+    """
+    path = store.root / ACCOUNT_COOLDOWN_FILE
+    try:
+        with store.locked():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return AccountCooldown()
+    except (OSError, ValueError):
+        logger.warning("Ignoring unreadable %s; treating as no cooldown", path)
+        return AccountCooldown()
+    return AccountCooldown.from_dict(raw)
+
+
+def _write_account_cooldown(store: JobStore, cooldown: AccountCooldown) -> None:
+    secure_write_text(
+        store.root / ACCOUNT_COOLDOWN_FILE, json.dumps(cooldown.to_dict(), indent=2)
+    )
+
+
+def cooldown_resume_at(store: JobStore, now: datetime) -> datetime | None:
+    """When the current account pause ends, or None when nothing is paused."""
+    until = read_account_cooldown(store).until
+    return until if until is not None and until > _utc(now) else None
+
+
+def record_throttle_signal(
+    store: JobStore, now: datetime, signal: str, *, half: bool = False
+) -> datetime | None:
+    """Pause the account after LinkedIn pushed back, and say until when.
+
+    Each signal within a day of the previous one is one more strike, and the
+    pause steps up through ``COOLDOWN_STEPS_SECONDS`` with the count; a day
+    without a signal starts the count over. Signals within a minute of each
+    other are one incident and one strike: a 429 is usually seen by more
+    than one layer of the same call. A pause already in force is never
+    shortened, because another session may have recorded a later signal and
+    the longer of the two is the one LinkedIn is judging the account by.
+
+    A ``half`` signal is one that is ambiguous with a slow network, such as a
+    messaging payload that never arrived. On its own it pauses nothing; two
+    within ``COOLDOWN_HALF_SIGNAL_WINDOW_SECONDS`` make one strike. Returns
+    None when nothing was paused.
+
+    The whole read-modify-write runs under the ledger lock, so two processes
+    recording at once escalate once each rather than both writing strike 1.
+    """
+    now = _utc(now)
+    with store.locked():
+        cooldown = read_account_cooldown(store)
+        if half:
+            if (
+                cooldown.half_at is None
+                or (now - cooldown.half_at).total_seconds()
+                > COOLDOWN_HALF_SIGNAL_WINDOW_SECONDS
+            ):
+                cooldown.half_at = now
+                _write_account_cooldown(store, cooldown)
+                logger.info(
+                    "Possible throttle (%s); a second one within %d min pauses "
+                    "the account",
+                    signal,
+                    COOLDOWN_HALF_SIGNAL_WINDOW_SECONDS // 60,
+                )
+                return None
+        # Spent by this strike, whether it completed a pair or a full signal
+        # arrived instead: a half after a full strike is not strike two.
+        cooldown.half_at = None
+
+        strikes = cooldown.strikes
+        since_last = None
+        if cooldown.last_signal is not None:
+            last_at = _parse_utc(cooldown.last_signal.get("at"))
+            if last_at is not None:
+                since_last = (now - last_at).total_seconds()
+        if since_last is None or since_last > COOLDOWN_STRIKES_RESET_SECONDS:
+            strikes = 0
+        same_incident = (
+            since_last is not None and since_last <= COOLDOWN_SAME_INCIDENT_SECONDS
+        )
+        if not same_incident:
+            strikes += 1
+        strikes = max(strikes, 1)
+        step = COOLDOWN_STEPS_SECONDS[min(strikes, len(COOLDOWN_STEPS_SECONDS)) - 1]
+        until = now + timedelta(seconds=step)
+        in_force = cooldown.until
+        if in_force is not None and in_force <= now:
+            in_force = None
+        if in_force is not None and (same_incident or in_force > until):
+            until = in_force
+
+        cooldown.until = until
+        cooldown.strikes = strikes
+        cooldown.last_signal = {"signal": signal, "at": now.isoformat()}
+        _write_account_cooldown(store, cooldown)
+    logger.warning(
+        "LinkedIn pushed back (%s); pausing the account until %s (strike %d)",
+        signal,
+        until.isoformat(timespec="seconds"),
+        strikes,
+    )
+    return until
+
+
+def note_throttle_signal(signal: str, *, half: bool = False) -> None:
+    """Record a throttle signal against the default account ledger.
+
+    For the places that detect throttling and hold no store of their own.
+    Best-effort, like every other write to the ledger: a home directory that
+    cannot be written must not turn one refused page into a second error.
+    """
+    if account_cooldown_disabled():
+        return
+    try:
+        record_throttle_signal(
+            JobStore(), datetime.now(timezone.utc), signal, half=half
+        )
+    except Exception:
+        logger.debug("Could not record the throttle signal", exc_info=True)
+
+
+def _actions_in_the_last_hour(budget: Job, now: datetime) -> list[float]:
+    cutoff = _utc(now).timestamp() - HOURLY_WINDOW_SECONDS
+    return sorted(t for t in budget.ledger.actions if t > cutoff)
+
+
+def hourly_headroom(budget: Job, now: datetime, cap: int | None = None) -> int:
+    """Actions the rolling-hour cap still admits right now.
+
+    For the bulk tools, which plan a bunch up front: a bunch planned past
+    the headroom would run through the cap in its middle, where nothing
+    checks it.
+    """
+    cap = hourly_actions_max() if cap is None else cap
+    return max(cap - len(_actions_in_the_last_hour(budget, now)), 0)
+
+
+def hourly_cap_resume_at(
+    budget: Job, now: datetime, cap: int | None = None, *, needed: int = 1
+) -> datetime | None:
+    """When the rolling-hour cap next admits ``needed`` actions, or None if now.
+
+    Not a strike: the cap is this server holding itself back, not LinkedIn
+    pushing back, so it neither escalates nor persists anything. The answer
+    is the moment enough of the hour's oldest actions have aged out of it.
+    """
+    cap = hourly_actions_max() if cap is None else cap
+    recent = _actions_in_the_last_hour(budget, now)
+    # How many of the hour's actions have to expire before `needed` fit.
+    must_expire = len(recent) - cap + needed
+    if must_expire <= 0:
+        return None
+    if not recent:
+        # Nothing to wait for: `needed` exceeds the cap itself, which no
+        # amount of waiting fixes. The callers name that as configuration.
+        return None
+    # The k-th oldest is the one whose expiry frees the last of them;
+    # everything older has expired by then anyway. Clamped: past the last
+    # entry the answer is "when the whole hour has drained", and the cap
+    # itself is the limit after that.
+    k = min(must_expire, len(recent))
+    return datetime.fromtimestamp(
+        recent[k - 1] + HOURLY_WINDOW_SECONDS, tz=timezone.utc
+    )
+
+
+def seconds_until_hourly_release(budget: Job, now: datetime, needed: int = 1) -> float:
+    """How long until the rolling-hour cap admits ``needed`` more actions.
+
+    For the bulk tools' ``next_run_after``; 0 when they are admitted now.
+    """
+    resume_at = hourly_cap_resume_at(budget, now, needed=needed)
+    if resume_at is None:
+        return 0.0
+    return max((resume_at - _utc(now)).total_seconds(), 0.0)

@@ -376,7 +376,12 @@ async def barrier_confirmed(
         if response is not None and response.status == HTTP_TOO_MANY_REQUESTS:
             # Throttling on the second look is still throttling, and it is
             # read before the detector: whatever the page shows now is not
-            # the session's doing.
+            # the session's doing. Imported here: ``pacing`` imports the
+            # top-level ``exceptions`` module, which imports this package,
+            # so a module-level import would be a cycle.
+            from linkedin_mcp_server.pacing import note_throttle_signal
+
+            note_throttle_signal("http_429")
             raise RateLimitError(
                 "LinkedIn rate-limited /feed/ (HTTP 429) while re-checking an "
                 "auth barrier. The saved LinkedIn session was not changed; "

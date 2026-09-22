@@ -25,6 +25,7 @@ from linkedin_mcp_server.scraping.capture import (
     capture_plan_for_url,
 )
 from linkedin_mcp_server.scraping.content import PageContentReader
+from linkedin_mcp_server.pacing import JobStore, read_account_cooldown
 from linkedin_mcp_server.scraping.contracts import (
     RATE_LIMITED_SECTION_TEXT,
     ExtractedSection,
@@ -158,7 +159,7 @@ class TestExtractPage:
                 section_name="main_profile",
             )
 
-    async def test_returns_rate_limited_msg_after_retry(self, mock_page):
+    async def test_returns_rate_limited_msg_after_retry(self, mock_page, tmp_path):
         """When both attempts return only noise, surface rate limit message."""
         noise_only = (
             "More profiles for you\n\n"
@@ -196,6 +197,9 @@ class TestExtractPage:
         assert result.text == RATE_LIMITED_SECTION_TEXT
         # goto called twice (initial + the first retry of a fresh budget)
         assert mock_page.goto.await_count == 2
+        # A retry that was granted and still came back empty is ambiguous
+        # with a deleted or private page; nothing is recorded yet.
+        assert read_account_cooldown(JobStore(tmp_path / "jobs")).last_signal is None
 
     async def test_retry_succeeds_after_rate_limit(self, mock_page):
         """When first attempt is rate-limited but retry succeeds, return content."""
@@ -244,7 +248,9 @@ class TestExtractPage:
 
         assert result.text == "Education\nHarvard University\n1973 – 1975"
 
-    async def test_soft_retry_budget_is_shared_across_sections(self, mock_page):
+    async def test_soft_retry_budget_is_shared_across_sections(
+        self, mock_page, tmp_path
+    ):
         """The retry budget belongs to the scrape, not to each section.
 
         Per section it was one retry each, so a throttled multi-section scrape
@@ -288,6 +294,12 @@ class TestExtractPage:
 
         # Four sections plus the scrape-wide budget of two, not four plus four.
         assert mock_page.goto.await_count == 4 + RATE_LIMIT_RETRY_BUDGET
+        # The two empties past the budget are the session being throttled,
+        # not one odd page: recorded (seconds apart, so as one incident).
+        cooldown = read_account_cooldown(JobStore(tmp_path / "jobs"))
+        assert cooldown.last_signal is not None
+        assert cooldown.last_signal["signal"] == "empty_page_budget_spent"
+        assert cooldown.strikes == 1
 
     async def test_soft_retry_delay_escalates_within_one_scrape(self, mock_page):
         """The second retry of a scrape waits twice as long as the first."""

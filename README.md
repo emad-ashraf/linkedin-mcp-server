@@ -271,7 +271,7 @@ while a container is running.
 <summary>Rate limiting (HTTP 429)</summary>
 
 - LinkedIn answers a burst of page loads with HTTP 429. It arrives as a failed navigation rather than a readable status, so the symptom is a tool call that reports being refused, or a session that suddenly cannot open pages it opened a minute ago.
-- The server spaces consecutive tool calls apart by `TOOL_CALL_GAP_SECONDS` (default 5, jittered ±20%; `0` disables). Raise it if you scrape steadily — published limits for comparable tools are far lower than most people expect, on the order of one action a minute. Every other pacing limit is tunable too; see [Pacing limits](#pacing-limits).
+- The server spaces consecutive tool calls apart by a random 8–20 s for reads and 20–60 s for writes (`TOOL_CALL_GAP_SECONDS` sets the read minimum and scales the rest; `0` disables), refuses calls once 40 actions have happened in an hour, and pauses the whole account after LinkedIn pushes back. Raise the gap if you scrape steadily — published limits for comparable tools are on the order of one action a minute. Every other pacing limit is tunable too; see [Pacing limits](#pacing-limits).
 - Images, fonts and media are not fetched (`BLOCK_SUBRESOURCES`, on by default), which cuts each page from 100+ requests to the handful that carry text. Set it falsy only if you need those resources; expect 429s sooner if you do.
 - When a limit is hit the server backs off before reporting, and honours LinkedIn's `Retry-After` when one is sent. Wait it out rather than retrying immediately — a retry is one more request into a live limit.
 
@@ -350,7 +350,7 @@ On startup, the MCP Bundle starts preparing the shared Patchright Chromium brows
 <summary>Rate limiting (HTTP 429)</summary>
 
 - LinkedIn answers a burst of page loads with HTTP 429. It arrives as a failed navigation rather than a readable status, so the symptom is a tool call that reports being refused, or a session that suddenly cannot open pages it opened a minute ago.
-- The server spaces consecutive tool calls apart by `TOOL_CALL_GAP_SECONDS` (default 5, jittered ±20%; `0` disables). Raise it if you scrape steadily — published limits for comparable tools are far lower than most people expect, on the order of one action a minute. Every other pacing limit is tunable too; see [Pacing limits](#pacing-limits).
+- The server spaces consecutive tool calls apart by a random 8–20 s for reads and 20–60 s for writes (`TOOL_CALL_GAP_SECONDS` sets the read minimum and scales the rest; `0` disables), refuses calls once 40 actions have happened in an hour, and pauses the whole account after LinkedIn pushes back. Raise the gap if you scrape steadily — published limits for comparable tools are on the order of one action a minute. Every other pacing limit is tunable too; see [Pacing limits](#pacing-limits).
 - Images, fonts and media are not fetched (`BLOCK_SUBRESOURCES`, on by default), which cuts each page from 100+ requests to the handful that carry text. Set it falsy only if you need those resources; expect 429s sooner if you do.
 - When a limit is hit the server backs off before reporting, and honours LinkedIn's `Retry-After` when one is sent. Wait it out rather than retrying immediately — a retry is one more request into a live limit.
 
@@ -647,7 +647,7 @@ belongs behind something that provides it.
 <summary>Rate limiting (HTTP 429)</summary>
 
 - LinkedIn answers a burst of page loads with HTTP 429. It arrives as a failed navigation rather than a readable status, so the symptom is a tool call that reports being refused, or a session that suddenly cannot open pages it opened a minute ago.
-- The server spaces consecutive tool calls apart by `TOOL_CALL_GAP_SECONDS` (default 5, jittered ±20%; `0` disables). Raise it if you scrape steadily — published limits for comparable tools are far lower than most people expect, on the order of one action a minute. Every other pacing limit is tunable too; see [Pacing limits](#pacing-limits).
+- The server spaces consecutive tool calls apart by a random 8–20 s for reads and 20–60 s for writes (`TOOL_CALL_GAP_SECONDS` sets the read minimum and scales the rest; `0` disables), refuses calls once 40 actions have happened in an hour, and pauses the whole account after LinkedIn pushes back. Raise the gap if you scrape steadily — published limits for comparable tools are on the order of one action a minute. Every other pacing limit is tunable too; see [Pacing limits](#pacing-limits).
 - Images, fonts and media are not fetched (`BLOCK_SUBRESOURCES`, on by default), which cuts each page from 100+ requests to the handful that carry text. Set it falsy only if you need those resources; expect 429s sooner if you do.
 - When a limit is hit the server backs off before reporting, and honours LinkedIn's `Retry-After` when one is sent. Wait it out rather than retrying immediately — a retry is one more request into a live limit.
 
@@ -770,8 +770,9 @@ off.
 | `BUNCH_PAUSE_JITTER` | `0.25` | ± fraction on the bunch pause |
 | `BUNCH_SIZE_MAX` | `25` | Ceiling on `bunch_size` per enrichment call |
 | `BUNCH_SEARCHES_MAX` | `20` | Ceiling on `bunch_searches` per company-enrichment call |
-| `TOOL_CALL_GAP_SECONDS` | `5` | Minimum gap between two tool calls (`0` disables) |
-| `TOOL_CALL_GAP_JITTER` | `0.2` | ± fraction on that gap |
+| `TOOL_CALL_GAP_SECONDS` | `8` | Read minimum of the gap between two tool calls; every other bound scales with it (`0` disables) |
+| `HOURLY_ACTIONS_MAX` | `40` | LinkedIn-touching actions allowed in any rolling hour, across every session |
+| `ACCOUNT_COOLDOWN_DISABLED` | unset | `1` stops a throttle signal from pausing the account |
 | `NAV_DELAY_SECONDS` | `2` | Pause between page navigations |
 | `AUTH_PROBE_CACHE_SECONDS` | `1800` | How long a passed `/feed/` session check is reused across server starts with the same cookies (`0` = check on every start) |
 | `RATE_LIMIT_RETRY_DELAY_SECONDS` | `5` | Base delay before retrying a soft 429 |
@@ -782,6 +783,43 @@ off.
 | `RETRY_AFTER_CEILING_SECONDS` | `3600` | Cap on a relayed `Retry-After` |
 | `LOGIN_INLINE_WAIT_MAX` | `45` | Ceiling on `LOGIN_INLINE_WAIT` |
 | `BROWSER_WAIT_MAX` | `45` | Ceiling on `BROWSER_WAIT` |
+
+### Gaps, the hourly cap and the account cooldown
+
+Two consecutive tool calls are spaced by a random gap drawn log-uniformly
+from 8–20 s for tools that only read and 20–60 s for `connect_with_person` and
+`send_message`. The middleware reports progress while it waits, so a client
+never sees a silent server. `TOOL_CALL_GAP_SECONDS` replaces the read minimum
+and scales every other bound with it.
+
+Beyond the daily budget, at most `HOURLY_ACTIONS_MAX` LinkedIn-touching
+actions run in any rolling hour, counted across every session and process
+that shares the ledger. A call over the cap is refused at once with an
+`account_cooldown` error that names the `resume_at` time; nothing is charged
+for it. The bulk tools (`run_enrichment_bunch`, `enrich_companies`,
+`enrich_company_deep`) are not refused: they plan each bunch against the
+hour's remaining headroom, so a bunch is cut short rather than run through
+the cap, and one with no headroom returns its usual status
+(`stopped_because: hourly_cap_reached`) with `next_run_after_seconds` set to
+when the oldest action ages out. A cap below what one call costs (a profile
+with extra sections, a deep company fetch with jobs) is answered as
+`hourly_cap_below_cost`, naming the variable, since no wait would fix it.
+
+When LinkedIn pushes back — an HTTP 429, a `/checkpoint` redirect, a
+rate-limit page, an About or search page that comes back as an empty shell,
+two consecutive empty profiles in a bunch — the account is paused for every
+session: 30 minutes for the first signal, then 2, 4 and 8 hours for each
+further signal within 24 hours of the last, starting over after a day without
+one. Signals within a minute of each other count as one. A messaging payload
+that never arrives is only half a signal, because a slow proxy looks the
+same; two within ten minutes make one. Until the pause ends every
+LinkedIn-touching call is refused with the same `account_cooldown` error, and
+its `resume_at` is the time to wait for; tools that answer from local disk
+still work. The pause lives in `~/.linkedin-mcp/jobs/__account_cooldown__.json`
+as `until`, `strikes` and `last_signal`; delete `until` (and `strikes`, to
+reset the escalation) to release it by hand, or set
+`ACCOUNT_COOLDOWN_DISABLED=1` to stop signals from pausing the account at
+all. The hourly cap is not affected by that switch.
 
 ## 🐍 Local Setup (Develop & Contribute)
 
@@ -947,7 +985,7 @@ uv run -m linkedin_mcp_server --transport streamable-http --host 127.0.0.1 --por
 <summary>Rate limiting (HTTP 429)</summary>
 
 - LinkedIn answers a burst of page loads with HTTP 429. It arrives as a failed navigation rather than a readable status, so the symptom is a tool call that reports being refused, or a session that suddenly cannot open pages it opened a minute ago.
-- The server spaces consecutive tool calls apart by `TOOL_CALL_GAP_SECONDS` (default 5, jittered ±20%; `0` disables). Raise it if you scrape steadily — published limits for comparable tools are far lower than most people expect, on the order of one action a minute. Every other pacing limit is tunable too; see [Pacing limits](#pacing-limits).
+- The server spaces consecutive tool calls apart by a random 8–20 s for reads and 20–60 s for writes (`TOOL_CALL_GAP_SECONDS` sets the read minimum and scales the rest; `0` disables), refuses calls once 40 actions have happened in an hour, and pauses the whole account after LinkedIn pushes back. Raise the gap if you scrape steadily — published limits for comparable tools are on the order of one action a minute. Every other pacing limit is tunable too; see [Pacing limits](#pacing-limits).
 - Images, fonts and media are not fetched (`BLOCK_SUBRESOURCES`, on by default), which cuts each page from 100+ requests to the handful that carry text. Set it falsy only if you need those resources; expect 429s sooner if you do.
 - When a limit is hit the server backs off before reporting, and honours LinkedIn's `Retry-After` when one is sent. Wait it out rather than retrying immediately — a retry is one more request into a live limit.
 

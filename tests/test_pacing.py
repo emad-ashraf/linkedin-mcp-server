@@ -3,8 +3,14 @@
 Every function under test takes ``now`` explicitly, so nothing here sleeps.
 """
 
+import fcntl
+import json
 import logging
-from datetime import date, datetime, timedelta
+import os
+import random
+import subprocess
+import sys
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -14,29 +20,40 @@ from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.limits import env_float
 from linkedin_mcp_server.pacing import (
     ACCOUNT_BUDGET_JOB,
-    DEFAULT_TOOL_CALL_GAP,
+    ACCOUNT_COOLDOWN_FILE,
+    COOLDOWN_STEPS_SECONDS,
+    HOURLY_WINDOW_SECONDS,
     INVITES,
+    Job,
+    JobStore,
+    LEDGER_LOCK_FILE,
+    Ledger,
     MAX_BUNCH_PAUSE,
     MESSAGES,
     MIN_BUNCH_PAUSE,
     PROFILE,
+    READ_TOOL_CALL_GAP,
     SEARCH,
+    Schedule,
     WEEK_SECONDS,
     WINDOW_SECONDS,
-    Job,
-    JobStore,
-    Ledger,
-    Schedule,
-    TOOL_CALL_GAP_JITTER,
+    WRITE_TOOL_CALL_GAP,
     account_budget_in_use,
     charge_navigation,
+    cooldown_resume_at,
+    hourly_cap_resume_at,
+    hourly_headroom,
     jittered_cap,
     kind_headroom,
     load_account_budget,
     max_daily_actions,
     navigation_kind,
     next_bunch_delay,
+    note_throttle_signal,
+    read_account_cooldown,
     record_action,
+    record_throttle_signal,
+    seconds_until_hourly_release,
     refuse_action,
     refuse_if_limited,
     schedule_ignored,
@@ -339,19 +356,54 @@ class TestJobStore:
 class TestToolCallGap:
     """The gap the middleware leaves between two MCP tool calls."""
 
-    def test_default_gap_is_the_documented_seconds_plus_or_minus_the_jitter(self):
-        gaps = {tool_call_gap() for _ in range(200)}
+    def test_read_gaps_fill_the_documented_band(self):
+        gaps = [tool_call_gap() for _ in range(200)]
 
-        low = DEFAULT_TOOL_CALL_GAP * (1 - TOOL_CALL_GAP_JITTER)
-        high = DEFAULT_TOOL_CALL_GAP * (1 + TOOL_CALL_GAP_JITTER)
+        low, high = READ_TOOL_CALL_GAP
+        assert (low, high) == (8.0, 20.0)
         assert all(low <= gap <= high for gap in gaps)
-        # Jittered, not a constant: a fixed period is the pattern being avoided.
-        assert len(gaps) > 1
+        # Randomised, not a constant: a fixed period is the pattern being
+        # avoided. Both halves of the band are used, not one edge of it.
+        assert min(gaps) < (low + high) / 2 < max(gaps)
 
-    def test_a_configured_gap_is_honoured(self):
-        gaps = [tool_call_gap("60") for _ in range(50)]
+    def test_write_gaps_fill_the_longer_band(self):
+        gaps = [tool_call_gap(write=True) for _ in range(200)]
 
-        assert all(48.0 <= gap <= 72.0 for gap in gaps)
+        low, high = WRITE_TOOL_CALL_GAP
+        assert (low, high) == (20.0, 60.0)
+        assert all(low <= gap <= high for gap in gaps)
+        assert min(gaps) < (low + high) / 2 < max(gaps)
+
+    def test_a_write_waits_longer_than_a_read(self):
+        reads = [tool_call_gap() for _ in range(200)]
+        writes = [tool_call_gap(write=True) for _ in range(200)]
+
+        assert min(writes) >= max(reads)
+        assert sum(writes) / len(writes) > sum(reads) / len(reads)
+
+    def test_the_draw_is_log_uniform_not_uniform(self):
+        """Seeded, so the shape is asserted rather than sampled.
+
+        Under a log-uniform draw the geometric midpoint of the band is the
+        median; under a uniform one the arithmetic midpoint is. The two sit
+        far enough apart on an 8-20 band (12.6 vs 14) to tell them apart.
+        """
+        rng = random.Random(57)
+        gaps = sorted(tool_call_gap(rng=rng) for _ in range(2000))
+
+        low, high = READ_TOOL_CALL_GAP
+        median = gaps[len(gaps) // 2]
+        assert abs(median - (low * high) ** 0.5) < abs(median - (low + high) / 2)
+
+    def test_a_configured_gap_sets_the_read_minimum_and_scales_the_rest(self):
+        reads = [tool_call_gap("16") for _ in range(200)]
+        writes = [tool_call_gap("16", write=True) for _ in range(200)]
+
+        # Twice the default minimum doubles every bound.
+        assert all(16.0 <= gap <= 40.0 for gap in reads)
+        assert all(40.0 <= gap <= 120.0 for gap in writes)
+        assert min(reads) < 20.0
+        assert min(writes) < 50.0
 
     def test_zero_is_the_way_to_turn_the_spacing_off(self):
         assert tool_call_gap("0") == 0.0
@@ -586,21 +638,24 @@ class TestConfigurableLimits:
         assert len(delays) > 1
         assert self._warned(caplog, EnvironmentKeys.BUNCH_PAUSE_JITTER)
 
-    # TOOL_CALL_GAP_JITTER
+    # HOURLY_ACTIONS_MAX
 
-    def test_tool_call_gap_jitter_zero_makes_the_gap_exact(self, monkeypatch):
-        monkeypatch.setenv(EnvironmentKeys.TOOL_CALL_GAP_JITTER, "0")
-        assert tool_call_gap("10") == 10.0
+    def test_hourly_max_moves_the_cap(self, monkeypatch):
+        monkeypatch.setenv(EnvironmentKeys.HOURLY_ACTIONS_MAX, "2")
+        budget = Job(name=ACCOUNT_BUDGET_JOB, started_on=self.START)
+        budget.ledger.record(WED_10AM)
+        assert hourly_cap_resume_at(budget, WED_10AM) is None
+        budget.ledger.record(WED_10AM)
+        assert hourly_cap_resume_at(budget, WED_10AM) is not None
 
-    def test_tool_call_gap_jitter_garbage_falls_back_with_a_warning(
-        self, monkeypatch, caplog
-    ):
-        monkeypatch.setenv(EnvironmentKeys.TOOL_CALL_GAP_JITTER, "lots")
+    def test_hourly_max_garbage_falls_back_with_a_warning(self, monkeypatch, caplog):
+        monkeypatch.setenv(EnvironmentKeys.HOURLY_ACTIONS_MAX, "0")
+        budget = Job(name=ACCOUNT_BUDGET_JOB, started_on=self.START)
+        for _ in range(39):
+            budget.ledger.record(WED_10AM)
         with caplog.at_level(logging.WARNING):
-            gaps = {tool_call_gap("10") for _ in range(50)}
-        assert all(8.0 <= g <= 12.0 for g in gaps)
-        assert len(gaps) > 1
-        assert self._warned(caplog, EnvironmentKeys.TOOL_CALL_GAP_JITTER)
+            assert hourly_cap_resume_at(budget, WED_10AM) is None
+        assert self._warned(caplog, EnvironmentKeys.HOURLY_ACTIONS_MAX)
 
 
 class TestAccountBudgetSchedule:
@@ -1031,3 +1086,430 @@ class TestWriteActions:
         store = JobStore(tmp_path)
         record_action(store, MESSAGES, WED_10AM)
         assert load_account_budget(store, WED_10AM).ledger.spent(WED_10AM) == 0
+
+
+# Aware, because the cooldown is stored as ISO-8601 UTC and compared as such.
+T0 = datetime(2026, 8, 5, 10, 0, tzinfo=timezone.utc)
+
+
+def _strike(store: JobStore, now: datetime, signal: str = "http_429") -> datetime:
+    """A full signal, which always answers with the pause it set."""
+    until = record_throttle_signal(store, now, signal)
+    assert until is not None
+    return until
+
+
+class TestAccountCooldown:
+    """One throttle signal pauses the account for every session (issue #57).
+
+    The pause lives in its own file, ``__account_cooldown__.json``, not in
+    the budget record: the enrichment tools hold a loaded budget for a whole
+    bunch and save it after every profile, and a pause written into that
+    record by another process was overwritten by the next such save.
+    """
+
+    def test_nothing_is_paused_until_a_signal_arrives(self, tmp_path):
+        store = JobStore(tmp_path)
+        assert cooldown_resume_at(store, T0) is None
+        assert not (tmp_path / ACCOUNT_COOLDOWN_FILE).exists()
+
+    def test_a_signal_pauses_the_account_for_half_an_hour(self, tmp_path):
+        store = JobStore(tmp_path)
+        until = _strike(store, T0, "http_429")
+
+        assert until == T0 + timedelta(minutes=30)
+        # Persisted, and read back fresh as any other process would.
+        assert cooldown_resume_at(store, T0 + timedelta(minutes=29)) == until
+        assert cooldown_resume_at(store, until) is None
+        cooldown = read_account_cooldown(store)
+        assert cooldown.strikes == 1
+        assert cooldown.last_signal == {"signal": "http_429", "at": T0.isoformat()}
+
+    def test_the_file_is_the_documented_shape(self, tmp_path):
+        store = JobStore(tmp_path)
+        record_throttle_signal(store, T0, "http_429")
+
+        raw = json.loads((tmp_path / ACCOUNT_COOLDOWN_FILE).read_text())
+        assert raw == {
+            "until": (T0 + timedelta(minutes=30)).isoformat(),
+            "strikes": 1,
+            "last_signal": {"signal": "http_429", "at": T0.isoformat()},
+            "half_at": None,
+        }
+
+    def test_the_budget_record_carries_no_cooldown(self, tmp_path):
+        """The blocker: a stale budget save must not be able to clear it."""
+        store = JobStore(tmp_path)
+        budget = load_account_budget(store, T0)  # loaded before the signal
+        record_throttle_signal(store, T0, "http_429")
+
+        budget.ledger.record(T0)
+        store.save(budget)  # the enrichment tools' per-profile save
+
+        assert cooldown_resume_at(store, T0) == T0 + timedelta(minutes=30)
+        assert "cooldown" not in json.dumps(budget.to_dict())
+
+    def test_the_pause_escalates_and_caps_at_eight_hours(self, tmp_path):
+        store = JobStore(tmp_path)
+        expected = [timedelta(minutes=30), timedelta(hours=2), timedelta(hours=4)]
+        expected += [timedelta(hours=8)] * 2
+        assert COOLDOWN_STEPS_SECONDS == (1800, 7200, 14400, 28800)
+
+        now = T0
+        for step in expected:
+            # Each signal lands once the previous pause has run out, so the
+            # escalation is the strike count alone and not a pause extended.
+            until = _strike(store, now, "http_429")
+            assert until == now + step
+            now = until
+
+    def test_strikes_start_over_after_a_day_without_a_signal(self, tmp_path):
+        store = JobStore(tmp_path)
+        record_throttle_signal(store, T0, "http_429")
+        record_throttle_signal(store, T0 + timedelta(hours=1), "http_429")
+        assert read_account_cooldown(store).strikes == 2
+
+        later = T0 + timedelta(hours=1) + timedelta(hours=24, seconds=1)
+        until = _strike(store, later, "checkpoint")
+
+        assert until == later + timedelta(minutes=30)
+        assert read_account_cooldown(store).strikes == 1
+
+    def test_a_day_is_measured_from_the_last_signal_not_the_first(self, tmp_path):
+        store = JobStore(tmp_path)
+        record_throttle_signal(store, T0, "http_429")
+        record_throttle_signal(store, T0 + timedelta(hours=20), "http_429")
+
+        until = _strike(store, T0 + timedelta(hours=25), "http_429")
+
+        assert until == T0 + timedelta(hours=25) + timedelta(hours=4)
+
+    def test_signals_within_a_minute_are_one_incident(self, tmp_path):
+        """A 429 is seen by more than one layer of the same call."""
+        store = JobStore(tmp_path)
+        record_throttle_signal(store, T0, "http_429")
+        until = _strike(store, T0 + timedelta(seconds=30), "empty_about")
+
+        assert read_account_cooldown(store).strikes == 1
+        assert until == T0 + timedelta(minutes=30)
+
+    def test_a_longer_pause_already_in_force_is_kept(self, tmp_path):
+        """Two sessions record signals; the longer pause is the account's."""
+        store = JobStore(tmp_path)
+        record_throttle_signal(store, T0, "http_429")
+        record_throttle_signal(store, T0 + timedelta(minutes=2), "http_429")
+        two_hours = T0 + timedelta(minutes=2, hours=2)
+        assert read_account_cooldown(store).until == two_hours
+
+        # A third signal, from a clock a little behind: 4h from there is
+        # still longer, but the point is that nothing here can go backwards.
+        cooldown = read_account_cooldown(store)
+        cooldown.until = T0 + timedelta(hours=9)
+        (tmp_path / ACCOUNT_COOLDOWN_FILE).write_text(json.dumps(cooldown.to_dict()))
+        until = _strike(store, T0 + timedelta(minutes=4), "http_429")
+        assert until == T0 + timedelta(hours=9)
+
+    def test_deleting_the_keys_from_the_file_clears_the_pause(self, tmp_path):
+        """The documented manual release: no CLI flag, just the JSON."""
+        store = JobStore(tmp_path)
+        record_throttle_signal(store, T0, "http_429")
+        path = tmp_path / ACCOUNT_COOLDOWN_FILE
+        raw = json.loads(path.read_text())
+        del raw["until"]
+        del raw["strikes"]
+        path.write_text(json.dumps(raw))
+
+        assert cooldown_resume_at(store, T0) is None
+        # And the escalation starts over, since strikes went too.
+        assert _strike(store, T0, "x") == T0 + timedelta(minutes=30)
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "{not json",
+            "null",
+            "[]",
+            '{"until": null, "strikes": null, "last_signal": null}',
+            '{"until": "yesterday", "strikes": "many", "last_signal": "429"}',
+            '{"until": 12345, "strikes": -3}',
+        ],
+    )
+    def test_a_hand_edited_file_that_is_garbage_reads_as_no_cooldown(
+        self, tmp_path, content
+    ):
+        store = JobStore(tmp_path)
+        (tmp_path / ACCOUNT_COOLDOWN_FILE).write_text(content)
+
+        assert cooldown_resume_at(store, T0) is None
+        assert read_account_cooldown(store).strikes == 0
+        # And recording over it works, rather than tripping on the garbage.
+        assert _strike(store, T0, "x") == T0 + timedelta(minutes=30)
+
+    def test_a_naive_now_is_read_as_local_time(self, tmp_path):
+        store = JobStore(tmp_path)
+        naive = datetime.now()
+        until = _strike(store, naive, "http_429")
+
+        assert until.tzinfo is not None
+        assert cooldown_resume_at(store, naive) == until
+
+    def test_a_half_signal_alone_pauses_nothing(self, tmp_path):
+        """A payload that never arrived is also what a slow proxy looks like."""
+        store = JobStore(tmp_path)
+
+        assert record_throttle_signal(store, T0, "payload_timeout", half=True) is None
+
+        assert cooldown_resume_at(store, T0) is None
+        assert read_account_cooldown(store).strikes == 0
+        assert read_account_cooldown(store).half_at == T0
+
+    def test_two_half_signals_within_ten_minutes_are_one_strike(self, tmp_path):
+        store = JobStore(tmp_path)
+        record_throttle_signal(store, T0, "payload_timeout", half=True)
+        second = T0 + timedelta(minutes=9)
+
+        until = record_throttle_signal(store, second, "payload_timeout", half=True)
+
+        assert until == second + timedelta(minutes=30)
+        cooldown = read_account_cooldown(store)
+        assert cooldown.strikes == 1
+        assert cooldown.half_at is None  # spent; a third starts a new pair
+
+    def test_two_half_signals_further_apart_stay_half(self, tmp_path):
+        store = JobStore(tmp_path)
+        record_throttle_signal(store, T0, "payload_timeout", half=True)
+        second = T0 + timedelta(minutes=11)
+
+        assert (
+            record_throttle_signal(store, second, "payload_timeout", half=True) is None
+        )
+
+        assert cooldown_resume_at(store, second) is None
+        assert read_account_cooldown(store).half_at == second
+
+    def test_a_full_signal_spends_a_pending_half(self, tmp_path):
+        """A half after a full strike must not read as strike two."""
+        store = JobStore(tmp_path)
+        record_throttle_signal(store, T0, "payload_timeout", half=True)
+        _strike(store, T0 + timedelta(minutes=2))  # a 429 arrives instead
+        assert read_account_cooldown(store).half_at is None
+
+        later = T0 + timedelta(minutes=5)
+        assert (
+            record_throttle_signal(store, later, "payload_timeout", half=True) is None
+        )
+        assert read_account_cooldown(store).strikes == 1
+        assert read_account_cooldown(store).half_at == later
+
+    def test_the_default_ledger_helper_writes_the_same_record(
+        self, tmp_path, monkeypatch
+    ):
+        """What the raise sites call: no store, no clock, never raises."""
+        from linkedin_mcp_server import pacing
+
+        monkeypatch.setattr(pacing, "JobStore", lambda: JobStore(tmp_path))
+        note_throttle_signal("http_429")
+
+        cooldown = read_account_cooldown(JobStore(tmp_path))
+        assert cooldown.strikes == 1
+        assert cooldown.last_signal is not None
+        assert cooldown.last_signal["signal"] == "http_429"
+
+    def test_the_default_ledger_helper_passes_half_through(self, tmp_path, monkeypatch):
+        from linkedin_mcp_server import pacing
+
+        monkeypatch.setattr(pacing, "JobStore", lambda: JobStore(tmp_path))
+        note_throttle_signal("payload_timeout", half=True)
+
+        cooldown = read_account_cooldown(JobStore(tmp_path))
+        assert cooldown.strikes == 0
+        assert cooldown.half_at is not None
+
+    def test_the_default_ledger_helper_is_the_opt_out(self, tmp_path, monkeypatch):
+        from linkedin_mcp_server import pacing
+
+        monkeypatch.setattr(pacing, "JobStore", lambda: JobStore(tmp_path))
+        monkeypatch.setenv(EnvironmentKeys.ACCOUNT_COOLDOWN_DISABLED, "1")
+        note_throttle_signal("http_429")
+
+        assert not (tmp_path / ACCOUNT_COOLDOWN_FILE).exists()
+
+    def test_the_default_ledger_helper_swallows_an_unwritable_home(
+        self, tmp_path, monkeypatch
+    ):
+        from linkedin_mcp_server import pacing
+
+        def broken():
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(pacing, "JobStore", broken)
+        note_throttle_signal("http_429")  # must not raise
+
+    def test_the_cooldown_file_is_not_a_job(self, tmp_path):
+        store = JobStore(tmp_path / "jobs")
+        record_throttle_signal(store, T0, "http_429")
+        load_account_budget(store, T0)
+
+        assert store.list_jobs() == [ACCOUNT_BUDGET_JOB]
+
+
+class TestLedgerLock:
+    """Two processes writing one record must not lose each other's update."""
+
+    def test_load_and_save_take_the_lock_and_release_it(self, tmp_path):
+        store = JobStore(tmp_path)
+        load_account_budget(store, T0)
+        assert (tmp_path / LEDGER_LOCK_FILE).exists()
+        # Released: a second exclusive lock from this process is granted at
+        # once. flock conflicts between two descriptors of one process, so a
+        # leaked lock would block here.
+        fd = os.open(tmp_path / LEDGER_LOCK_FILE, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def test_the_lock_is_reentrant_within_the_process(self, tmp_path):
+        store = JobStore(tmp_path)
+        with store.locked():
+            budget = load_account_budget(store, T0)  # locks again inside
+            budget.ledger.record(T0)
+            store.save(budget)
+            record_throttle_signal(store, T0, "http_429")
+        assert load_account_budget(store, T0).ledger.spent(T0) == 1
+
+    def test_a_held_lock_blocks_another_process(self, tmp_path):
+        """A real second process, because flock is per open file description."""
+        store = JobStore(tmp_path)
+        load_account_budget(store, T0)
+        script = (
+            "import fcntl, os, sys\n"
+            f"fd = os.open({str(tmp_path / LEDGER_LOCK_FILE)!r}, os.O_RDWR)\n"
+            "try:\n"
+            "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "except OSError:\n"
+            "    sys.exit(3)\n"
+            "sys.exit(0)\n"
+        )
+        with store.locked():
+            held = subprocess.run([sys.executable, "-c", script])
+        free = subprocess.run([sys.executable, "-c", script])
+        assert held.returncode == 3
+        assert free.returncode == 0
+
+    def test_saves_use_a_per_process_temp_name(self, tmp_path):
+        """One shared ``.json.tmp`` let two savers rename each other's
+        half-written file into place."""
+        store = JobStore(tmp_path)
+        budget = load_account_budget(store, T0)
+        seen: list[str] = []
+        original = os.replace
+
+        def spy(src, dst):
+            seen.append(os.path.basename(src))
+            return original(src, dst)
+
+        with patch("linkedin_mcp_server.common_utils.os.replace", spy):
+            store.save(budget)
+            store.save(budget)
+        assert len(seen) == 2 and seen[0] != seen[1]
+        assert list(tmp_path.glob("*.tmp")) == []
+
+
+class TestHourlyCap:
+    """Forty LinkedIn-touching actions a rolling hour, from the shared ledger."""
+
+    def _budget_with(self, count: int, at: datetime) -> Job:
+        budget = Job(name=ACCOUNT_BUDGET_JOB, started_on=at.date())
+        for _ in range(count):
+            budget.ledger.record(at)
+        return budget
+
+    def test_the_default_cap_is_forty(self):
+        assert hourly_cap_resume_at(self._budget_with(39, T0), T0) is None
+        assert hourly_cap_resume_at(self._budget_with(40, T0), T0) is not None
+
+    def test_release_is_when_the_oldest_ages_out(self):
+        budget = self._budget_with(39, T0)
+        budget.ledger.record(T0 + timedelta(minutes=10))
+        now = T0 + timedelta(minutes=20)
+
+        resume = hourly_cap_resume_at(budget, now)
+
+        # 40 inside the hour; the slot frees when the oldest of them does.
+        assert resume == T0 + timedelta(seconds=HOURLY_WINDOW_SECONDS)
+        just_after = T0 + timedelta(seconds=HOURLY_WINDOW_SECONDS + 1)
+        assert hourly_cap_resume_at(budget, just_after) is None
+
+    def test_actions_older_than_an_hour_do_not_count(self):
+        budget = self._budget_with(40, T0)
+        assert hourly_cap_resume_at(budget, T0 + timedelta(hours=1, seconds=1)) is None
+
+    def test_a_backlog_beyond_the_cap_releases_one_slot_at_a_time(self):
+        """Fifty inside the hour: the eleventh-oldest expiring frees the slot,
+        not the oldest, because forty-nine would still be inside."""
+        budget = Job(name=ACCOUNT_BUDGET_JOB, started_on=T0.date())
+        for i in range(50):
+            budget.ledger.record(T0 + timedelta(seconds=i))
+
+        resume = hourly_cap_resume_at(budget, T0 + timedelta(minutes=30), cap=40)
+
+        assert resume == T0 + timedelta(seconds=10 + HOURLY_WINDOW_SECONDS)
+
+    def test_the_cap_is_not_a_strike(self, tmp_path):
+        store = JobStore(tmp_path)
+        budget = load_account_budget(store, T0)
+        for _ in range(40):
+            budget.ledger.record(T0)
+        store.save(budget)
+
+        assert hourly_cap_resume_at(budget, T0) is not None
+        assert read_account_cooldown(store).strikes == 0
+        assert cooldown_resume_at(store, T0) is None
+
+    def test_release_waits_for_as_many_slots_as_are_needed(self):
+        """A bunch that needs two must wait for the second-oldest to age out."""
+        budget = Job(name=ACCOUNT_BUDGET_JOB, started_on=T0.date())
+        for i in range(3):
+            budget.ledger.record(T0 + timedelta(minutes=i))
+        now = T0 + timedelta(minutes=30)
+
+        assert hourly_cap_resume_at(budget, now, cap=3, needed=1) == T0 + timedelta(
+            seconds=HOURLY_WINDOW_SECONDS
+        )
+        assert hourly_cap_resume_at(budget, now, cap=3, needed=2) == T0 + timedelta(
+            minutes=1, seconds=HOURLY_WINDOW_SECONDS
+        )
+        # One of headroom is enough for one, not for two.
+        assert hourly_cap_resume_at(budget, now, cap=4, needed=1) is None
+        assert hourly_cap_resume_at(budget, now, cap=4, needed=2) == T0 + timedelta(
+            seconds=HOURLY_WINDOW_SECONDS
+        )
+
+    def test_needing_more_than_the_cap_does_not_index_past_the_hour(self, monkeypatch):
+        """Reproduced: cap=3, needed=5 raised IndexError, as did cap=1,
+        needed=2 on an empty ledger. Reachable whenever HOURLY_ACTIONS_MAX
+        sits below one profile's cost."""
+        empty = Job(name=ACCOUNT_BUDGET_JOB, started_on=T0.date())
+        assert hourly_cap_resume_at(empty, T0, cap=1, needed=2) is None
+        assert seconds_until_hourly_release(empty, T0, needed=2) == 0.0
+
+        budget = Job(name=ACCOUNT_BUDGET_JOB, started_on=T0.date())
+        for i in range(3):
+            budget.ledger.record(T0 + timedelta(minutes=i))
+        now = T0 + timedelta(minutes=30)
+        # Past the last entry the answer is when the whole hour has drained.
+        assert hourly_cap_resume_at(budget, now, cap=3, needed=5) == T0 + timedelta(
+            minutes=2, seconds=HOURLY_WINDOW_SECONDS
+        )
+        monkeypatch.setenv(EnvironmentKeys.HOURLY_ACTIONS_MAX, "3")
+        assert seconds_until_hourly_release(budget, now, needed=5) == pytest.approx(
+            32 * 60
+        )
+
+    def test_headroom_is_what_the_hour_still_admits(self):
+        budget = self._budget_with(30, T0)
+        assert hourly_headroom(budget, T0) == 10
+        assert hourly_headroom(budget, T0, cap=25) == 0
+        assert hourly_headroom(budget, T0 + timedelta(hours=1, seconds=1)) == 40

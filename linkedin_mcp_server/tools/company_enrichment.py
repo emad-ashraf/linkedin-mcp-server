@@ -66,10 +66,14 @@ from linkedin_mcp_server.pacing import (
     Schedule,
     account_budget_in_use,
     bunch_searches_max,
+    hourly_actions_max,
+    hourly_headroom,
     load_account_budget,
     next_bunch_delay,
+    note_throttle_signal,
     request_arrived_at,
     schedule_ignored,
+    seconds_until_hourly_release,
     step_delay,
     working_hours_enforced,
 )
@@ -159,6 +163,9 @@ def register_company_enrichment_tools(
             error = errors.get("about", {})
             message = error.get("error_message") or "About section did not load."
             if error.get("error_type") == "rate_limit":
+                # The slug was resolved, so the company exists; an About
+                # that comes back as a shell is the session, not the page.
+                note_throttle_signal("empty_about")
                 raise RateLimitError(message)
             if _closed_target_filed(errors):
                 raise _BrowserGone(message, errors)
@@ -328,6 +335,30 @@ def register_company_enrichment_tools(
                     detail="Shared 24h action budget spent; refills gradually.",
                 )
 
+            # The rolling-hour cap, planned against rather than tripped over:
+            # the middleware lets this tool through on purpose, so a bunch
+            # that would run through the cap in its middle is cut to the
+            # headroom instead.
+            headroom = hourly_headroom(budget, now)
+            if headroom <= 0:
+                return _paced_return(
+                    served,
+                    0,
+                    "hourly_cap_reached",
+                    seconds_until_hourly_release(budget, now),
+                    detail=(
+                        "The account's rolling-hour cap is reached; it frees up "
+                        "as the hour's oldest actions age out."
+                    ),
+                )
+            if bunch_searches > headroom:
+                logger.info(
+                    "Clamping bunch_searches=%d to the hourly headroom %d",
+                    bunch_searches,
+                    headroom,
+                )
+                bunch_searches = headroom
+
             # From arrival at the middleware, not from here; see the same
             # computation in run_enrichment_bunch for the 210 s proxy deadline
             # a queued call can outlive before its own timeout has started.
@@ -404,6 +435,9 @@ def register_company_enrichment_tools(
                     # With nothing loaded, a filed rate limit is the whole answer,
                     # and it is a rate limit, not a dead browser.
                     if limit := _soft_rate_limit(result):
+                        # A search results page has no "gone" state to be
+                        # confused with; empty is throttled.
+                        note_throttle_signal("empty_search")
                         raise RateLimitError(limit)
                     errors = result.get("section_errors", {})
                     if _closed_target_filed(errors):
@@ -658,6 +692,9 @@ def register_company_enrichment_tools(
                 stopped, wait = "daily_budget_spent", budget.ledger.next_expiry(now)
             elif outstanding == 0:
                 stopped, wait = "all_done", None
+            elif hourly_headroom(budget, now) <= 0:
+                stopped = "hourly_cap_reached"
+                wait = seconds_until_hourly_release(budget, now)
             else:
                 wait = next_bunch_delay(
                     remaining, bunch_searches, now, pacing_schedule, rng
@@ -729,12 +766,36 @@ def register_company_enrichment_tools(
         token = account_budget_in_use.set(budget)
         try:
             needed = int(want_firmographics) + int(want_jobs)
+            # ``status`` after the view, which carries a status of its own for
+            # the cached record; the reason nothing was fetched is the answer.
             if budget.remaining_today(now) < needed:
                 return {
                     "company": company,
+                    **_firmographics_view(rec, "cache"),
                     "status": "daily_budget_spent",
                     "next_run_after_seconds": round(budget.ledger.next_expiry(now)),
+                }
+            if hourly_actions_max() < needed:
+                # No hour will ever admit both loads: configuration, not a wait.
+                return {
+                    "company": company,
                     **_firmographics_view(rec, "cache"),
+                    "status": "hourly_cap_below_cost",
+                    "detail": (
+                        f"{EnvironmentKeys.HOURLY_ACTIONS_MAX}="
+                        f"{hourly_actions_max()} is below the {needed} page "
+                        "loads this call needs. Raise it or leave out "
+                        "include_jobs."
+                    ),
+                }
+            if hourly_headroom(budget, now) < needed:
+                return {
+                    "company": company,
+                    **_firmographics_view(rec, "cache"),
+                    "status": "hourly_cap_reached",
+                    "next_run_after_seconds": round(
+                        seconds_until_hourly_release(budget, now, needed)
+                    ),
                 }
 
             extractor = extractor or await get_ready_extractor(

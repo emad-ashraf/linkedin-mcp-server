@@ -154,8 +154,8 @@ class EnvironmentKeys:
     # a long default is safe; open roles are the volatile signal, so a short one.
     COMPANY_FIRMOGRAPHICS_TTL_DAYS = "COMPANY_FIRMOGRAPHICS_TTL_DAYS"
     COMPANY_JOBS_TTL_DAYS = "COMPANY_JOBS_TTL_DAYS"
-    # Minimum gap between two tool calls, in seconds, jittered by +/-20%.
-    # 0 removes the spacing; see pacing.DEFAULT_TOOL_CALL_GAP for the default.
+    # Read minimum of the gap between two tool calls, in seconds; the other
+    # bounds scale with it. 0 removes the spacing; see pacing.READ_TOOL_CALL_GAP.
     TOOL_CALL_GAP_SECONDS = "TOOL_CALL_GAP_SECONDS"
     # How long a successful /feed/ probe stays trusted across owner starts, in
     # seconds; 0 probes on every start. See drivers/browser.py.
@@ -163,7 +163,8 @@ class EnvironmentKeys:
     # Pacing limits. Every one of these has a built-in default in ``pacing.py``
     # or ``scraping/extractor.py``; the variable replaces it per process, and a
     # process is one profile. See ``limits.py`` for the parse rules.
-    TOOL_CALL_GAP_JITTER = "TOOL_CALL_GAP_JITTER"
+    ACCOUNT_COOLDOWN_DISABLED = "ACCOUNT_COOLDOWN_DISABLED"
+    HOURLY_ACTIONS_MAX = "HOURLY_ACTIONS_MAX"
     DAILY_ACTIONS_MAX = "DAILY_ACTIONS_MAX"
     DAILY_ACTIONS_DEFAULT = "DAILY_ACTIONS_DEFAULT"
     DAILY_CAP_JITTER = "DAILY_CAP_JITTER"
