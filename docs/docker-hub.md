@@ -136,6 +136,7 @@ Use `$env:USERPROFILE\.linkedin-mcp` when constructing the host path outside JSO
 | `TOOL_CALL_GAP_SECONDS` | `5.0` | Minimum gap between two tool calls, in seconds, jittered by ±20% (`0` = no spacing). LinkedIn answers bursts of navigations with HTTP 429; this caps one client at roughly 12 page loads a minute. Tools answered from local disk never wait. |
 | `TOOL_CALL_GAP_JITTER` | `0.2` | ± fraction applied to `TOOL_CALL_GAP_SECONDS`. |
 | `NAV_DELAY_SECONDS` | `2` | Pause between page navigations inside one tool call, in seconds. |
+| `AUTH_PROBE_CACHE_SECONDS` | `1800` | How long a passed `/feed/` session check is reused across server starts with the same cookies, in seconds (`0` = check on every start). |
 | `DAILY_ACTIONS_MAX` | `150` | Ceiling on any enrichment job's `daily_cap`. Raising it raises detection exposure in step; the defaults are the deliberate ceiling. |
 | `DAILY_ACTIONS_DEFAULT` | `100` | `daily_cap` when a job does not set one. |
 | `DAILY_CAP_JITTER` | `0.15` | Fraction shaved off the daily cap at random each day. |

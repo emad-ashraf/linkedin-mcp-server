@@ -124,7 +124,8 @@ class TestExtractPage:
         assert result.error == {"issue_template_path": "/tmp/issue.md"}
 
     async def test_extract_page_raises_auth_error_for_account_picker(self, mock_page):
-        mock_page.goto = AsyncMock(side_effect=Exception("net::ERR_TOO_MANY_REDIRECTS"))
+        # Not a redirect loop: that one is throttling and reads no barrier.
+        mock_page.goto = AsyncMock(side_effect=Exception("net::ERR_ABORTED"))
         capture = _capture(mock_page)
 
         with (

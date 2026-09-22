@@ -15,6 +15,7 @@ from linkedin_mcp_server.core.exceptions import (
     AuthenticationError,
     ProxyConnectionError,
     RateLimitError,
+    TransientBarrierError,
 )
 from linkedin_mcp_server.scraping import session as session_module
 from linkedin_mcp_server.scraping.navigation import PageNavigator
@@ -583,8 +584,196 @@ class TestRememberMeRetriesOnlyOnce:
                 "https://www.linkedin.com/in/testuser/"
             )
 
-        assert mock_page.goto.await_count == 2
+        # Target, target again behind the prompt, then the /feed/ second look.
+        assert mock_page.goto.await_count == 3
         assert mock_resolve.await_count == 1
+
+
+class TestABarrierMidScrapeIsBelievedOnlyWhenSeenTwice:
+    """With the owner-start probe cached, the first LinkedIn request after a
+    restart is a scrape navigation, so this path needs the same second look
+    as the probe (issue #9)."""
+
+    FEED = "https://www.linkedin.com/feed/"
+    TARGET = "https://www.linkedin.com/in/testuser/"
+
+    def _no_prompt(self):
+        return patch(
+            "linkedin_mcp_server.scraping.navigation.resolve_remember_me_prompt",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+
+    async def test_a_barrier_that_clears_earns_the_target_one_more_load(
+        self, mock_page
+    ):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+
+        with (
+            self._no_prompt(),
+            patch(
+                "linkedin_mcp_server.scraping.navigation.detect_auth_barrier_quick",
+                new_callable=AsyncMock,
+                side_effect=["auth blocker URL: /checkpoint/lg/x", None, None],
+            ),
+        ):
+            await navigator._goto_with_auth_checks(self.TARGET)
+
+        urls = [call.args[0] for call in mock_page.goto.await_args_list]
+        assert urls == [self.TARGET, self.FEED, self.TARGET]
+        assert mock_page.listeners["framenavigated"] == []
+
+    async def test_a_barrier_seen_twice_raises(self, mock_page):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+
+        with (
+            self._no_prompt(),
+            patch(
+                "linkedin_mcp_server.scraping.navigation.detect_auth_barrier_quick",
+                new_callable=AsyncMock,
+                return_value="auth blocker URL: /checkpoint/lg/x",
+            ),
+            pytest.raises(AuthenticationError),
+        ):
+            await navigator._goto_with_auth_checks(self.TARGET)
+
+        urls = [call.args[0] for call in mock_page.goto.await_args_list]
+        assert urls == [self.TARGET, self.FEED]
+
+    async def test_a_barrier_on_the_retried_target_is_final(self, mock_page):
+        # Cleared on /feed/, back on the target: one second look, not a loop.
+        navigator = PageNavigator(ScrapingSession(mock_page))
+
+        with (
+            self._no_prompt(),
+            patch(
+                "linkedin_mcp_server.scraping.navigation.detect_auth_barrier_quick",
+                new_callable=AsyncMock,
+                side_effect=[
+                    "auth blocker URL: /checkpoint/lg/x",
+                    None,
+                    "auth blocker URL: /checkpoint/lg/x",
+                ],
+            ),
+            pytest.raises(AuthenticationError),
+        ):
+            await navigator._goto_with_auth_checks(self.TARGET)
+
+        urls = [call.args[0] for call in mock_page.goto.await_args_list]
+        assert urls == [self.TARGET, self.FEED, self.TARGET]
+
+    async def test_a_login_redirect_without_li_at_raises_at_once(self, mock_page):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+        mock_page.context.cookies = AsyncMock(return_value=[])
+        mock_page.url = "https://www.linkedin.com/login"
+
+        with (
+            self._no_prompt(),
+            patch(
+                "linkedin_mcp_server.scraping.navigation.detect_auth_barrier_quick",
+                new_callable=AsyncMock,
+                return_value="auth blocker URL: https://www.linkedin.com/login",
+            ),
+            pytest.raises(AuthenticationError),
+        ):
+            await navigator._goto_with_auth_checks(self.TARGET)
+
+        mock_page.goto.assert_awaited_once()
+
+    async def test_a_barrier_behind_a_failed_load_gets_the_same_look(self, mock_page):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+        mock_page.goto = AsyncMock(
+            side_effect=[Exception("net::ERR_ABORTED"), None, None]
+        )
+
+        with (
+            self._no_prompt(),
+            patch(
+                "linkedin_mcp_server.scraping.navigation.detect_auth_barrier",
+                new_callable=AsyncMock,
+                # The failure log reads it first, then the check, then the
+                # second look.
+                side_effect=[
+                    "auth blocker URL: /checkpoint/lg/x",
+                    "auth blocker URL: /checkpoint/lg/x",
+                    None,
+                ],
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.navigation.detect_auth_barrier_quick",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            await navigator._goto_with_auth_checks(self.TARGET)
+
+        urls = [call.args[0] for call in mock_page.goto.await_args_list]
+        assert urls == [self.TARGET, self.FEED, self.TARGET]
+
+    async def test_a_redirect_loop_reads_no_barrier(self, mock_page):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+        mock_page.goto = AsyncMock(side_effect=Exception("net::ERR_TOO_MANY_REDIRECTS"))
+
+        with (
+            self._no_prompt(),
+            patch(
+                "linkedin_mcp_server.scraping.navigation.detect_auth_barrier",
+                new_callable=AsyncMock,
+                return_value="auth blocker URL: /checkpoint/lg/x",
+            ),
+            pytest.raises(Exception, match="ERR_TOO_MANY_REDIRECTS") as excinfo,
+        ):
+            await navigator._goto_with_auth_checks(self.TARGET)
+
+        assert not isinstance(excinfo.value, AuthenticationError)
+        mock_page.goto.assert_awaited_once()
+
+    async def test_a_picker_only_the_full_read_sees_is_still_expiry(
+        self, mock_page, monkeypatch
+    ):
+        # Sighted by the full detector, so it has to be re-checked by the full
+        # detector: the quick one would call it cleared every time and the job
+        # readers would report a transient forever instead of a re-login.
+        monkeypatch.setattr(
+            "linkedin_mcp_server.core.auth.detect_auth_barrier_quick",
+            AsyncMock(return_value=None),
+        )
+        navigator = PageNavigator(ScrapingSession(mock_page))
+
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.navigation.detect_auth_barrier",
+                new_callable=AsyncMock,
+                return_value="auth barrier text: welcome back + join now",
+            ),
+            pytest.raises(AuthenticationError),
+        ):
+            await navigator._raise_if_auth_barrier(self.TARGET)
+
+    async def test_a_guarded_page_lost_to_a_cleared_barrier_is_not_expiry(
+        self, mock_page
+    ):
+        # The job readers call this after a suspicious reload and would read
+        # /feed/ as the list if it returned; it raises, but not as expiry.
+        navigator = PageNavigator(ScrapingSession(mock_page))
+
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.navigation.detect_auth_barrier",
+                new_callable=AsyncMock,
+                side_effect=["account picker: #rememberme-div", None],
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.navigation.detect_auth_barrier_quick",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            pytest.raises(TransientBarrierError, match="Retry the call"),
+        ):
+            await navigator._raise_if_auth_barrier(self.TARGET)
+
+        urls = [call.args[0] for call in mock_page.goto.await_args_list]
+        assert urls == [self.FEED]
 
 
 class TestWatchingNavigations:

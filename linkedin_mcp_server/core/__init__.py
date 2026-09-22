@@ -3,6 +3,9 @@
 from typing import TYPE_CHECKING
 
 from .auth import (
+    AUTH_COOKIE_NAMES,
+    auth_cookies,
+    barrier_confirmed,
     detect_auth_barrier,
     detect_auth_barrier_quick,
     is_logged_in,
@@ -18,6 +21,7 @@ from .exceptions import (
     ProxyConnectionError,
     RateLimitError,
     ScrapingError,
+    TransientBarrierError,
 )
 from .proxy_errors import (
     as_proxy_error,
@@ -51,9 +55,12 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
+    "AUTH_COOKIE_NAMES",
     "AuthenticationError",
     "BrowserManager",
+    "auth_cookies",
     "await_deferring_cancels",
+    "barrier_confirmed",
     "detect_auth_barrier",
     "detect_auth_barrier_quick",
     "ElementNotFoundError",
@@ -63,6 +70,7 @@ __all__ = [
     "ProxyConnectionError",
     "RateLimitError",
     "ScrapingError",
+    "TransientBarrierError",
     "as_proxy_error",
     "goto_reporting_proxy_errors",
     "is_proxy_error",

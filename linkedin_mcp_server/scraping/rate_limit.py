@@ -17,6 +17,12 @@ import logging
 import re
 
 from linkedin_mcp_server.config.loaders import EnvironmentKeys
+# The committed 429 and the redirect loop live in ``core.rate_limit_markers``,
+# where the auth probe can read them too; re-exported here for the navigator.
+from linkedin_mcp_server.core.rate_limit_markers import (
+    HTTP_TOO_MANY_REQUESTS as HTTP_TOO_MANY_REQUESTS,
+    REDIRECT_LOOP_NAV_FAILURE as REDIRECT_LOOP_NAV_FAILURE,
+)
 from linkedin_mcp_server.limits import env_float, env_int
 
 logger = logging.getLogger(__name__)
@@ -59,14 +65,6 @@ HTTP_STATUS_NAV_FAILURE = "ERR_HTTP_RESPONSE_CODE_FAILURE"
 # rather than on "too many requests". Bounded by a word boundary so a 429 in a
 # URL or a timestamp elsewhere on the page cannot stand in for the status.
 HTTP_STATUS_ON_INTERSTITIAL = re.compile(r"\b429\b")
-
-# The other shape of the same thing, and the reason `page.goto`'s return value
-# is no longer discarded: a 429 that Chromium *does* commit comes back as an
-# ordinary response. Measured against a local server answering 429, with and
-# without a body, under both `wait_until="domcontentloaded"` and `"commit"`:
-# `goto` returns rather than raising, `status` is 429 and `Retry-After`
-# survives on `headers`. No `wait_until` change is needed to see it.
-HTTP_TOO_MANY_REQUESTS = 429
 
 # Pause before a hard rate limit is reported, doubling per hit within one
 # scrape and jittered like every other deliberate pause here. Bounded well

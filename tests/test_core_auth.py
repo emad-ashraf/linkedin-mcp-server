@@ -9,9 +9,15 @@ from patchright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
-from linkedin_mcp_server.core.exceptions import AuthenticationError
+from linkedin_mcp_server.core import auth as auth_module
+from linkedin_mcp_server.core.exceptions import (
+    AuthenticationError,
+    NetworkError,
+    RateLimitError,
+)
 from linkedin_mcp_server.core.auth import (
     _REMEMBER_ME_CONTAINER_SELECTOR,
+    barrier_confirmed,
     detect_auth_barrier,
     detect_auth_barrier_quick,
     is_logged_in,
@@ -661,3 +667,91 @@ async def test_wait_for_manual_login_does_not_log_waiting_after_cookie(
         await wait_for_manual_login(page, timeout=0)
 
     assert "Still waiting for manual login" not in caplog.text
+
+
+def _reprobe_page(
+    *, url: str = "https://www.linkedin.com/checkpoint/lg/x"
+) -> MagicMock:
+    """A signed-in page showing a barrier, whose /feed/ re-load succeeds."""
+    page = MagicMock()
+    page.url = url
+    page.title = AsyncMock(return_value="LinkedIn")
+    page.goto = AsyncMock(return_value=None)
+    page.context.cookies = AsyncMock(
+        return_value=[{"name": "li_at", "value": "li-at-value"}]
+    )
+    found = MagicMock()
+    found.count = AsyncMock(return_value=0)
+    page.locator = MagicMock(return_value=found)
+    return page
+
+
+class TestBarrierConfirmed:
+    """The second look is one /feed/ load, paced, and classified like any other."""
+
+    @pytest.mark.asyncio
+    async def test_the_second_look_waits_five_to_ten_seconds(
+        self, monkeypatch, no_barrier_reprobe_delay
+    ):
+        # The suite zeroes the pause everywhere else; this is where it is real:
+        # the fixture hands back the module's own range, which is what is pinned.
+        monkeypatch.setattr(
+            auth_module, "_BARRIER_REPROBE_DELAY_RANGE", no_barrier_reprobe_delay
+        )
+        sleep = AsyncMock()
+        monkeypatch.setattr("linkedin_mcp_server.core.auth.asyncio.sleep", sleep)
+        page = _reprobe_page()
+
+        await barrier_confirmed(page, "auth blocker URL: /checkpoint/lg/x")
+
+        sleep.assert_awaited_once()
+        (pause,) = sleep.await_args_list[0].args
+        assert 5.0 <= pause <= 10.0
+
+    @pytest.mark.asyncio
+    async def test_a_429_on_the_second_look_is_a_rate_limit(self):
+        page = _reprobe_page()
+        response = MagicMock()
+        response.status = 429
+        page.goto = AsyncMock(return_value=response)
+        # The page still shows the barrier; a 429 must be read before it is.
+        detect = AsyncMock(return_value="auth blocker URL: /checkpoint/lg/x")
+
+        with pytest.raises(RateLimitError):
+            await barrier_confirmed(
+                page, "auth blocker URL: /checkpoint/lg/x", detect=detect
+            )
+
+        detect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_redirect_loop_on_the_second_look_is_throttling(self):
+        page = _reprobe_page()
+        page.goto = AsyncMock(side_effect=Exception("net::ERR_TOO_MANY_REDIRECTS"))
+        detect = AsyncMock(return_value="auth blocker URL: /checkpoint/lg/x")
+
+        with pytest.raises(NetworkError, match="redirect loop") as raised:
+            await barrier_confirmed(
+                page, "auth blocker URL: /checkpoint/lg/x", detect=detect
+            )
+
+        assert not isinstance(raised.value, AuthenticationError)
+        detect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_second_look_uses_the_detector_it_is_given(self):
+        # Sighted by the full read (body text), which the quick one cannot see:
+        # re-checking with the quick one would call every such picker cleared.
+        page = _reprobe_page(url="https://www.linkedin.com/in/testuser/")
+        page.evaluate = AsyncMock(
+            return_value="Welcome back. Sign in using another account"
+        )
+
+        assert (
+            await barrier_confirmed(
+                page,
+                "auth barrier text: welcome back + sign in using another account",
+                detect=detect_auth_barrier,
+            )
+            is True
+        )

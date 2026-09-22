@@ -17,6 +17,9 @@ def mock_page():
     page.wait_for_selector = AsyncMock()
     page.wait_for_function = AsyncMock()
     page.url = "https://www.linkedin.com/in/testuser/"
+    page.context.cookies = AsyncMock(
+        return_value=[{"name": "li_at", "value": "li-at-value"}]
+    )
     page.locator = MagicMock()
     # Default: no modals, no CAPTCHA
     mock_locator = MagicMock()

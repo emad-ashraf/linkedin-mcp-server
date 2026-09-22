@@ -12,11 +12,16 @@ import re
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core.auth import (
+    barrier_confirmed,
     detect_auth_barrier,
     detect_auth_barrier_quick,
     resolve_remember_me_prompt,
 )
-from linkedin_mcp_server.core.exceptions import AuthenticationError, RateLimitError
+from linkedin_mcp_server.core.exceptions import (
+    AuthenticationError,
+    RateLimitError,
+    TransientBarrierError,
+)
 from linkedin_mcp_server.core.humanize import humanize_after_nav
 from linkedin_mcp_server.core.proxy_errors import (
     raise_if_proxy_error,
@@ -33,6 +38,7 @@ from linkedin_mcp_server.scraping.rate_limit import (
     HTTP_STATUS_NAV_FAILURE,
     HTTP_STATUS_ON_INTERSTITIAL,
     HTTP_TOO_MANY_REQUESTS,
+    REDIRECT_LOOP_NAV_FAILURE,
     rate_limit_backoff_delay,
     rate_limit_backoff_max,
     rate_limit_backoff_max_doublings,
@@ -160,22 +166,35 @@ class PageNavigator:
             body_marker,
         )
 
-    async def _raise_if_auth_barrier(
+    async def _auth_barrier_cleared(
         self,
         url: str,
         *,
         navigation_error: Exception | None = None,
-    ) -> None:
-        """Raise an auth error when LinkedIn shows login/account-picker UI."""
+        confirm: bool = True,
+    ) -> bool:
+        """Raise on a confirmed auth barrier; say whether one cleared instead.
+
+        False when the page shows no barrier. True when it showed one that was
+        gone from a /feed/ re-load, in which case the page is now /feed/ and the
+        caller must navigate again rather than read on. ``confirm=False`` is
+        for a retry that has already had its second look.
+        """
         barrier = await detect_auth_barrier(self._session.page)
         if not barrier:
-            return
+            return False
 
         logger.warning(
             "Authentication barrier detected on %s: %s",
             redact_private_navigation_value(url),
             barrier,
         )
+        # Re-checked with the same detector that sighted it: a picker only the
+        # body text reveals would read as cleared to the quick one every time.
+        if confirm and not await barrier_confirmed(
+            self._session.page, barrier, detect=detect_auth_barrier
+        ):
+            return True
         message = (
             "LinkedIn requires interactive re-authentication. "
             "Run with --login and complete the account selection/sign-in flow."
@@ -183,6 +202,28 @@ class PageNavigator:
         if navigation_error is not None:
             raise AuthenticationError(message) from redacted_copy(navigation_error)
         raise AuthenticationError(message)
+
+    async def _raise_if_auth_barrier(
+        self,
+        url: str,
+        *,
+        navigation_error: Exception | None = None,
+    ) -> None:
+        """Raise when LinkedIn shows login/account-picker UI on the current page.
+
+        A barrier that clears on the /feed/ re-load is not an expired session
+        and must not rotate one, but the page this call was guarding is gone
+        with it, so it raises all the same -- as a
+        :class:`TransientBarrierError`, which the tool reports in these words
+        without touching the session.
+        """
+        if await self._auth_barrier_cleared(url, navigation_error=navigation_error):
+            raise TransientBarrierError(
+                f"A LinkedIn interstitial interrupted "
+                f"{redact_private_navigation_value(url)} and cleared on the "
+                f"next load. Retry the call; the saved LinkedIn session was "
+                f"not changed."
+            )
 
     async def _refusal_was_a_rate_limit(self) -> bool:
         """Read the status off the error page Chromium left in the tab.
@@ -249,8 +290,14 @@ class PageNavigator:
         *,
         wait_until: WaitUntil = "domcontentloaded",
         allow_remember_me: bool = True,
+        confirm_barrier: bool = True,
     ) -> None:
-        """Navigate to a LinkedIn page and fail fast on auth barriers."""
+        """Navigate to a LinkedIn page and fail fast on auth barriers.
+
+        A barrier is believed only when a /feed/ re-load shows it again
+        (``barrier_confirmed``); one that clears earns the target one more
+        attempt, with ``confirm_barrier=False`` so a second sighting is final.
+        """
         page = self._session.page
         hops: list[str] = []
         listener_registered = False
@@ -386,7 +433,21 @@ class PageNavigator:
                     },
                 )
                 await self._log_navigation_failure(url, wait_until, exc, hops)
-                await self._raise_if_auth_barrier(url, navigation_error=exc)
+                # No barrier is read off a redirect loop: it is throttling, and
+                # the route it stopped on is where the loop happened to break.
+                if REDIRECT_LOOP_NAV_FAILURE not in str(
+                    exc
+                ) and await self._auth_barrier_cleared(
+                    url, navigation_error=exc, confirm=confirm_barrier
+                ):
+                    unregister_navigation_listener()
+                    await self._goto_with_auth_checks(
+                        url,
+                        wait_until=wait_until,
+                        allow_remember_me=False,
+                        confirm_barrier=False,
+                    )
+                    return
                 # Re-raised as a redacted copy rather than the original: with a
                 # proxy configured, a driver error can quote the proxy URL, and
                 # everything downstream from here logs the exception -- the
@@ -437,6 +498,15 @@ class PageNavigator:
                 redact_private_navigation_value(url),
                 barrier,
             )
+            if confirm_barrier and not await barrier_confirmed(page, barrier):
+                unregister_navigation_listener()
+                await self._goto_with_auth_checks(
+                    url,
+                    wait_until=wait_until,
+                    allow_remember_me=False,
+                    confirm_barrier=False,
+                )
+                return
             raise AuthenticationError(
                 "LinkedIn requires interactive re-authentication. "
                 "Run with --login and complete the account selection/sign-in flow."

@@ -751,6 +751,7 @@ expect, on the order of one action a minute.
 | `TOOL_CALL_GAP_SECONDS` | `5` | Minimum gap between two tool calls (`0` disables) |
 | `TOOL_CALL_GAP_JITTER` | `0.2` | ± fraction on that gap |
 | `NAV_DELAY_SECONDS` | `2` | Pause between page navigations |
+| `AUTH_PROBE_CACHE_SECONDS` | `1800` | How long a passed `/feed/` session check is reused across server starts with the same cookies (`0` = check on every start) |
 | `RATE_LIMIT_RETRY_DELAY_SECONDS` | `5` | Base delay before retrying a soft 429 |
 | `RATE_LIMIT_RETRY_BUDGET` | `2` | Soft-429 retries per navigation |
 | `RATE_LIMIT_BACKOFF_DELAY_SECONDS` | `5` | Base of the hard-429 backoff |

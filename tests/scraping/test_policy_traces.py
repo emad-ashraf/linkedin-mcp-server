@@ -105,7 +105,9 @@ async def test_stabilization_trace_ignores_physical_logger_identity():
 
 
 async def test_full_auth_boundary_propagates_a_detected_barrier():
-    recorder = TraceRecorder("full-auth-barrier", {"boundary.auth"})
+    recorder = TraceRecorder(
+        "full-auth-barrier", {"boundary.auth", "boundary.barrier_confirmed"}
+    )
     clock = FakeClock(recorder)
     page = ScriptedPage(recorder)
     navigator = PageNavigator(ScrapingSession(cast(Any, page)))
@@ -116,7 +118,14 @@ async def test_full_auth_boundary_propagates_a_detected_barrier():
                 "https://www.linkedin.com/jobs/search/"
             )
 
-    assert recorder.events == [{"kind": "boundary.auth", "result": "account picker"}]
+    assert recorder.events == [
+        {"kind": "boundary.auth", "result": "account picker"},
+        {
+            "kind": "boundary.barrier_confirmed",
+            "barrier": "account picker",
+            "result": True,
+        },
+    ]
 
 
 async def test_trace_comparison_reports_a_unified_diff():

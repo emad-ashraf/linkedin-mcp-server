@@ -157,6 +157,9 @@ class EnvironmentKeys:
     # Minimum gap between two tool calls, in seconds, jittered by +/-20%.
     # 0 removes the spacing; see pacing.DEFAULT_TOOL_CALL_GAP for the default.
     TOOL_CALL_GAP_SECONDS = "TOOL_CALL_GAP_SECONDS"
+    # How long a successful /feed/ probe stays trusted across owner starts, in
+    # seconds; 0 probes on every start. See drivers/browser.py.
+    AUTH_PROBE_CACHE_SECONDS = "AUTH_PROBE_CACHE_SECONDS"
     # Pacing limits. Every one of these has a built-in default in ``pacing.py``
     # or ``scraping/extractor.py``; the variable replaces it per process, and a
     # process is one profile. See ``limits.py`` for the parse rules.

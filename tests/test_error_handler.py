@@ -12,6 +12,7 @@ from linkedin_mcp_server.core.exceptions import (
     ProxyConnectionError,
     RateLimitError,
     ScrapingError,
+    TransientBarrierError,
 )
 from linkedin_mcp_server.error_handler import raise_tool_error
 from linkedin_mcp_server.exceptions import (
@@ -273,6 +274,24 @@ def test_proxy_error_skips_issue_diagnostics(monkeypatch):
 
     with pytest.raises(ToolError):
         raise_tool_error(ProxyConnectionError("proxy gate:7000 is unreachable"))
+
+
+def test_transient_barrier_keeps_its_own_words_and_files_no_issue(monkeypatch):
+    # It subclasses NetworkError, so the specific branch has to come first;
+    # otherwise the user is told to check a connection that is fine, under an
+    # issue footer for something that is not a bug.
+    monkeypatch.setattr(
+        "linkedin_mcp_server.error_handler.build_issue_diagnostics",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("diagnostics should not run")
+        ),
+    )
+    advice = "A LinkedIn interstitial cleared on the next load. Retry the call."
+
+    with pytest.raises(ToolError) as raised:
+        raise_tool_error(TransientBarrierError(advice))
+
+    assert str(raised.value) == advice
 
 
 def test_invalid_reference_surfaces_the_correction_verbatim():

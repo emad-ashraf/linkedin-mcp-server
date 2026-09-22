@@ -27,6 +27,7 @@ from linkedin_mcp_server.core.exceptions import (
     ProxyConnectionError,
     RateLimitError,
     ScrapingError,
+    TransientBarrierError,
 )
 
 from linkedin_mcp_server.exceptions import (
@@ -248,6 +249,14 @@ def raise_tool_error(exception: Exception, context: str = "") -> NoReturn:
         # Ahead of NetworkError, which it subclasses. No issue diagnostics: a
         # proxy that is down or misconfigured is not a bug worth reporting.
         logger.warning("Proxy error%s: %s", ctx, exception)
+        raise ToolError(str(exception)) from exception
+
+    elif isinstance(exception, TransientBarrierError):
+        # Ahead of NetworkError, which it subclasses. Its own words, and no
+        # issue diagnostics: an interstitial that cleared is neither a
+        # connection problem nor a bug, and "check your connection" would send
+        # the user the wrong way.
+        logger.warning("Transient auth barrier%s: %s", ctx, exception)
         raise ToolError(str(exception)) from exception
 
     elif isinstance(exception, NetworkError):

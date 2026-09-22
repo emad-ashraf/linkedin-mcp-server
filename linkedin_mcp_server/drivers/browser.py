@@ -7,19 +7,29 @@ automatic profile persistence.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from collections.abc import Coroutine
 from typing import Any, TypeVar
 
 from linkedin_mcp_server.common_utils import harden_linkedin_tree, secure_mkdir
+from linkedin_mcp_server.core.rate_limit_markers import (
+    HTTP_TOO_MANY_REQUESTS,
+    REDIRECT_LOOP_NAV_FAILURE,
+)
 from linkedin_mcp_server.core import (
+    AUTH_COOKIE_NAMES,
     AuthenticationError,
     BrowserManager,
     NetworkError,
+    RateLimitError,
+    auth_cookies,
     await_deferring_cancels,
+    barrier_confirmed,
     detect_auth_barrier_quick,
     detect_rate_limit,
     goto_reporting_proxy_errors,
@@ -35,6 +45,7 @@ from linkedin_mcp_server.core import (
 from linkedin_mcp_server.browser_launch import build_launch_options, describe_launch
 from linkedin_mcp_server.common_utils import utcnow_iso
 from linkedin_mcp_server.config import get_config
+from linkedin_mcp_server.config.loaders import EnvironmentKeys
 from linkedin_mcp_server.debug_trace import record_page_trace
 from linkedin_mcp_server.debug_utils import stabilize_navigation
 from linkedin_mcp_server.exceptions import (
@@ -43,6 +54,7 @@ from linkedin_mcp_server.exceptions import (
     BrowserShutdownUnconfirmedError,
     ProfileRootRefusedError,
 )
+from linkedin_mcp_server.limits import env_int
 from linkedin_mcp_server.process_tree import (
     release_browser_guardian,
     start_browser_guardian,
@@ -54,12 +66,14 @@ from linkedin_mcp_server.session_state import (
     clear_runtime_profile,
     get_runtime_id,
     get_source_profile_dir,
+    load_auth_probe,
     load_runtime_state,
     load_source_state,
     portable_cookie_path,
     profile_exists as session_profile_exists,
     runtime_profile_dir,
     runtime_storage_state_path,
+    write_auth_probe,
     write_runtime_state,
 )
 
@@ -68,6 +82,7 @@ logger = logging.getLogger(__name__)
 
 # Default persistent profile directory
 DEFAULT_PROFILE_DIR = Path.home() / ".linkedin-mcp" / "profile"
+DEFAULT_AUTH_PROBE_CACHE_SECONDS = 1800
 # Global browser instance (singleton)
 _browser: BrowserManager | None = None
 _browser_cookie_export_path: Path | None = None
@@ -199,11 +214,19 @@ async def _feed_auth_succeeds(
     finish loading.
     """
     try:
-        await goto_reporting_proxy_errors(
+        response = await goto_reporting_proxy_errors(
             browser.page,
             "https://www.linkedin.com/feed/",
             wait_until="domcontentloaded",
         )
+        if response is not None and response.status == HTTP_TOO_MANY_REQUESTS:
+            # Throttling, not expiry, and checked before anything reads the
+            # page: a 429 on /feed/ inside the probe rotated a live profile
+            # twice on 2026-09-17.
+            raise RateLimitError(
+                "LinkedIn rate-limited /feed/ (HTTP 429). The saved LinkedIn "
+                "session was not changed; wait before retrying."
+            )
         await stabilize_navigation("feed navigation", logger)
         await record_page_trace(
             browser.page,
@@ -227,9 +250,9 @@ async def _feed_auth_succeeds(
                 extra={"barrier": barrier},
             )
             await _log_feed_failure_context(browser, barrier)
-            return False
+            return not await barrier_confirmed(browser.page, barrier)
         return True
-    except NetworkError:
+    except (NetworkError, RateLimitError):
         # Already classified: the remember-me retries above run inside this
         # try, and the inner call has done the probing, tracing and logging
         # below once. Letting it fall through re-probed the prompt on a page
@@ -256,12 +279,19 @@ async def _feed_auth_succeeds(
                 },
             )
             return await _feed_auth_succeeds(browser, allow_remember_me=False)
+        detail = redact_proxy_credentials(f"{type(exc).__name__}: {exc}")
+        if REDIRECT_LOOP_NAV_FAILURE in str(exc):
+            # Throttling's other shape. The loop can pass through an auth
+            # route, so the URL it stops on is not evidence of anything.
+            raise NetworkError(
+                f"/feed/ ended in a redirect loop ({detail}), which LinkedIn "
+                f"uses to throttle. The saved LinkedIn session was not changed."
+            ) from exc
         # A failed navigation still leaves a URL and a title behind, and the
         # quick check reads only those. LinkedIn may have committed a redirect
         # to /login and merely missed the load event, which is real evidence
         # about the session and must outrank the proxy explanation below.
         barrier = await detect_auth_barrier_quick(browser.page)
-        detail = redact_proxy_credentials(f"{type(exc).__name__}: {exc}")
         await record_page_trace(
             browser.page,
             "feed-navigation-error",
@@ -272,7 +302,7 @@ async def _feed_auth_succeeds(
         # disk and the log is what users paste into issue reports.
         await _log_feed_failure_context(browser, detail)
         if barrier is not None:
-            return False
+            return not await barrier_confirmed(browser.page, barrier)
         # Nothing loaded and no barrier, so nothing proves the session is
         # dead -- and with a proxy in front, the most likely cause is the
         # proxy. Wrong credentials in particular produce no proxy error code
@@ -337,6 +367,42 @@ async def _close_holding_back_cancels(browser: BrowserManager) -> tuple[bool, bo
     return await await_deferring_cancels(browser.close())
 
 
+def _cookie_fingerprint(cookies: dict[str, str]) -> str:
+    """A hash of the auth cookies, so the record never holds a cookie value."""
+    material = "\n".join(cookies.get(name, "") for name in AUTH_COOKIE_NAMES)
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def _probe_still_trusted(cookies: dict[str, str]) -> bool:
+    """Whether the last successful /feed/ probe still vouches for these cookies.
+
+    An owner start used to load /feed/ every time, and under lease contention
+    that is a start every few minutes on the same session, each one a chance
+    to meet an interstitial. A probe that passed inside the window with the
+    same ``li_at`` and ``JSESSIONID`` is as good as a fresh one; a login
+    changes both, so the record cannot vouch for cookies it never saw.
+    """
+    ttl = env_int(
+        EnvironmentKeys.AUTH_PROBE_CACHE_SECONDS, DEFAULT_AUTH_PROBE_CACHE_SECONDS
+    )
+    if ttl <= 0 or "li_at" not in cookies:
+        return False
+    record = load_auth_probe()
+    if not record or record.get("cookie_fingerprint") != _cookie_fingerprint(cookies):
+        return False
+    try:
+        verified_at = datetime.fromisoformat(
+            str(record.get("verified_at")).replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False
+    if verified_at.tzinfo is None:
+        # Subtracting a naive time from an aware one raises TypeError.
+        return False
+    age = (datetime.now(UTC) - verified_at).total_seconds()
+    return 0 <= age <= ttl
+
+
 async def _authenticate_existing_profile(
     profile_dir: Path,
     *,
@@ -350,11 +416,20 @@ async def _authenticate_existing_profile(
     )
     try:
         await browser.start()
-        if not await _feed_auth_succeeds(browser):
+        if _probe_still_trusted(await auth_cookies(browser.page)):
+            # On purpose the page stays on about:blank: the first tool call
+            # navigates, and its own barrier check has the same second look.
+            logger.info(
+                "Skipping the /feed/ probe: verified recently with these cookies"
+            )
+        elif not await _feed_auth_succeeds(browser):
             raise AuthenticationError(
                 f"Stored runtime profile is invalid: {profile_dir}. "
                 f"Run with --login to refresh the source session.{proxy_hint()}"
             )
+        else:
+            # Read again: the probe itself can rotate JSESSIONID.
+            write_auth_probe(_cookie_fingerprint(await auth_cookies(browser.page)))
         browser.is_authenticated = True
         return browser
     except BaseException as exc:

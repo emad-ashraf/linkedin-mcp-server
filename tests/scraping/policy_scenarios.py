@@ -147,6 +147,12 @@ async def boundaries(
         recorder.record("boundary.auth", result=auth_result)
         return auth_result
 
+    async def confirmed(_page: Any, barrier: str, *, detect: Any = None) -> bool:
+        # The second look at a barrier is a /feed/ load of its own; here it
+        # stands, so a detected barrier propagates the way it always did.
+        recorder.record("boundary.barrier_confirmed", barrier=barrier, result=True)
+        return True
+
     async def remember(_page: Any) -> bool:
         return False
 
@@ -206,6 +212,7 @@ async def boundaries(
         patch.object(navigation_module, "record_page_trace", trace),
         patch.object(navigation_module, "detect_auth_barrier_quick", auth_quick),
         patch.object(navigation_module, "detect_auth_barrier", auth),
+        patch.object(navigation_module, "barrier_confirmed", confirmed),
         patch.object(navigation_module, "resolve_remember_me_prompt", remember),
         patch.object(navigation_module, "stabilize_navigation", stabilize),
         # Every binding of each shared boundary, because the workflows that

@@ -50,6 +50,15 @@ class NetworkError(LinkedInScraperException):
     pass
 
 
+class TransientBarrierError(NetworkError):
+    """An auth interstitial interrupted a page and cleared on the next load.
+
+    Not expiry, so not an ``AuthenticationError``; not a connection problem
+    either, so the tool layer shows this message rather than the generic
+    network one, and files no issue diagnostics for it.
+    """
+
+
 class ProxyConnectionError(NetworkError):
     """Raised when the configured proxy cannot carry the request.
 

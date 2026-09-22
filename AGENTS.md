@@ -66,7 +66,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   `source-state.json`, `profile.lock`, `profile.handoff`, `profile.holder`,
   `runtime-profiles/` and every `invalid-state-*` live one level *above*
   `USER_DATA_DIR`, so the emptiness of the profile says nothing about what a
-  rotation takes with it.
+  rotation takes with it. `auth-probe.json` sits there too, holding the time of
+  the last passed `/feed/` probe and a hash of the cookies it saw; it is not a
+  session artifact, so a rotation leaves it behind and the next login's new
+  `li_at` stops matching it.
 - **Expand and resolve together, always.** Doing one without the other lets a
   symlink move the profile out of one directory while its sidecars come from
   another. Use `session_state.canonical()`.

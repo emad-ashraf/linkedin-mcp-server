@@ -9,6 +9,7 @@ import pytest
 from linkedin_mcp_server.profile_claim import ensure_profile_claim
 from linkedin_mcp_server.session_state import (
     _native_machine_win32,
+    auth_probe_path,
     clear_auth_state,
     get_runtime_id,
     load_runtime_state,
@@ -22,9 +23,25 @@ from linkedin_mcp_server.session_state import (
     runtime_state_path,
     runtime_storage_state_path,
     source_state_path,
+    load_auth_probe,
+    write_auth_probe,
     write_runtime_state,
     write_source_state,
 )
+
+
+def test_auth_probe_record_sits_beside_source_state(isolate_profile_dir):
+    write_auth_probe("abc", isolate_profile_dir)
+
+    record = load_auth_probe(isolate_profile_dir)
+
+    assert (
+        auth_probe_path(isolate_profile_dir).parent
+        == source_state_path(isolate_profile_dir).parent
+    )
+    assert record is not None
+    assert record["cookie_fingerprint"] == "abc"
+    assert record["verified_at"].endswith("Z")
 
 
 def test_write_source_state_creates_generation(monkeypatch, isolate_profile_dir):
@@ -557,6 +574,19 @@ class TestRotateSourceProfile:
             "runtime-profiles",
         }
 
+    def test_leaves_the_probe_record_behind(self, isolate_profile_dir):
+        # Not a session artifact: the next login issues a new li_at, so the
+        # fingerprint stops matching on its own. Nothing new is moved.
+        profile_dir = isolate_profile_dir
+        _seed_session(profile_dir)
+        write_auth_probe("abc", profile_dir)
+
+        backup = rotate_source_profile(profile_dir)
+
+        assert backup is not None
+        assert auth_probe_path(profile_dir).exists()
+        assert not (backup / "auth-probe.json").exists()
+
     def test_new_profile_does_not_inherit_the_fingerprint(self, isolate_profile_dir):
         """The point of rotating: Chromium mints machine_id once per profile
         directory, so reusing the directory hands LinkedIn one device identity
@@ -658,6 +688,15 @@ class TestClearAuthState:
 
         assert quarantine_dirs(profile_dir) == []
         assert not profile_dir.exists()
+
+    def test_removes_the_probe_record(self, isolate_profile_dir):
+        profile_dir = isolate_profile_dir
+        _seed_session(profile_dir)
+        write_auth_probe("abc", profile_dir)
+
+        assert clear_auth_state(profile_dir) is True
+
+        assert not auth_probe_path(profile_dir).exists()
 
 
 class TestRestoreSourceProfile:

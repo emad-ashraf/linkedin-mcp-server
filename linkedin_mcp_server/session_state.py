@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 _SOURCE_STATE_FILE = "source-state.json"
 _RUNTIME_STATE_FILE = "runtime-state.json"
+_AUTH_PROBE_FILE = "auth-probe.json"
 _RUNTIME_PROFILES_DIR = "runtime-profiles"
 
 # Prefix of the timestamped directories retired auth state is moved into.
@@ -107,6 +108,16 @@ def portable_cookie_path(source_profile_dir: Path | None = None) -> Path:
 def source_state_path(source_profile_dir: Path | None = None) -> Path:
     """Return the source session metadata path."""
     return auth_root_dir(source_profile_dir) / _SOURCE_STATE_FILE
+
+
+def auth_probe_path(source_profile_dir: Path | None = None) -> Path:
+    """Return the path of the last successful /feed/ probe's record.
+
+    Deliberately not in ``_auth_state_targets``: a rotation leaves it behind,
+    and a login that follows issues a new ``li_at``, so the fingerprint no
+    longer matches and the record is simply ignored.
+    """
+    return auth_root_dir(source_profile_dir) / _AUTH_PROBE_FILE
 
 
 def runtime_profiles_root(source_profile_dir: Path | None = None) -> Path:
@@ -613,6 +624,25 @@ def write_source_state(source_profile_dir: Path | None = None) -> SourceState:
     )
     _write_json(source_state_path(profile_dir), asdict(state))
     return state
+
+
+def load_auth_probe(source_profile_dir: Path | None = None) -> dict[str, Any] | None:
+    """Load the last successful /feed/ probe's record if present."""
+    return _load_json(auth_probe_path(source_profile_dir))
+
+
+def write_auth_probe(
+    cookie_fingerprint: str, source_profile_dir: Path | None = None
+) -> None:
+    """Record that /feed/ just loaded signed in with these cookies."""
+    _write_json(
+        auth_probe_path(source_profile_dir),
+        {
+            "version": 1,
+            "verified_at": utcnow_iso(),
+            "cookie_fingerprint": cookie_fingerprint,
+        },
+    )
 
 
 def load_runtime_state(
@@ -1182,8 +1212,13 @@ def clear_auth_state(source_profile_dir: Path | None = None) -> bool:
     with _exclusive_profile(profile_dir, action="clearing the stored session"):
         # Quarantines hold previous sessions' cookies, so a logout that left them
         # behind would not be the "clear all stored auth state" the CLI
-        # advertises.
-        targets = _auth_state_targets(profile_dir) + quarantine_dirs(profile_dir)
+        # advertises. The probe record holds only a hash, but it is about the
+        # session being cleared, so it goes too.
+        targets = (
+            _auth_state_targets(profile_dir)
+            + quarantine_dirs(profile_dir)
+            + [auth_probe_path(profile_dir)]
+        )
 
         success = True
         for target in targets:
