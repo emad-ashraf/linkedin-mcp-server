@@ -24,6 +24,12 @@ class AuthenticationError(LinkedInScraperException):
     pass
 
 
+class SecurityChallengeError(LinkedInScraperException):
+    """LinkedIn requires interactive identity or account verification."""
+
+    pass
+
+
 class RateLimitError(LinkedInScraperException):
     """Raised when rate limiting is detected."""
 

@@ -12,7 +12,7 @@ import asyncio
 import datetime
 import inspect
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -41,6 +41,14 @@ from linkedin_mcp_server.daemon_proxy import (
     DaemonProxyBackend,
     create_proxy_provider,
 )
+from linkedin_mcp_server.core.exceptions import (
+    AuthenticationError,
+    ProfileNotFoundError,
+    RateLimitError,
+    ScrapingError,
+    SecurityChallengeError,
+)
+from linkedin_mcp_server.outcomes import OUTCOME_KEY, OutcomeMiddleware
 
 
 def _backend(attachment: Attachment, tmp_path: Path) -> DaemonProxyBackend:
@@ -850,6 +858,40 @@ class TestServingTheOwnersTools:
         assert result.structured_content == {"the": "structured half"}
         assert any("the text half" in getattr(c, "text", "") for c in result.content)
 
+    @pytest.mark.parametrize(
+        ("error_factory", "code"),
+        [
+            (
+                lambda: SecurityChallengeError("account verification required"),
+                "challenge_required",
+            ),
+            (lambda: AuthenticationError("sign in again"), "reauth_required"),
+            (lambda: RateLimitError("wait before retrying"), "rate_limited"),
+            (lambda: ProfileNotFoundError("the member is gone"), "not_found"),
+            (lambda: TimeoutError("the provider deadline expired"), "timeout"),
+            (lambda: ScrapingError("the provider response failed"), "provider_error"),
+        ],
+    )
+    async def test_a_round_trip_preserves_every_typed_provider_outcome(
+        self, error_factory: Callable[[], Exception], code: str
+    ):
+        owner = FastMCP("owner", mask_error_details=True)
+        owner.add_middleware(OutcomeMiddleware())
+
+        @owner.tool
+        async def failing() -> str:
+            raise error_factory()
+
+        proxy = FastMCP("proxy", providers=[ProxyProvider(lambda: ProxyClient(owner))])
+
+        async with Client(proxy) as client:
+            result = await client.call_tool("failing", {}, raise_on_error=False)
+
+        assert result.is_error is True
+        assert result.meta == {OUTCOME_KEY: {"v": 1, "code": code}}
+        text = "\n".join(getattr(content, "text", "") for content in result.content)
+        assert text not in ("", "Error calling tool 'failing'")
+
     async def test_the_owners_tool_schema_survives_the_hop(self):
         # A client picks tools by title and annotations, so losing them changes
         # which tool an agent chooses even though every call still works.
@@ -1388,6 +1430,35 @@ class TestRepeatingOnlyWhatIsSafe:
 
         assert attempts == 1
 
+    async def test_exhausted_owner_recovery_is_a_typed_provider_error(self, _alone):
+        """The outer public boundary classifies an unavailable shared owner."""
+        from linkedin_mcp_server.daemon_proxy import (
+            FrontendOwnerRecoveryMiddleware,
+            OwnerUnreachableError,
+        )
+
+        backend, failed = _alone
+        context = self._context(read_only=True)
+
+        async def unreachable(context: Any) -> ToolResult:
+            raise OwnerUnreachableError(
+                instance_id=failed,
+                nothing_was_sent=True,
+                cause=httpx.ConnectError("gone"),
+            )
+
+        recovery = FrontendOwnerRecoveryMiddleware(backend)
+
+        async def exhausted(context: Any) -> ToolResult:
+            return await recovery.on_call_tool(context, unreachable)
+
+        result = await OutcomeMiddleware().on_call_tool(context, exhausted)
+
+        assert result.is_error is True
+        assert result.meta == {OUTCOME_KEY: {"v": 1, "code": "provider_error"}}
+        assert isinstance(result.content[0], mt.TextContent)
+        assert "shared browser owner" in result.content[0].text
+
     async def test_a_failure_from_something_else_is_left_alone(self, _recovering):
         # Only an unreachable owner is this middleware's business. Swallowing or
         # retrying anything else would hide a real tool error behind a recovery.
@@ -1899,6 +1970,7 @@ class TestRecoveringThroughTheWholeProxy:
             )
 
         assert result.is_error is True
+        assert result.meta == {OUTCOME_KEY: {"v": 1, "code": "provider_error"}}
         assert result.structured_content is not None
         assert result.structured_content["status"] == "outcome_unknown"
         assert result.structured_content["retry_safe"] is False
@@ -1950,6 +2022,7 @@ class TestRecoveringThroughTheWholeProxy:
             )
 
         assert result.is_error is True
+        assert result.meta == {OUTCOME_KEY: {"v": 1, "code": "provider_error"}}
         assert result.structured_content is not None, (
             "the owner loss reached the client as a failure carrying nothing"
         )

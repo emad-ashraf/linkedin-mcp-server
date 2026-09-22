@@ -11,6 +11,7 @@ from .exceptions import (
     ProxyConnectionError,
     RateLimitError,
     ScrapingError,
+    SecurityChallengeError,
     TransientBarrierError,
 )
 
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
         detect_auth_barrier,
         detect_auth_barrier_quick,
         is_logged_in,
+        is_security_challenge_url,
         resolve_remember_me_prompt,
         wait_for_manual_login,
     )
@@ -51,6 +53,7 @@ _LAZY_EXPORTS = {
     "detect_auth_barrier": ".auth",
     "detect_auth_barrier_quick": ".auth",
     "is_logged_in": ".auth",
+    "is_security_challenge_url": ".auth",
     "resolve_remember_me_prompt": ".auth",
     "wait_for_manual_login": ".auth",
     "BrowserManager": ".browser",
@@ -103,6 +106,7 @@ __all__ = [
     "ProxyConnectionError",
     "RateLimitError",
     "ScrapingError",
+    "SecurityChallengeError",
     "TransientBarrierError",
     "as_proxy_error",
     "goto_reporting_proxy_errors",
@@ -115,6 +119,7 @@ __all__ = [
     "detect_rate_limit",
     "handle_modal_close",
     "is_logged_in",
+    "is_security_challenge_url",
     "resolve_remember_me_prompt",
     "scroll_to_bottom",
     "wait_for_manual_login",

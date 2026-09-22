@@ -16,11 +16,13 @@ from linkedin_mcp_server.core.auth import (
     barrier_confirmed,
     detect_auth_barrier,
     detect_auth_barrier_quick,
+    is_security_challenge_url,
     resolve_remember_me_prompt,
 )
 from linkedin_mcp_server.core.exceptions import (
     AuthenticationError,
     RateLimitError,
+    SecurityChallengeError,
     TransientBarrierError,
 )
 from linkedin_mcp_server.core.humanize import humanize_after_nav
@@ -50,6 +52,22 @@ from linkedin_mcp_server.scraping.rate_limit import (
 from linkedin_mcp_server.scraping.session import ScrapingSession
 
 logger = logging.getLogger(__name__)
+
+
+def _confirmed_auth_barrier(current_url: str) -> Exception:
+    if is_security_challenge_url(current_url):
+        # Keep the existing cross-session safety pause, but do not call the
+        # challenge a rate limit: clients have different policy for the two.
+        note_throttle_signal("checkpoint")
+        return SecurityChallengeError(
+            "LinkedIn requires interactive security verification. Complete the "
+            "checkpoint, captcha, or identity challenge before continuing."
+        )
+    return AuthenticationError(
+        "LinkedIn requires interactive re-authentication. "
+        "Run with --login and complete the account selection/sign-in flow."
+    )
+
 
 WaitUntil = Literal["commit", "domcontentloaded", "load", "networkidle"]
 
@@ -198,13 +216,10 @@ class PageNavigator:
             self._session.page, barrier, detect=detect_auth_barrier
         ):
             return True
-        message = (
-            "LinkedIn requires interactive re-authentication. "
-            "Run with --login and complete the account selection/sign-in flow."
-        )
+        error = _confirmed_auth_barrier(self._session.page.url)
         if navigation_error is not None:
-            raise AuthenticationError(message) from redacted_copy(navigation_error)
-        raise AuthenticationError(message)
+            raise error from redacted_copy(navigation_error)
+        raise error
 
     async def _raise_if_auth_barrier(
         self,
@@ -535,10 +550,7 @@ class PageNavigator:
                     confirm_barrier=False,
                 )
                 return
-            raise AuthenticationError(
-                "LinkedIn requires interactive re-authentication. "
-                "Run with --login and complete the account selection/sign-in flow."
-            )
+            raise _confirmed_auth_barrier(page.url)
         finally:
             unregister_navigation_listener()
 

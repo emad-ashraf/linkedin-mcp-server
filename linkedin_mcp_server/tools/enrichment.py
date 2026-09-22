@@ -32,6 +32,7 @@ from linkedin_mcp_server.core.exceptions import (
     AuthenticationError,
     RateLimitError,
     ScrapingError,
+    SecurityChallengeError,
 )
 from linkedin_mcp_server.config.loaders import EnvironmentKeys
 from linkedin_mcp_server.exceptions import ActionLimitError
@@ -606,6 +607,15 @@ def register_enrichment_tools(
                         gathered=gathered,
                         detail=str(e),
                     )
+                except SecurityChallengeError:
+                    # A checkpoint applies to the account, not this profile.
+                    # Keep the untouched queue entry and let the outer MCP
+                    # boundary expose challenge_required to the caller. The
+                    # navigation that revealed it still counts as one action.
+                    budget.ledger.record(now)
+                    store.save(job)
+                    store.save(budget)
+                    raise
                 except (RateLimitError, AuthenticationError) as e:
                     # Neither consumes the queue entry -- the profile was never
                     # read. A rate limit means back off; an expired session means

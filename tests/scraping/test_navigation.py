@@ -17,6 +17,7 @@ from linkedin_mcp_server.core.exceptions import (
     AuthenticationError,
     ProxyConnectionError,
     RateLimitError,
+    SecurityChallengeError,
     TransientBarrierError,
 )
 from linkedin_mcp_server.exceptions import ActionLimitError
@@ -613,6 +614,25 @@ class TestABarrierMidScrapeIsBelievedOnlyWhenSeenTwice:
             new_callable=AsyncMock,
             return_value=False,
         )
+
+    async def test_a_confirmed_checkpoint_is_a_security_challenge(self, mock_page):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+        mock_page.url = "https://www.linkedin.com/checkpoint/challenge/"
+
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.navigation.detect_auth_barrier",
+                new_callable=AsyncMock,
+                return_value="auth blocker URL: /checkpoint/challenge/",
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.navigation.barrier_confirmed",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            pytest.raises(SecurityChallengeError, match="verification"),
+        ):
+            await navigator._auth_barrier_cleared(self.TARGET)
 
     async def test_a_barrier_that_clears_earns_the_target_one_more_load(
         self, mock_page

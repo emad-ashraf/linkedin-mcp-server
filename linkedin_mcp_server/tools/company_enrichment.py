@@ -58,6 +58,7 @@ from linkedin_mcp_server.core.exceptions import (
     AuthenticationError,
     RateLimitError,
     ScrapingError,
+    SecurityChallengeError,
 )
 from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
 from linkedin_mcp_server.error_handler import raise_tool_error
@@ -533,6 +534,13 @@ def register_company_enrichment_tools(
                         return _browser_unavailable(e)
                     except ActionLimitError as e:
                         return _limit_exceeded(e)
+                    except SecurityChallengeError:
+                        # The navigation happened, but the checkpoint is
+                        # account-wide. Save the charge and stop before the
+                        # generic per-company failure path can continue.
+                        budget.ledger.record(now)
+                        jobs.save(budget)
+                        raise
                     except RateLimitError as e:
                         logger.warning("Rate limited during company enrichment: %s", e)
                         # The refused navigation is one LinkedIn counted too.
@@ -651,6 +659,10 @@ def register_company_enrichment_tools(
                         return _browser_unavailable(e)
                     except ActionLimitError as e:
                         return _limit_exceeded(e)
+                    except SecurityChallengeError:
+                        budget.ledger.record(now)
+                        jobs.save(budget)
+                        raise
                     except RateLimitError as e:
                         logger.warning("Rate limited during About load: %s", e)
                         budget.ledger.record(now)

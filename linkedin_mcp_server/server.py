@@ -37,6 +37,7 @@ from linkedin_mcp_server.daemon_auth import (
     OwnerAuthSignalMiddleware,
 )
 from linkedin_mcp_server.error_handler import raise_tool_error
+from linkedin_mcp_server.outcomes import OutcomeMiddleware
 from linkedin_mcp_server.sequential_tool_middleware import (
     SequentialToolExecutionMiddleware,
 )
@@ -219,6 +220,10 @@ def create_mcp_server(
         mask_error_details=True,
         auth=_StaticTokenAuth(auth_token) if auth_token is not None else None,
     )
+    # First project middleware, so it sees exceptions after every role-specific
+    # wrapper and can preserve the final human-readable wording. FastMCP's own
+    # built-ins may precede it, but no provider middleware does.
+    mcp.add_middleware(OutcomeMiddleware())
     # Added before the serializing middleware below, which makes it the outer one.
     # An inner position would work: `close_browser` does not consult the in-flight
     # count, so quiescence succeeds from there, and the lease reference the inner

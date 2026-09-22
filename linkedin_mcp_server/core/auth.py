@@ -64,6 +64,19 @@ _LOGIN_REDIRECT_PATHS = ("/login", "/uas/login", "/authwall")
 AUTH_COOKIE_NAMES = ("li_at", "JSESSIONID")
 
 
+def is_security_challenge_url(url: str) -> bool:
+    """Whether a LinkedIn URL is an interactive security-verification route."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if host != "linkedin.com" and not host.endswith(".linkedin.com"):
+        return False
+    path = parsed.path.lower()
+    return any(
+        path == prefix or path.startswith(f"{prefix}/")
+        for prefix in ("/checkpoint", "/challenge", "/uas/consumer-email-challenge")
+    )
+
+
 async def is_logged_in(page: Page) -> bool:
     """Check if currently logged in to LinkedIn.
 

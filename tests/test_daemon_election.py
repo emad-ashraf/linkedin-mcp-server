@@ -5342,6 +5342,7 @@ class TestRealOwner:
             MARKER_VERSION,
             FrontendAuthRepairMiddleware,
         )
+        from linkedin_mcp_server.outcomes import OUTCOME_KEY
         from linkedin_mcp_server.server import ServerRole, create_mcp_server
 
         profile = real_state_root
@@ -5412,6 +5413,10 @@ class TestRealOwner:
             # And the owner never opened a browser to find this out, so the
             # profile is free for the login it is asking for.
             assert marker["browser_open"] is False
+            assert (answered.meta or {})[OUTCOME_KEY] == {
+                "v": 1,
+                "code": "reauth_required",
+            }
 
             # Worth recording what this does and does not pin. Removing the
             # owner's middleware makes it fail, and so does removing *both* role

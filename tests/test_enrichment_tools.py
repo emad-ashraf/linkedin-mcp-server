@@ -21,6 +21,7 @@ from linkedin_mcp_server.config.loaders import EnvironmentKeys
 from linkedin_mcp_server.core.exceptions import (
     AuthenticationError,
     RateLimitError,
+    SecurityChallengeError,
 )
 from linkedin_mcp_server.exceptions import ActionLimitError, BrowserBusyError
 from linkedin_mcp_server.pacing import (
@@ -394,6 +395,29 @@ class TestRunBunch:
         assert out["stopped_because"] == "session_expired"
         assert store.load("j").pending == ["a", "b"]  # nothing consumed
         assert store.load("j").failed == {}  # nothing wrongly failed
+
+    async def test_a_security_challenge_stops_with_the_profile_still_queued(
+        self, mcp, store, mock_context
+    ):
+        """A checkpoint is account-wide, not a failure of one profile."""
+        await self._seed(mcp, store, ["a", "b"])
+
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        with pytest.raises(SecurityChallengeError, match="verify the account"):
+            await fn(
+                "j",
+                mock_context,
+                extractor=_extractor(
+                    error=SecurityChallengeError("verify the account")
+                ),
+            )
+
+        assert store.load("j").pending == ["a", "b"]
+        assert store.load("j").failed == {}
+        assert (
+            store.load(ACCOUNT_BUDGET_JOB).ledger.spent(datetime.now().astimezone())
+            == 1
+        )
 
     async def test_extra_sections_do_not_overshoot_the_budget(
         self, mcp, store, mock_context, monkeypatch

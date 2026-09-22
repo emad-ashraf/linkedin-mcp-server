@@ -9,7 +9,10 @@ import asyncio
 import pytest
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from linkedin_mcp_server.core.exceptions import AuthenticationError
+from linkedin_mcp_server.core.exceptions import (
+    AuthenticationError,
+    SecurityChallengeError,
+)
 from linkedin_mcp_server.scraping import job_pages as job_pages_module
 from linkedin_mcp_server.scraping.content import PageContentReader
 from linkedin_mcp_server.scraping.contracts import (
@@ -228,7 +231,7 @@ class TestExtractSearchPage:
 
         check_auth.assert_awaited_once_with(requested)
 
-    async def test_a_checkpoint_while_scrolling_raises_an_auth_error(self, mock_page):
+    async def test_a_checkpoint_while_scrolling_raises_a_challenge(self, mock_page):
         """A checkpoint reached mid-scroll must not come back as job results.
 
         The scroll suppresses every error its evaluate raises, and a
@@ -237,11 +240,10 @@ class TestExtractSearchPage:
         its text back under `search_results` with no `section_errors` beside
         it, which no client can tell from a search that found those words.
 
-        A diagnostic is not enough either. An expired session reaches this
-        branch as often as a layout change does, and only the auth error
-        starts the recovery the tool has: returning a section error leaves
-        the dead browser registered and offers no re-login, so the next call
-        walks into the same barrier.
+        A diagnostic is not enough either. A security challenge reaches this
+        branch as often as a layout change does, and only the typed challenge
+        tells a client to stop LinkedIn work for interactive verification.
+        Returning a section error leaves the next call at the same barrier.
         """
         mock_page.url = "https://www.linkedin.com/jobs/search/?keywords=test"
         mock_page.evaluate = AsyncMock(
@@ -275,7 +277,7 @@ class TestExtractSearchPage:
                 new_callable=AsyncMock,
                 side_effect=navigate_away,
             ),
-            pytest.raises(AuthenticationError, match="--login"),
+            pytest.raises(SecurityChallengeError, match="verification"),
         ):
             await reader._extract_search_page(
                 "https://www.linkedin.com/jobs/search/?keywords=test",
@@ -703,7 +705,7 @@ class TestExtractSearchPage:
                 "linkedin_mcp_server.scraping.job_pages.scroll_job_sidebar",
                 side_effect=hop_twice,
             ),
-            pytest.raises(AuthenticationError, match="--login"),
+            pytest.raises(SecurityChallengeError, match="verification"),
         ):
             await reader._extract_search_page(
                 "https://www.linkedin.com/jobs/search/?keywords=test",
@@ -745,7 +747,7 @@ class TestExtractSearchPage:
                 "linkedin_mcp_server.scraping.job_pages.scroll_job_sidebar",
                 side_effect=hop_slowly,
             ),
-            pytest.raises(AuthenticationError, match="--login"),
+            pytest.raises(SecurityChallengeError, match="verification"),
         ):
             await reader._extract_search_page(
                 "https://www.linkedin.com/jobs/search/?keywords=test",
@@ -790,7 +792,7 @@ class TestExtractSearchPage:
                 "linkedin_mcp_server.scraping.job_pages.scroll_job_sidebar",
                 side_effect=hop_late,
             ),
-            pytest.raises(AuthenticationError, match="--login"),
+            pytest.raises(SecurityChallengeError, match="verification"),
         ):
             await reader._extract_search_page(
                 "https://www.linkedin.com/jobs/search/?keywords=test",
@@ -998,7 +1000,7 @@ class TestExtractSearchPage:
                 "linkedin_mcp_server.scraping.job_pages.scroll_job_sidebar",
                 side_effect=scroll_then_publish,
             ),
-            pytest.raises(AuthenticationError, match="--login"),
+            pytest.raises(SecurityChallengeError, match="verification"),
         ):
             await reader._extract_search_page(
                 "https://www.linkedin.com/jobs/search/?keywords=python",

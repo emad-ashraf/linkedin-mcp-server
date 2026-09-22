@@ -6,7 +6,8 @@ import time
 
 from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
-from .exceptions import RateLimitError
+from .auth import is_security_challenge_url
+from .exceptions import AuthenticationError, RateLimitError, SecurityChallengeError
 from .humanize import jitter
 
 logger = logging.getLogger(__name__)
@@ -113,8 +114,9 @@ async def detect_rate_limit(page: Page) -> None:
     """Detect if LinkedIn has rate-limited or security-challenged the session.
 
     Checks (in order):
-    1. URL contains /checkpoint or /authwall (security challenge)
-    2. Body text contains rate-limit phrases on error-shaped pages (throttling)
+    1. URL is a checkpoint/challenge route (security verification)
+    2. URL is an authwall route (authentication loss)
+    3. Body text contains rate-limit phrases on error-shaped pages (throttling)
 
     The body-text heuristic only runs on pages without a ``<main>`` element
     and with short body text (<2000 chars), since real rate-limit pages are
@@ -122,7 +124,9 @@ async def detect_rate_limit(page: Page) -> None:
     that happens to contain phrases like "slow down" or "try again later".
 
     Raises:
-        RateLimitError: If any rate-limiting or security challenge is detected
+        SecurityChallengeError: If interactive verification is required
+        AuthenticationError: If the session reached an authwall
+        RateLimitError: If throttling is detected
     """
     # Imported here: ``pacing`` imports the top-level ``exceptions`` module,
     # which imports this package, so a module-level import would be a cycle.
@@ -130,17 +134,19 @@ async def detect_rate_limit(page: Page) -> None:
 
     # Check URL for security challenges
     current_url = page.url
-    if "linkedin.com/checkpoint" in current_url:
+    if is_security_challenge_url(current_url):
         # Recorded before raising, so every other session sees the pause
         # while this one's error is still on its way to the client.
         note_throttle_signal("checkpoint")
-    if "linkedin.com/checkpoint" in current_url or "authwall" in current_url:
+        raise SecurityChallengeError(
+            "LinkedIn security checkpoint detected. "
+            "Complete the interactive identity verification before continuing."
+        )
+    if "linkedin.com/authwall" in current_url:
         # An authwall is not recorded: it is the session having ended, not
         # LinkedIn throttling it, and a pause would only delay the re-login.
-        raise RateLimitError(
-            "LinkedIn security checkpoint detected. "
-            "You may need to verify your identity or wait before continuing.",
-            suggested_wait_time=30,
+        raise AuthenticationError(
+            "LinkedIn authentication is no longer valid. Sign in again."
         )
 
     # Check for rate limit messages — only on error-shaped pages.

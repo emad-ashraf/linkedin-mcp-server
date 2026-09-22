@@ -11,7 +11,10 @@ import pytest
 from patchright.async_api import Error as PatchrightError
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from linkedin_mcp_server.core.exceptions import AuthenticationError
+from linkedin_mcp_server.core.exceptions import (
+    AuthenticationError,
+    SecurityChallengeError,
+)
 from linkedin_mcp_server.scraping import jobs as jobs_module
 from linkedin_mcp_server.scraping.capture import CapturePlan, SectionCapture
 from linkedin_mcp_server.scraping.content import PageContentReader
@@ -2705,14 +2708,12 @@ class TestGetSavedJobs:
         ):
             await scraper.get_saved_jobs(max_pages=1)
 
-    async def test_a_redirect_while_scrolling_the_list_is_an_auth_error(
-        self, mock_page
-    ):
+    async def test_a_redirect_while_scrolling_the_list_is_a_challenge(self, mock_page):
         """A navigation destroys the scroll's context, and that error is generic.
 
         Turned straight into a section diagnostic it hands the caller an empty
-        list, leaves the browser registered and offers no relogin, so the next
-        call meets the same checkpoint.
+        list and leaves the browser on the checkpoint. A typed challenge tells
+        the client to stop LinkedIn work for interactive verification instead.
         """
         mock_page.url = "https://www.linkedin.com/jobs-tracker/"
 
@@ -2749,7 +2750,7 @@ class TestGetSavedJobs:
                 "linkedin_mcp_server.scraping.job_pages.scroll_to_bottom",
                 side_effect=redirect,
             ),
-            pytest.raises(AuthenticationError, match="--login"),
+            pytest.raises(SecurityChallengeError, match="verification"),
         ):
             await scraper.get_saved_jobs(max_pages=1)
 

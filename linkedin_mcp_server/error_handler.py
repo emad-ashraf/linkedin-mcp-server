@@ -27,6 +27,7 @@ from linkedin_mcp_server.core.exceptions import (
     ProxyConnectionError,
     RateLimitError,
     ScrapingError,
+    SecurityChallengeError,
     TransientBarrierError,
 )
 
@@ -207,6 +208,10 @@ def raise_tool_error(exception: Exception, context: str = "") -> NoReturn:
     # would send users to the tracker for something working as intended.
     elif isinstance(exception, BrowserDowngradeError):
         logger.warning("Browser older than the profile%s: %s", ctx, exception)
+        raise ToolError(str(exception)) from exception
+
+    elif isinstance(exception, SecurityChallengeError):
+        logger.warning("LinkedIn security challenge%s: %s", ctx, exception)
         raise ToolError(str(exception)) from exception
 
     elif isinstance(exception, SessionExpiredError):

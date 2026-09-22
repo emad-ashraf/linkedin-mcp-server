@@ -19,7 +19,11 @@ from patchright.async_api import Error as PatchrightError
 
 from linkedin_mcp_server.company_cache import CompanyCache
 from linkedin_mcp_server.config.loaders import EnvironmentKeys
-from linkedin_mcp_server.core.exceptions import AuthenticationError, RateLimitError
+from linkedin_mcp_server.core.exceptions import (
+    AuthenticationError,
+    RateLimitError,
+    SecurityChallengeError,
+)
 from linkedin_mcp_server.exceptions import (
     AuthenticationStartedError,
     BrowserBusyError,
@@ -869,6 +873,46 @@ class TestEnrichCompanies:
         handle.assert_awaited_once()
         extractor.search_companies.assert_awaited_once()  # Acme was not attempted
         assert _spent(jobs) == 1  # the search that hit the wall
+
+    async def test_a_security_challenge_during_search_stops_the_bunch(
+        self, mcp, wired, mock_context, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        _, jobs = wired
+        extractor = _search_extractor([])
+        extractor.search_companies = AsyncMock(
+            side_effect=SecurityChallengeError("verify the account")
+        )
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        with pytest.raises(SecurityChallengeError, match="verify the account"):
+            await fn(["Copado", "Acme"], mock_context, extractor=extractor)
+
+        extractor.search_companies.assert_awaited_once()
+        assert _spent(jobs) == 1
+
+    async def test_a_security_challenge_during_about_stops_the_bunch(
+        self, mcp, wired, mock_context, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.company_enrichment.step_delay", lambda **k: 0
+        )
+        cache, jobs = wired
+        extractor = _search_extractor(["copado", "acme"])
+        extractor.scrape_company = AsyncMock(
+            side_effect=SecurityChallengeError("verify the account")
+        )
+
+        fn = await get_tool_fn(mcp, "enrich_companies")
+        with pytest.raises(SecurityChallengeError, match="verify the account"):
+            await fn(["Copado", "Acme"], mock_context, about=True, extractor=extractor)
+
+        extractor.scrape_company.assert_awaited_once()
+        assert extractor.search_companies.await_count == 1
+        assert _spent(jobs) == 2
+        assert cache.get("Copado").linkedin_url
 
     async def test_a_search_that_outlives_the_deadline_skips_the_about(
         self, wired, mock_context, monkeypatch

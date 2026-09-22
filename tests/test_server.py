@@ -25,6 +25,7 @@ from linkedin_mcp_server.server_role import (
     process_role,
 )
 from linkedin_mcp_server.update_check import UpdateNoticeMiddleware
+from linkedin_mcp_server.outcomes import OutcomeMiddleware
 
 
 def _has_middleware(mcp: FastMCP, kind: type) -> bool:
@@ -135,6 +136,21 @@ class TestServerRoles:
         for mcp in (default, direct):
             assert _has_middleware(mcp, SequentialToolExecutionMiddleware)
             assert _has_middleware(mcp, UpdateNoticeMiddleware)
+
+    def test_outcome_mapping_is_outermost_for_every_role(self):
+        for role in ServerRole:
+            mcp = _server_for(role)
+            outcome_index = next(
+                index
+                for index, middleware in enumerate(mcp.middleware)
+                if isinstance(middleware, OutcomeMiddleware)
+            )
+            assert all(
+                outcome_index < index
+                for index, middleware in enumerate(mcp.middleware)
+                if type(middleware).__module__.startswith("linkedin_mcp_server.")
+                and not isinstance(middleware, OutcomeMiddleware)
+            ), role
 
     def test_every_role_that_drives_a_browser_serializes_its_calls(self):
         # The invariant the shared profile depends on: any server that can
