@@ -7,6 +7,7 @@ with configurable section selection.
 
 import json
 import logging
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
@@ -18,10 +19,18 @@ from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
 from linkedin_mcp_server.error_handler import raise_tool_error
+from linkedin_mcp_server.pacing import INVITES, JobStore, record_action, refuse_action
 from linkedin_mcp_server.scraping import parse_person_sections
 from linkedin_mcp_server.scraping.contracts import FilterValidationError
 
 logger = logging.getLogger(__name__)
+
+# Outcomes after which an invitation exists, or may: the unverified one is
+# counted because a repeat can invite twice. ``not_sent`` and
+# ``dialog_not_found`` are LinkedIn declining, and a decline is not an invite.
+# (``outcome_unknown`` is synthesised by the frontend proxy when the daemon
+# went away mid-call, so this tool body never sees it.)
+_INVITE_SUBMITTED = frozenset({"connected", "send_unverified"})
 
 
 def _coerce_str_list(value: Any) -> Any:
@@ -370,6 +379,8 @@ def register_person_tools(
             before calling again, because a repeat may invite twice.
         """
         try:
+            # Before the browser: a refused invite must not spend a page load.
+            refuse_action(JobStore(), INVITES, datetime.now().astimezone())
             extractor = extractor or await get_ready_extractor(
                 ctx, tool_name="connect_with_person"
             )
@@ -389,6 +400,8 @@ def register_person_tools(
                 linkedin_username,
                 note=note,
             )
+            if result.get("status") in _INVITE_SUBMITTED:
+                record_action(JobStore(), INVITES, datetime.now().astimezone())
 
             await ctx.report_progress(progress=100, total=100, message="Complete")
 

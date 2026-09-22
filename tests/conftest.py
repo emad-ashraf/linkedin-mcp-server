@@ -196,18 +196,34 @@ def isolate_profile_dir(ignore_the_developers_environment, tmp_path, monkeypatch
 def isolate_the_account_ledger(tmp_path, monkeypatch):
     """Keep the shared action budget out of the developer's real home.
 
-    Every tool call the middleware runs records one action against
-    ``~/.linkedin-mcp/jobs``, so without this a test run spends the daily
-    budget of whoever ran it and the next real job finds it half gone.
+    Every page load the navigator makes, and every invite or message the
+    tools submit, is charged against ``~/.linkedin-mcp/jobs``, so without
+    this a test run spends the daily budget of whoever ran it -- or is
+    refused by a cap the real ledger has already reached.
     """
-    from linkedin_mcp_server import sequential_tool_middleware
-    from linkedin_mcp_server.pacing import JobStore
+    from datetime import datetime
 
-    monkeypatch.setattr(
-        sequential_tool_middleware,
-        "JobStore",
-        lambda *args, **kwargs: JobStore(tmp_path / "jobs"),
+    from linkedin_mcp_server import pacing
+    from linkedin_mcp_server.pacing import JobStore, Schedule, load_account_budget
+    from linkedin_mcp_server.scraping import navigation
+    from linkedin_mcp_server.tools import messaging, person
+
+    for module in (navigation, person, messaging):
+        monkeypatch.setattr(
+            module,
+            "JobStore",
+            lambda *args, **kwargs: JobStore(tmp_path / "jobs"),
+        )
+    # A fresh account budget is on business hours, so a test that let one
+    # materialise would be refused an invite in the evening and given half a
+    # profile cap at the weekend. Seed it open; a test about the schedule
+    # stores its own.
+    load_account_budget(
+        JobStore(tmp_path / "jobs"), datetime.now(), schedule=Schedule()
     )
+    # The clamp warning fires once per (key, value) per process, and a test
+    # asserting it must not depend on which test asked first.
+    monkeypatch.setattr(pacing, "_clamp_warned", set())
 
 
 @pytest.fixture

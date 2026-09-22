@@ -5,6 +5,7 @@ Provides inbox listing, conversation reading, message search, and sending.
 """
 
 import logging
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
@@ -17,6 +18,7 @@ from linkedin_mcp_server.core.exceptions import (
 )
 from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
 from linkedin_mcp_server.error_handler import raise_tool_error
+from linkedin_mcp_server.pacing import MESSAGES, JobStore, record_action, refuse_action
 from linkedin_mcp_server.scraping.contracts import (
     SEND_INTERRUPTED_WARNING,
     refuse_an_invalid_message,
@@ -268,6 +270,10 @@ def register_messaging_tools(
             refusal = refuse_an_invalid_message(linkedin_username, message)
             if refusal is not None:
                 return refusal
+            # Also before the browser, and only for a real send: a dry run
+            # submits nothing and owes nothing.
+            if confirm_send:
+                refuse_action(JobStore(), MESSAGES, datetime.now().astimezone())
             extractor = extractor or await get_ready_extractor(
                 ctx, tool_name="send_message"
             )
@@ -285,6 +291,11 @@ def register_messaging_tools(
                 confirm_send=confirm_send,
                 profile_urn=profile_urn,
             )
+            # `retry_safe` is false from the moment a submission is attempted,
+            # which is exactly when a message exists or may: an unconfirmed
+            # send is counted because a repeat can deliver it twice.
+            if result.get("sent") or result.get("retry_safe") is False:
+                record_action(JobStore(), MESSAGES, datetime.now().astimezone())
 
             try:
                 await ctx.report_progress(progress=100, total=100, message="Complete")

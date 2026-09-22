@@ -85,24 +85,23 @@ class TestCallsAreSpacedApart:
         assert second < 0.1
 
 
-class TestEveryCallDrawsOnTheAccountBudget:
-    """A direct tool call costs LinkedIn activity like an enrichment one does.
+class TestTheMiddlewareChargesNoBudgetItself:
+    """The account budget is spent per page load, at the navigation (#58).
 
-    Without this the shared ledger only ever saw the bulk jobs, so a day of
-    interactive scraping left the budget reading as untouched.
+    One unit per call was the old rule, and it undercounted by the number of
+    pages a call loaded: a full-sections profile read was fourteen loads for
+    one unit. A call that loads no page therefore owes nothing here, and the
+    navigator is where the charge now lives (`tests/scraping/test_navigation`).
     """
 
-    async def test_each_call_records_one_action(self, paced, tmp_path):
-        # The same jobs root the autouse ledger-isolation fixture hands the
-        # middleware.
+    async def test_a_call_that_loads_no_page_spends_nothing(self, paced, tmp_path):
+        # The same jobs root the autouse ledger-isolation fixture hands out.
         store = JobStore(tmp_path / "jobs")
         now = datetime.now()
 
         await _timed_call(paced)
-        assert load_account_budget(store, now).ledger.spent(now) == 1
-
-        await _timed_call(paced)
-        assert load_account_budget(store, now).ledger.spent(now) == 2
+        await _timed_call(paced, "run_enrichment_bunch")
+        assert load_account_budget(store, now).ledger.spent(now) == 0
 
 
 class TestLocalOnlyToolsAreNotPaced:
@@ -135,43 +134,13 @@ class TestLocalOnlyToolsAreNotPaced:
 
         assert second < 0.1
 
-    async def test_a_local_tool_spends_no_budget(self, paced, tmp_path):
-        store = JobStore(tmp_path / "jobs")
-        now = datetime.now()
 
-        await _timed_call(paced, "get_enrichment_status")
-        await _timed_call(paced, "get_company_cache")
-        await _timed_call(paced, "query_company_cache")
-        # Writing a queue to disk and closing the browser are local too.
-        await _timed_call(paced, "start_enrichment_job")
-        await _timed_call(paced, "close_session")
-        assert load_account_budget(store, now).ledger.spent(now) == 0
+class TestBulkToolsAreStillPaced:
+    """An enrichment tool records its own units, one per page load, and the
+    navigator adds each load's kind to the copy it holds. The gap between
+    calls still applies: these tools do reach LinkedIn."""
 
-        await _timed_call(paced)
-        assert load_account_budget(store, now).ledger.spent(now) == 1
-
-
-class TestSelfRecordingToolsAreNotCountedTwice:
-    """An enrichment tool writes its own units, one per profile it scrapes.
-
-    Recording here as well added one more per call. The ledger drives a
-    rolling daily cap, so an overstated count makes the next bunch stop before
-    the budget it was actually given. The gap still applies: these tools do
-    reach LinkedIn, and skipping the record is not the same as skipping the
-    pacing.
-    """
-
-    async def test_a_self_recording_tool_spends_no_extra_unit(self, paced, tmp_path):
-        store = JobStore(tmp_path / "jobs")
-        now = datetime.now()
-
-        await _timed_call(paced, "run_enrichment_bunch")
-        await _timed_call(paced, "enrich_companies")
-        await _timed_call(paced, "enrich_company_deep")
-
-        assert load_account_budget(store, now).ledger.spent(now) == 0
-
-    async def test_a_self_recording_tool_is_still_paced(self, paced):
+    async def test_a_bulk_tool_waits_out_the_gap(self, paced):
         await _timed_call(paced, "run_enrichment_bunch")
         second = await _timed_call(paced, "run_enrichment_bunch")
 

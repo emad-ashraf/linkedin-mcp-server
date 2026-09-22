@@ -33,19 +33,26 @@ from linkedin_mcp_server.core.exceptions import (
     RateLimitError,
     ScrapingError,
 )
+from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.dependencies import get_ready_extractor
 from linkedin_mcp_server.error_handler import raise_tool_error
 from linkedin_mcp_server.pacing import (
     ACCOUNT_BUDGET_JOB,
+    PROFILE,
     Job,
     JobStore,
+    Schedule,
+    account_budget_in_use,
     bunch_size_max,
     default_daily_actions,
     load_account_budget,
     max_daily_actions,
+    kind_headroom,
     next_bunch_delay,
     request_arrived_at,
+    schedule_ignored,
     step_delay,
+    working_hours_enforced,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,6 +151,19 @@ def _soft_rate_limit(result: dict[str, Any]) -> str | None:
     return None
 
 
+def _limit_filed(result: dict[str, Any]) -> ActionLimitError | None:
+    """The cap refusal a section walk filed and stopped on, if any.
+
+    The walks do not raise for it (the sections before it are returned as
+    paid for), but for a bulk tool the profile is then not done: it stays
+    queued, uncharged, and the bunch stops until the cap says otherwise.
+    """
+    for error in result.get("section_errors", {}).values():
+        if error.get("error_type") == ActionLimitError.error_type:
+            return ActionLimitError.from_section_error(error)
+    return None
+
+
 def _refuse_reserved(job_name: str) -> None:
     """The shared budget record lives in the job store but is not a job.
 
@@ -194,8 +214,9 @@ def register_enrichment_tools(
             usernames: LinkedIn usernames or profile URLs. Deduplicated;
                 already-completed people are skipped when a job is resumed.
             daily_cap: Profile views allowed per rolling 24 hours (default
-                100, ceiling 150; DAILY_ACTIONS_DEFAULT / DAILY_ACTIONS_MAX
-                move both). Anything above the ceiling is clamped to it. This
+                100, ceiling 150; DAILY_ACTIONS_DEFAULT moves the default,
+                DAILY_ACTIONS_MAX can only lower the ceiling). Anything above
+                the ceiling is clamped to it. This
                 is a behavioral budget, not a LinkedIn API limit -- LinkedIn
                 publishes no official number.
             warmup: Ramp the cap over four weeks (10/day in week 1, 20 in
@@ -281,11 +302,13 @@ def register_enrichment_tools(
         Visit the next few profiles in a job, pacing them like a human would.
 
         Stops early -- persisting everything gathered -- when the bunch is
-        done, the rolling 24-hour budget is spent, the working window closes,
-        the tool timeout approaches, LinkedIn signals a rate limit, or the
-        browser has gone away and a relaunch did not bring it back
-        (browser_unavailable: the profile stays pending and nothing is
-        charged).
+        done, the rolling 24-hour budget is spent, the profile-load cap is
+        reached (limit_exceeded: the profile stays pending, the refused load
+        is uncharged, and next_run_after says when the cap frees up), the
+        working window closes, the tool timeout approaches, LinkedIn signals
+        a rate limit, or the browser has gone away and a relaunch did not
+        bring it back (browser_unavailable: the profile stays pending and
+        nothing is charged).
 
         Args:
             job_name: The job created by start_enrichment_job.
@@ -322,295 +345,362 @@ def register_enrichment_tools(
         now = datetime.now().astimezone()
         rng = random.Random()
         budget = load_account_budget(store, now)
-
-        # Schedule gate. Checked before the budget so a closed window reports
-        # the real reason rather than "no budget".
-        if not ignore_schedule and not budget.schedule.is_open(now):
-            opens = budget.schedule.next_open(now)
-            return _status(
-                job,
-                budget,
-                now,
-                stopped="outside_working_hours",
-                next_run_after=(opens - now).total_seconds(),
-                gathered={},
-                detail=f"Working window reopens {opens.isoformat(timespec='minutes')}.",
-            )
-
-        if not job.pending:
-            return _status(
-                job,
-                budget,
-                now,
-                stopped="queue_empty",
-                next_run_after=None,
-                gathered={},
-            )
-
-        requested_sections = {
-            s.strip() for s in (sections or "").split(",") if s.strip()
-        }
-        # Each profile costs one page load for the main profile plus one per
-        # extra section, so the budget is measured in those units -- not in
-        # profiles. Planning in profiles (the old bug) overspent the cap by
-        # len(sections)x.
-        cost = 1 + len(requested_sections)
-
-        remaining = budget.remaining_today(now)
-        if remaining < cost:
-            return _status(
-                job,
-                budget,
-                now,
-                stopped="daily_budget_spent",
-                next_run_after=budget.ledger.next_expiry(now),
-                gathered={},
-                detail=(
-                    "The shared account budget can't afford another profile "
-                    f"({remaining} left, {cost} needed). It refills gradually "
-                    "as individual actions age out, not all at once at midnight."
-                ),
-            )
-
-        # From arrival at the middleware, not from here: the frontend proxy
-        # gives up tool_timeout + 30 s (210 s at the defaults) after it sent
-        # the call, and a call queued behind another session's spends that
-        # waiting before its own timeout starts. Measured: a bunch let
-        # through after the proxy had gone ran to completion for nobody.
-        arrived = request_arrived_at.get()
-        deadline = (
-            time.monotonic() if arrived is None else arrived
-        ) + tool_timeout * DEADLINE_FRACTION
-        if time.monotonic() >= deadline:
-            return _status(
-                job,
-                budget,
-                now,
-                stopped="tool_deadline",
-                next_run_after=RETRY_AFTER_QUEUED_OUT,
-                gathered={},
-                detail=(
-                    "Queued behind other calls for longer than the tool "
-                    "deadline; nothing was loaded and nothing was charged. "
-                    "Call again."
-                ),
-            )
-
-        extractor = extractor or await get_ready_extractor(
-            ctx, tool_name="run_enrichment_bunch"
-        )
-
-        # Never plan more profiles than the budget can pay for at `cost` each.
-        planned = min(bunch_size, remaining // cost, len(job.pending))
-
-        gathered: dict[str, Any] = {}
-        stopped = "bunch_complete"
-        # The username struck out by the previous visit of this call, if any:
-        # the next visit emptying too says the whole session is throttled.
-        struck_this_call: str | None = None
-
-        async def _scrape(username: str) -> dict[str, Any]:
-            """One profile visit, with both shapes of a dead browser raised
-            as ``_BrowserGone`` and a soft rate limit raised as such."""
-            try:
-                result = await extractor.scrape_person(
-                    username, requested_sections, callbacks=None
+        # The page loads below file their kind into this copy, which is the
+        # one saved after every profile; `actions` is recorded here, per load.
+        token = account_budget_in_use.set(budget)
+        ignored = schedule_ignored.set(ignore_schedule)
+        try:
+            # Schedule gate. Checked before the budget so a closed window reports
+            # the real reason rather than "no budget".
+            # With the gate lifted the bunches are spread over the clock, not
+            # over a window that is closed: spacing them by a closed schedule
+            # answers every off-hours bunch with the maximum pause.
+            gate_lifted = ignore_schedule or not working_hours_enforced()
+            pacing_schedule = Schedule() if gate_lifted else budget.schedule
+            if not gate_lifted and not budget.schedule.is_open(now):
+                opens = budget.schedule.next_open(now)
+                return _status(
+                    job,
+                    budget,
+                    now,
+                    stopped="outside_working_hours",
+                    next_run_after=(opens - now).total_seconds(),
+                    gathered={},
+                    detail=f"Working window reopens {opens.isoformat(timespec='minutes')}.",
                 )
-            except Exception as e:
-                if _browser_gone(e):
-                    raise _BrowserGone(str(e)) from e
-                raise
-            if not result.get("sections"):
-                # With nothing loaded, a filed rate limit is the whole answer,
-                # and it is a rate limit, not a dead browser.
-                if limit := _soft_rate_limit(result):
-                    raise _EmptyPage(limit)
-                errors = result.get("section_errors", {})
-                if _closed_target_filed(errors):
-                    raise _BrowserGone("every section failed", errors)
-            return result
 
-        async def _relaunch(username: str) -> Any:
-            # Re-acquiring goes through get_or_create_browser, which relaunches
-            # a dead browser; the extractor is bound to the old page, so it is
-            # re-created too. The caller retries the same profile once.
-            logger.warning(
-                "browser gone under %s; relaunching and retrying once", username
+            if not job.pending:
+                return _status(
+                    job,
+                    budget,
+                    now,
+                    stopped="queue_empty",
+                    next_run_after=None,
+                    gathered={},
+                )
+
+            requested_sections = {
+                s.strip() for s in (sections or "").split(",") if s.strip()
+            }
+            # Each profile costs one page load for the main profile plus one per
+            # extra section, so the budget is measured in those units -- not in
+            # profiles. Planning in profiles (the old bug) overspent the cap by
+            # len(sections)x.
+            cost = 1 + len(requested_sections)
+
+            remaining = budget.remaining_today(now)
+            if remaining < cost:
+                return _status(
+                    job,
+                    budget,
+                    now,
+                    stopped="daily_budget_spent",
+                    next_run_after=budget.ledger.next_expiry(now),
+                    gathered={},
+                    detail=(
+                        "The shared account budget can't afford another profile "
+                        f"({remaining} left, {cost} needed). It refills gradually "
+                        "as individual actions age out, not all at once at midnight."
+                    ),
+                )
+
+            # Every load here is a profile load, so the profile cap plans the
+            # bunch the way the daily cap does: never start what it cannot
+            # finish, or the navigator refuses mid-profile.
+            headroom, headroom_wait = kind_headroom(
+                budget, PROFILE, now, ignore_schedule=ignore_schedule
             )
-            try:
-                return await get_ready_extractor(ctx, tool_name="run_enrichment_bunch")
-            except Exception as e:
-                raise _RelaunchFailed(e) from e
+            if headroom < cost:
+                return _status(
+                    job,
+                    budget,
+                    now,
+                    stopped="limit_exceeded",
+                    next_run_after=headroom_wait,
+                    gathered={},
+                    detail=(
+                        "The profile-load cap can't afford another profile "
+                        f"({headroom} left, {cost} needed)."
+                    ),
+                )
 
-        def _browser_unavailable(e: _BrowserGone) -> dict[str, Any]:
-            # A closed browser is not a fact about the profile; nothing was
-            # loaded, so nothing is charged, and the profile stays pending.
-            logger.warning("Browser unavailable during enrichment bunch: %s", e)
-            store.save(job)
-            store.save(budget)
-            return _status(
-                job,
-                budget,
-                now,
-                stopped="browser_unavailable",
-                next_run_after=60.0,
-                gathered=gathered,
-                detail=(
-                    "The browser is gone and a relaunch did not bring it back; "
-                    "nothing was loaded and nothing was charged. Progress saved."
-                ),
-                section_errors=e.section_errors,
-            )
-
-        for index in range(planned):
+            # From arrival at the middleware, not from here: the frontend proxy
+            # gives up tool_timeout + 30 s (210 s at the defaults) after it sent
+            # the call, and a call queued behind another session's spends that
+            # waiting before its own timeout starts. Measured: a bunch let
+            # through after the proxy had gone ran to completion for nobody.
+            arrived = request_arrived_at.get()
+            deadline = (
+                time.monotonic() if arrived is None else arrived
+            ) + tool_timeout * DEADLINE_FRACTION
             if time.monotonic() >= deadline:
-                stopped = "tool_deadline"
-                break
-
-            username = job.pending[0]
-            now = datetime.now().astimezone()
-
-            try:
-                try:
-                    result = await _scrape(username)
-                except _BrowserGone:
-                    # One retry of the same profile: a second failure is the
-                    # stop below.
-                    extractor = await _relaunch(username)
-                    result = await _scrape(username)
-            except _RelaunchFailed as e:
-                # The profile was never read and stays pending, uncharged.
-                store.save(job)
-                raise_tool_error(e.cause, "run_enrichment_bunch")  # NoReturn
-            except _BrowserGone as e:
-                return _browser_unavailable(e)
-            except (RateLimitError, AuthenticationError) as e:
-                # Neither consumes the queue entry -- the profile was never
-                # read. A rate limit means back off; an expired session means
-                # the next call re-authenticates via get_ready_extractor. Both
-                # save progress and stop rather than draining the queue into
-                # `failed` (which an auth error, a sibling of RateLimitError,
-                # would otherwise do by falling through to the generic handler).
-                is_auth = isinstance(e, AuthenticationError)
-                if isinstance(e, _EmptyPage):
-                    # The heuristic cannot tell a throttle from a profile that
-                    # is gone; both come back as an empty shell. The same
-                    # username emptying on consecutive calls is struck out
-                    # rather than heading the queue on every call forever --
-                    # unless the very next profile in the same call empties
-                    # too, which is a session-wide throttle, not a dead URL:
-                    # then the strike-out is undone and the call backs off.
-                    job.strikes[username] = job.strikes.get(username, 0) + 1
-                    if struck_this_call is not None:
-                        job.pending.insert(0, struck_this_call)
-                        del job.failed[struck_this_call]
-                        job.strikes[struck_this_call] = EMPTY_PAGE_STRIKES
-                        logger.info(
-                            "%s emptied right after %s was struck out; "
-                            "re-queued it as a throttle",
-                            username,
-                            struck_this_call,
-                        )
-                    elif job.strikes[username] >= EMPTY_PAGE_STRIKES:
-                        job.pending.pop(0)
-                        del job.strikes[username]
-                        job.failed[username] = (
-                            f"empty page on {EMPTY_PAGE_STRIKES} consecutive visits "
-                            "(heuristic rate limit); profile is probably deleted "
-                            "or private"
-                        )
-                        # The striking visit was a real page load, so it is
-                        # charged and paced like any other; the first stays
-                        # uncharged.
-                        for _ in range(cost):
-                            budget.ledger.record(now)
-                        store.save(job)
-                        store.save(budget)
-                        logger.info("Enrichment struck out %s: %s", username, e)
-                        struck_this_call = username
-                        if index != planned - 1:
-                            await asyncio.sleep(step_delay(rng=rng))
-                        continue
-                logger.warning(
-                    "%s during enrichment bunch: %s",
-                    "Auth expired" if is_auth else "Rate limited",
-                    e,
+                return _status(
+                    job,
+                    budget,
+                    now,
+                    stopped="tool_deadline",
+                    next_run_after=RETRY_AFTER_QUEUED_OUT,
+                    gathered={},
+                    detail=(
+                        "Queued behind other calls for longer than the tool "
+                        "deadline; nothing was loaded and nothing was charged. "
+                        "Call again."
+                    ),
                 )
-                if not is_auth and not isinstance(e, _EmptyPage):
-                    # A hard 429 was still a load LinkedIn counted, and the
-                    # middleware leaves recording to this tool. A first empty
-                    # page stays uncharged on purpose (see the strike above).
-                    budget.ledger.record(now)
+
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="run_enrichment_bunch"
+            )
+
+            # Never plan more profiles than the budgets can pay for at `cost` each.
+            planned = min(
+                bunch_size, remaining // cost, headroom // cost, len(job.pending)
+            )
+
+            gathered: dict[str, Any] = {}
+            stopped = "bunch_complete"
+            # The username struck out by the previous visit of this call, if any:
+            # the next visit emptying too says the whole session is throttled.
+            struck_this_call: str | None = None
+
+            async def _scrape(username: str) -> dict[str, Any]:
+                """One profile visit, with both shapes of a dead browser raised
+                as ``_BrowserGone`` and a soft rate limit raised as such."""
+                try:
+                    result = await extractor.scrape_person(
+                        username, requested_sections, callbacks=None
+                    )
+                except Exception as e:
+                    if _browser_gone(e):
+                        raise _BrowserGone(str(e)) from e
+                    raise
+                if refused := _limit_filed(result):
+                    raise refused
+                if not result.get("sections"):
+                    # With nothing loaded, a filed rate limit is the whole answer,
+                    # and it is a rate limit, not a dead browser.
+                    if limit := _soft_rate_limit(result):
+                        raise _EmptyPage(limit)
+                    errors = result.get("section_errors", {})
+                    if _closed_target_filed(errors):
+                        raise _BrowserGone("every section failed", errors)
+                return result
+
+            async def _relaunch(username: str) -> Any:
+                # Re-acquiring goes through get_or_create_browser, which relaunches
+                # a dead browser; the extractor is bound to the old page, so it is
+                # re-created too. The caller retries the same profile once.
+                logger.warning(
+                    "browser gone under %s; relaunching and retrying once", username
+                )
+                try:
+                    return await get_ready_extractor(
+                        ctx, tool_name="run_enrichment_bunch"
+                    )
+                except Exception as e:
+                    raise _RelaunchFailed(e) from e
+
+            def _browser_unavailable(e: _BrowserGone) -> dict[str, Any]:
+                # A closed browser is not a fact about the profile; nothing was
+                # loaded, so nothing is charged, and the profile stays pending.
+                logger.warning("Browser unavailable during enrichment bunch: %s", e)
                 store.save(job)
                 store.save(budget)
                 return _status(
                     job,
                     budget,
                     now,
-                    stopped="session_expired" if is_auth else "rate_limited",
-                    next_run_after=(
-                        60.0 if is_auth else max(budget.ledger.next_expiry(now), 3600.0)
-                    ),
+                    stopped="browser_unavailable",
+                    next_run_after=60.0,
                     gathered=gathered,
                     detail=(
-                        "LinkedIn session expired. Progress saved; the next "
-                        "call will prompt re-login."
-                        if is_auth
-                        else (
-                            "LinkedIn signalled a rate limit. Progress saved. "
-                            "Wait at least an hour; if it repeats, stop for "
-                            "the day."
-                        )
+                        "The browser is gone and a relaunch did not bring it back; "
+                        "nothing was loaded and nothing was charged. Progress saved."
                     ),
+                    section_errors=e.section_errors,
                 )
-            except Exception as e:
+
+            for index in range(planned):
+                if time.monotonic() >= deadline:
+                    stopped = "tool_deadline"
+                    break
+
+                username = job.pending[0]
+                now = datetime.now().astimezone()
+
+                try:
+                    try:
+                        result = await _scrape(username)
+                    except _BrowserGone:
+                        # One retry of the same profile: a second failure is the
+                        # stop below.
+                        extractor = await _relaunch(username)
+                        result = await _scrape(username)
+                except _RelaunchFailed as e:
+                    # The profile was never read and stays pending, uncharged.
+                    store.save(job)
+                    raise_tool_error(e.cause, "run_enrichment_bunch")  # NoReturn
+                except _BrowserGone as e:
+                    return _browser_unavailable(e)
+                except ActionLimitError as e:
+                    # The ledger refused a load before it happened: the
+                    # refused load is uncharged, the profile still pending,
+                    # and the error says when to come back. Ahead of the generic handler, which
+                    # would file it as the profile's own failure and go on
+                    # to drain the whole queue into `failed` the same way.
+                    store.save(job)
+                    store.save(budget)
+                    return _status(
+                        job,
+                        budget,
+                        now,
+                        stopped="limit_exceeded",
+                        next_run_after=max((e.resume_at - now).total_seconds(), 0.0),
+                        gathered=gathered,
+                        detail=str(e),
+                    )
+                except (RateLimitError, AuthenticationError) as e:
+                    # Neither consumes the queue entry -- the profile was never
+                    # read. A rate limit means back off; an expired session means
+                    # the next call re-authenticates via get_ready_extractor. Both
+                    # save progress and stop rather than draining the queue into
+                    # `failed` (which an auth error, a sibling of RateLimitError,
+                    # would otherwise do by falling through to the generic handler).
+                    is_auth = isinstance(e, AuthenticationError)
+                    if isinstance(e, _EmptyPage):
+                        # The heuristic cannot tell a throttle from a profile that
+                        # is gone; both come back as an empty shell. The same
+                        # username emptying on consecutive calls is struck out
+                        # rather than heading the queue on every call forever --
+                        # unless the very next profile in the same call empties
+                        # too, which is a session-wide throttle, not a dead URL:
+                        # then the strike-out is undone and the call backs off.
+                        job.strikes[username] = job.strikes.get(username, 0) + 1
+                        if struck_this_call is not None:
+                            job.pending.insert(0, struck_this_call)
+                            del job.failed[struck_this_call]
+                            job.strikes[struck_this_call] = EMPTY_PAGE_STRIKES
+                            logger.info(
+                                "%s emptied right after %s was struck out; "
+                                "re-queued it as a throttle",
+                                username,
+                                struck_this_call,
+                            )
+                        elif job.strikes[username] >= EMPTY_PAGE_STRIKES:
+                            job.pending.pop(0)
+                            del job.strikes[username]
+                            job.failed[username] = (
+                                f"empty page on {EMPTY_PAGE_STRIKES} consecutive visits "
+                                "(heuristic rate limit); profile is probably deleted "
+                                "or private"
+                            )
+                            # The striking visit was a real page load, so it is
+                            # charged and paced like any other; the first stays
+                            # uncharged.
+                            for _ in range(cost):
+                                budget.ledger.record(now)
+                            store.save(job)
+                            store.save(budget)
+                            logger.info("Enrichment struck out %s: %s", username, e)
+                            struck_this_call = username
+                            if index != planned - 1:
+                                await asyncio.sleep(step_delay(rng=rng))
+                            continue
+                    logger.warning(
+                        "%s during enrichment bunch: %s",
+                        "Auth expired" if is_auth else "Rate limited",
+                        e,
+                    )
+                    if not is_auth and not isinstance(e, _EmptyPage):
+                        # A hard 429 was still a load LinkedIn counted, and the
+                        # middleware leaves recording to this tool. A first empty
+                        # page stays uncharged on purpose (see the strike above).
+                        budget.ledger.record(now)
+                    store.save(job)
+                    store.save(budget)
+                    return _status(
+                        job,
+                        budget,
+                        now,
+                        stopped="session_expired" if is_auth else "rate_limited",
+                        next_run_after=(
+                            60.0
+                            if is_auth
+                            else max(budget.ledger.next_expiry(now), 3600.0)
+                        ),
+                        gathered=gathered,
+                        detail=(
+                            "LinkedIn session expired. Progress saved; the next "
+                            "call will prompt re-login."
+                            if is_auth
+                            else (
+                                "LinkedIn signalled a rate limit. Progress saved. "
+                                "Wait at least an hour; if it repeats, stop for "
+                                "the day."
+                            )
+                        ),
+                    )
+                except Exception as e:
+                    job.pending.pop(0)
+                    job.strikes.pop(username, None)
+                    job.failed[username] = str(e)[:200]
+                    store.save(job)
+                    logger.info("Enrichment failed for %s: %s", username, e)
+                    struck_this_call = None
+                    continue
+
                 job.pending.pop(0)
                 job.strikes.pop(username, None)
-                job.failed[username] = str(e)[:200]
-                store.save(job)
-                logger.info("Enrichment failed for %s: %s", username, e)
                 struck_this_call = None
-                continue
+                job.done[username] = result
+                gathered[username] = result
+                # Every page load counts against the shared budget, extras included.
+                for _ in range(cost):
+                    budget.ledger.record(now)
+                # Persist per profile: a kill mid-bunch costs one page view, not
+                # the whole bunch. Budget and queue are saved together.
+                store.save(job)
+                store.save(budget)
 
-            job.pending.pop(0)
-            job.strikes.pop(username, None)
-            struck_this_call = None
-            job.done[username] = result
-            gathered[username] = result
-            # Every page load counts against the shared budget, extras included.
-            for _ in range(cost):
-                budget.ledger.record(now)
-            # Persist per profile: a kill mid-bunch costs one page view, not
-            # the whole bunch. Budget and queue are saved together.
-            store.save(job)
+                await ctx.report_progress(
+                    progress=index + 1,
+                    total=planned,
+                    message=f"{len(job.done)} done, {len(job.pending)} pending",
+                )
+
+                is_last = index == planned - 1
+                if not is_last:
+                    await asyncio.sleep(step_delay(rng=rng))
+
+            now = datetime.now().astimezone()
+            # The navigator filed kinds into this copy up to the last visit;
+            # a profile that failed generically saved the job but not this.
             store.save(budget)
+            remaining = budget.remaining_today(now)
+            if remaining < cost:
+                stopped = "daily_budget_spent"
+                wait = budget.ledger.next_expiry(now)
+            elif not job.pending:
+                stopped = "queue_empty"
+                wait = None
+            else:
+                # More queue and more budget remain (bunch_complete or tool_deadline);
+                # tell the caller when to come back for the next bunch.
+                wait = next_bunch_delay(
+                    remaining, bunch_size, now, pacing_schedule, rng
+                )
 
-            await ctx.report_progress(
-                progress=index + 1,
-                total=planned,
-                message=f"{len(job.done)} done, {len(job.pending)} pending",
+            return _status(
+                job,
+                budget,
+                now,
+                stopped=stopped,
+                next_run_after=wait,
+                gathered=gathered,
             )
-
-            is_last = index == planned - 1
-            if not is_last:
-                await asyncio.sleep(step_delay(rng=rng))
-
-        now = datetime.now().astimezone()
-        remaining = budget.remaining_today(now)
-        if remaining < cost:
-            stopped = "daily_budget_spent"
-            wait = budget.ledger.next_expiry(now)
-        elif not job.pending:
-            stopped = "queue_empty"
-            wait = None
-        else:
-            # More queue and more budget remain (bunch_complete or tool_deadline);
-            # tell the caller when to come back for the next bunch.
-            wait = next_bunch_delay(remaining, bunch_size, now, budget.schedule, rng)
-
-        return _status(
-            job, budget, now, stopped=stopped, next_run_after=wait, gathered=gathered
-        )
+        finally:
+            account_budget_in_use.reset(token)
+            schedule_ignored.reset(ignored)
 
     @mcp.tool(
         timeout=tool_timeout,

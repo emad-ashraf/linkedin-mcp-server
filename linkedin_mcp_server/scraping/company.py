@@ -10,6 +10,7 @@ import logging
 from patchright._impl._errors import TargetClosedError
 
 from linkedin_mcp_server.core.exceptions import LinkedInScraperException
+from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
 from linkedin_mcp_server.scraping.capture import (
     CaptureMode,
@@ -19,6 +20,7 @@ from linkedin_mcp_server.scraping.capture import (
 from linkedin_mcp_server.scraping.contracts import (
     RATE_LIMITED_SECTION_TEXT,
     FilterValidationError,
+    limit_exceeded_section_error,
     rate_limited_section_error,
 )
 from linkedin_mcp_server.scraping.facets import FacetResolver
@@ -114,6 +116,10 @@ class CompanyScraper:
                         rate_limited = True
                     elif extracted.error:
                         section_errors[section_name] = extracted.error
+                except ActionLimitError as e:
+                    # Uncharged and final for this walk; see scrape_person.
+                    section_errors[section_name] = limit_exceeded_section_error(e)
+                    break
                 except LinkedInScraperException:
                     raise
                 except TargetClosedError:

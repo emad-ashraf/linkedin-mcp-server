@@ -31,6 +31,7 @@ from linkedin_mcp_server.core.exceptions import (
 )
 
 from linkedin_mcp_server.exceptions import (
+    ActionLimitError,
     AuthenticationBootstrapFailedError,
     AuthenticationInProgressError,
     AuthenticationStartedError,
@@ -223,6 +224,12 @@ def raise_tool_error(exception: Exception, context: str = "") -> NoReturn:
             "Authentication failed. Run with --login to re-authenticate.",
             context=context,
         )
+
+    # A cap or the schedule refusing, not a bug: no issue diagnostics, following
+    # RateLimitError. The message already names the cap and when to resume.
+    elif isinstance(exception, ActionLimitError):
+        logger.info("Action limit%s: %s", ctx, exception)
+        raise ToolError(str(exception)) from exception
 
     elif isinstance(exception, RateLimitError):
         wait_time = getattr(exception, "suggested_wait_time", 300)

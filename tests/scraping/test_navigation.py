@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import logging
@@ -11,12 +12,16 @@ from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 import pytest
 
+from linkedin_mcp_server.config.loaders import EnvironmentKeys
 from linkedin_mcp_server.core.exceptions import (
     AuthenticationError,
     ProxyConnectionError,
     RateLimitError,
     TransientBarrierError,
 )
+from linkedin_mcp_server.exceptions import ActionLimitError
+from linkedin_mcp_server.pacing import PROFILE, JobStore, load_account_budget
+from linkedin_mcp_server.scraping import navigation as navigation_module
 from linkedin_mcp_server.scraping import session as session_module
 from linkedin_mcp_server.scraping.navigation import PageNavigator
 from linkedin_mcp_server.scraping.rate_limit import (
@@ -1574,3 +1579,83 @@ class TestConfigurableBackoff:
             and "'soon'" in r.getMessage()
             for r in caplog.records
         )
+
+
+class TestEveryNavigationIsCharged:
+    """One unit of the account budget per page load, taken here (#58).
+
+    The middleware used to charge one unit per tool call, whatever the call
+    loaded: a full-sections profile read was fourteen page loads for one
+    unit. This is the one path every page load takes, so it is where the
+    ledger and LinkedIn's own count agree.
+    """
+
+    URL = "https://www.linkedin.com/in/testuser/"
+
+    @staticmethod
+    def _ledger(tmp_path):
+        # The root the autouse isolation fixture hands the navigator.
+        return load_account_budget(JobStore(tmp_path / "jobs"), datetime.now())
+
+    async def test_each_page_load_costs_one_unit_of_its_kind(self, mock_page, tmp_path):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+        now = datetime.now()
+
+        with TestCommittedNavigation._no_barrier():
+            await navigator._goto_with_auth_checks(self.URL)
+            await navigator._goto_with_auth_checks(self.URL + "details/skills/")
+
+        budget = self._ledger(tmp_path)
+        assert budget.ledger.spent(now) == 2
+        assert budget.ledger.spent_kind(PROFILE, now) == 2
+
+    async def test_a_remember_me_retry_is_the_same_page_load(self, mock_page, tmp_path):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.navigation.resolve_remember_me_prompt",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.navigation.detect_auth_barrier_quick",
+                new_callable=AsyncMock,
+                side_effect=["account picker", None],
+            ),
+        ):
+            await navigator._goto_with_auth_checks(self.URL)
+
+        assert mock_page.goto.await_count == 2
+        assert self._ledger(tmp_path).ledger.spent(datetime.now()) == 1
+
+    async def test_a_capped_load_is_refused_before_the_page_is_asked_for(
+        self, mock_page, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv(EnvironmentKeys.PROFILE_LOADS_MAX, "1")
+        navigator = PageNavigator(ScrapingSession(mock_page))
+
+        with TestCommittedNavigation._no_barrier():
+            await navigator._goto_with_auth_checks(self.URL)
+            with pytest.raises(ActionLimitError, match="limit_exceeded"):
+                await navigator._goto_with_auth_checks(self.URL)
+
+        assert mock_page.goto.await_count == 1
+        assert self._ledger(tmp_path).ledger.spent(datetime.now()) == 1
+
+    async def test_a_ledger_that_cannot_be_written_costs_the_count_not_the_page(
+        self, mock_page, caplog
+    ):
+        navigator = PageNavigator(ScrapingSession(mock_page))
+
+        with (
+            TestCommittedNavigation._no_barrier(),
+            patch.object(
+                navigation_module, "JobStore", side_effect=OSError("read-only")
+            ),
+            caplog.at_level(logging.DEBUG, logger=navigation_module.__name__),
+        ):
+            await navigator._goto_with_auth_checks(self.URL)
+
+        mock_page.goto.assert_awaited_once()
+        assert any("Could not charge" in r.getMessage() for r in caplog.records)

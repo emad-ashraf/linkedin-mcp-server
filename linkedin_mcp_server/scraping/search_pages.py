@@ -13,9 +13,11 @@ from linkedin_mcp_server.scraping.capture import (
     CapturePlan,
     SectionCapture,
 )
+from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.scraping.contracts import (
     RATE_LIMITED_SECTION_TEXT,
     ExtractedSection,
+    limit_exceeded_section_error,
     rate_limited_section_error,
 )
 from linkedin_mcp_server.scraping.link_metadata import (
@@ -125,11 +127,17 @@ async def paginate_search(
         # people card carries up to two mutual-connection anchors of its
         # own, so the section cap would strand the later cards without a
         # URL. The cap is applied per page to ``page_references`` below.
-        extracted = await capture.capture(
-            url,
-            "search_results",
-            CapturePlan(CaptureMode.SEARCH_RESULTS, apply_cap=False),
-        )
+        try:
+            extracted = await capture.capture(
+                url,
+                "search_results",
+                CapturePlan(CaptureMode.SEARCH_RESULTS, apply_cap=False),
+            )
+        except ActionLimitError as e:
+            # The page cap refused this one before it loaded; the pages
+            # before it were paid for and are kept, like a throttled page.
+            gathered.section_errors["search_results"] = limit_exceeded_section_error(e)
+            break
 
         if not extracted.text or extracted.text == RATE_LIMITED_SECTION_TEXT:
             # Rate limit first: it is the more specific diagnosis, and a

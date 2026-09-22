@@ -6,6 +6,12 @@ Defines hierarchical exception types for different error scenarios including
 authentication failures and MCP client reporting.
 """
 
+from __future__ import annotations
+
+from datetime import datetime
+
+from linkedin_mcp_server.core.exceptions import LinkedInScraperException
+
 
 class LinkedInMCPError(Exception):
     """Base exception for LinkedIn MCP Server."""
@@ -263,6 +269,48 @@ class BrowserShutdownUnconfirmedError(LinkedInMCPError):
         )
 
         a_held_profile_means_this_owner_must_go()
+
+
+class ActionLimitError(LinkedInMCPError, LinkedInScraperException):
+    """One more action of this kind would break a rolling cap or the schedule.
+
+    Raised before the navigation or the write it refuses, so nothing is
+    charged for it. Also a ``LinkedInScraperException``: the section loops
+    re-raise that base and swallow everything else into ``section_errors``
+    with an issue template attached, which a cap working as intended does not
+    deserve. The loops that walk several pages catch it by name instead, file
+    it once (``contracts.limit_exceeded_section_error``) and stop, keeping the
+    sections already paid for; ``from_section_error`` is the way back for a
+    bulk tool reading that result.
+
+    ``error_type`` names the category for a client; ``limit`` and ``window``
+    say which cap (``limit`` is 0 for a schedule refusal) and ``resume_at``
+    when the next attempt can succeed, in the schedule's local time.
+    """
+
+    error_type = "limit_exceeded"
+
+    def __init__(self, kind: str, *, limit: int, window: str, resume_at: datetime):
+        self.kind = kind
+        self.limit = limit
+        self.window = window
+        self.resume_at = resume_at
+        when = resume_at.isoformat(timespec="minutes")
+        if limit:
+            reason = f"{kind} limit of {limit} per {window} reached"
+        else:
+            reason = f"{kind} are not sent outside {window}"
+        super().__init__(f"{self.error_type}: {reason}. Resume at {when}.")
+
+    @classmethod
+    def from_section_error(cls, error: dict) -> ActionLimitError:
+        """Rebuild the refusal a section loop filed and stopped on."""
+        return cls(
+            error["kind"],
+            limit=error["limit"],
+            window=error["window"],
+            resume_at=datetime.fromisoformat(error["resume_at"]),
+        )
 
 
 class BrowserBusyError(LinkedInMCPError):

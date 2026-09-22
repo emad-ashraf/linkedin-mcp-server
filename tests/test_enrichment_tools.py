@@ -8,7 +8,7 @@ and never silently drops a queued profile.
 import asyncio
 import logging
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,15 +22,20 @@ from linkedin_mcp_server.core.exceptions import (
     AuthenticationError,
     RateLimitError,
 )
-from linkedin_mcp_server.exceptions import BrowserBusyError
+from linkedin_mcp_server.exceptions import ActionLimitError, BrowserBusyError
 from linkedin_mcp_server.pacing import (
     ACCOUNT_BUDGET_JOB,
+    PROFILE,
     Job,
     JobStore,
     Ledger,
     Schedule,
+    account_budget_in_use,
+    charge_navigation,
     request_arrived_at,
+    schedule_ignored,
 )
+from linkedin_mcp_server.scraping.contracts import limit_exceeded_section_error
 from linkedin_mcp_server.tools.enrichment import (
     RETRY_AFTER_QUEUED_OUT,
     _normalize,
@@ -341,6 +346,262 @@ class TestRunBunch:
 
         assert out["done"] == 1
         assert out["account_spent_last_24h"] == 3  # not 15
+
+    async def test_page_loads_inside_a_bunch_are_charged_exactly_once(
+        self, mcp, store, mock_context, monkeypatch
+    ):
+        """The navigator charges every page load (#58), and this tool records
+        one `actions` unit per load itself. Both writing `actions` would
+        double the count; the navigator writing to disk while this tool saves
+        its own copy would lose the kinds. So the tool hands its copy over and
+        the navigator files only the kind into it."""
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.enrichment.step_delay", lambda **k: 0
+        )
+        await self._seed(mcp, store, ["a", "b"])
+
+        async def scrape_person(username, sections, callbacks=None):
+            # What the real navigator does for the main profile and each
+            # extra section, with the store the navigator would construct.
+            now = datetime.now().astimezone()
+            base = f"https://www.linkedin.com/in/{username}/"
+            charge_navigation(store, base, now)
+            for section in sections:
+                charge_navigation(store, f"{base}details/{section}/", now)
+            return {"url": base, "sections": {"main_profile": "Jane"}}
+
+        extractor = MagicMock()
+        extractor.scrape_person = AsyncMock(side_effect=scrape_person)
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        out = await fn(
+            "j",
+            mock_context,
+            bunch_size=2,
+            sections="experience,education",  # cost = 3
+            extractor=extractor,
+        )
+
+        assert out["done"] == 2
+        assert out["account_spent_last_24h"] == 6  # two profiles, three loads each
+        now = datetime.now().astimezone()
+        assert store.load(ACCOUNT_BUDGET_JOB).ledger.spent_kind(PROFILE, now) == 6
+
+    @staticmethod
+    def _charging_extractor(store, sections=()):
+        """An extractor whose every visit charges the way the navigator does."""
+
+        async def scrape_person(username, requested, callbacks=None):
+            now = datetime.now().astimezone()
+            base = f"https://www.linkedin.com/in/{username}/"
+            charge_navigation(store, base, now)
+            for section in requested:
+                charge_navigation(store, f"{base}details/{section}/", now)
+            return {"url": base, "sections": {"main_profile": "Jane"}}
+
+        extractor = MagicMock()
+        extractor.scrape_person = AsyncMock(side_effect=scrape_person)
+        return extractor
+
+    @staticmethod
+    def _profile_loads(store, count):
+        budget = store.load(ACCOUNT_BUDGET_JOB)
+        now = datetime.now().astimezone()
+        for _ in range(count):
+            budget.ledger.record_kind(PROFILE, now)
+        store.save(budget)
+
+    @pytest.mark.parametrize("shape", ["raised", "filed"])
+    async def test_a_cap_refusal_mid_bunch_keeps_the_profile_queued(
+        self, mcp, store, mock_context, shape
+    ):
+        """The navigator refusing a load is not a fact about the profile.
+        Reproduced with 80 loads in the ledger: the generic handler filed it
+        as the profile's failure and went on to drain the whole queue into
+        `failed` with the same refusal. Both shapes reach here -- raised for
+        a single load, or filed by the section walk with the paid sections."""
+        await self._seed(mcp, store, ["a", "b"])
+        now = datetime.now().astimezone()
+        refusal = ActionLimitError(
+            "profile", limit=80, window="24 h", resume_at=now + timedelta(hours=2)
+        )
+        if shape == "raised":
+            extractor = _extractor(error=refusal)
+        else:
+            extractor = _extractor(
+                result={
+                    "url": "x",
+                    "sections": {"main_profile": "Jane"},
+                    "section_errors": {
+                        "experience": limit_exceeded_section_error(refusal)
+                    },
+                }
+            )
+
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        out = await fn("j", mock_context, bunch_size=2, extractor=extractor)
+
+        assert out["stopped_because"] == "limit_exceeded"
+        assert out["next_run_after_seconds"] == pytest.approx(2 * 3600, abs=5)
+        assert extractor.scrape_person.await_count == 1
+        assert store.load("j").pending == ["a", "b"]
+        assert store.load("j").failed == {}
+        assert out["account_spent_last_24h"] == 0
+
+    async def test_the_profile_cap_plans_the_bunch_before_it_starts(
+        self, mcp, store, mock_context, monkeypatch
+    ):
+        """Never start what cannot finish: with 5 loads of headroom and a
+        cost of 3, one profile is planned, not the bunch of five."""
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.enrichment.step_delay", lambda **k: 0
+        )
+        await self._seed(mcp, store, ["a", "b", "c", "d", "e"])
+        self._profile_loads(store, 75)
+
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        out = await fn(
+            "j",
+            mock_context,
+            bunch_size=5,
+            sections="experience,education",  # cost = 3
+            extractor=self._charging_extractor(store),
+        )
+
+        assert out["done"] == 1
+        assert out["stopped_because"] == "bunch_complete"
+        assert store.load("j").pending == ["b", "c", "d", "e"]
+
+    async def test_no_profile_headroom_stops_before_any_visit(
+        self, mcp, store, mock_context
+    ):
+        await self._seed(mcp, store, ["a"])
+        self._profile_loads(store, 79)
+        extractor = _extractor()
+
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        out = await fn(
+            "j",
+            mock_context,
+            sections="experience",
+            extractor=extractor,  # cost 2
+        )
+
+        assert out["stopped_because"] == "limit_exceeded"
+        # The oldest load frees up in a day; the bunch waits for it.
+        assert out["next_run_after_seconds"] == pytest.approx(24 * 3600, abs=5)
+        extractor.scrape_person.assert_not_awaited()
+        assert store.load("j").pending == ["a"]
+
+    async def test_ignore_schedule_runs_the_loads_on_the_full_cap(
+        self, mcp, store, mock_context
+    ):
+        """A caller who asked for the off-hours catch-up knowingly gets the
+        full profile cap, not the halved one the navigator applies to reads
+        outside the window."""
+        now = datetime.now().astimezone()
+        # Closed now, open again two hours on, whatever the wall clock says.
+        opens = (now.hour + 2) % 24
+        closed_now = Schedule(work_start=opens, work_end=min(opens + 1, 24))
+        _seed_budget(store, schedule=closed_now)
+        await self._seed(mcp, store, ["a"])
+        self._profile_loads(store, 45)  # over the halved 40, under the full 80
+
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        out = await fn(
+            "j",
+            mock_context,
+            ignore_schedule=True,
+            extractor=self._charging_extractor(store),
+        )
+
+        assert out["done"] == 1
+        assert store.load(ACCOUNT_BUDGET_JOB).ledger.spent_kind(PROFILE, now) == 46
+
+    async def test_the_opt_out_lifts_the_bunch_schedule_gate_too(
+        self, mcp, store, mock_context, monkeypatch
+    ):
+        monkeypatch.setenv(EnvironmentKeys.WORKING_HOURS_DISABLED, "1")
+        now = datetime.now().astimezone()
+        opens = (now.hour + 2) % 24
+        _seed_budget(
+            store, schedule=Schedule(work_start=opens, work_end=min(opens + 1, 24))
+        )
+        await self._seed(mcp, store, ["a"])
+
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        out = await fn("j", mock_context, extractor=_extractor())
+
+        assert out["stopped_because"] != "outside_working_hours"
+        assert out["done"] == 1
+
+    @pytest.mark.parametrize("how", ["ignore_schedule", "opt_out"])
+    async def test_a_lifted_gate_paces_the_next_bunch_over_the_clock(
+        self, mcp, store, mock_context, monkeypatch, how
+    ):
+        """Spacing off-hours bunches by the closed schedule answered every
+        one of them with the maximum pause, whichever way the gate was
+        lifted; the caller then waited an hour between one-profile bunches."""
+        monkeypatch.setattr(
+            "linkedin_mcp_server.tools.enrichment.step_delay", lambda **k: 0
+        )
+        monkeypatch.setenv(EnvironmentKeys.BUNCH_PAUSE_MIN_SECONDS, "1")
+        monkeypatch.setenv(EnvironmentKeys.BUNCH_PAUSE_MAX_SECONDS, "100000")
+        if how == "opt_out":
+            monkeypatch.setenv(EnvironmentKeys.WORKING_HOURS_DISABLED, "1")
+        now = datetime.now().astimezone()
+        opens = (now.hour + 2) % 24
+        _seed_budget(
+            store, schedule=Schedule(work_start=opens, work_end=min(opens + 1, 24))
+        )
+        await self._seed(mcp, store, ["a", "b", "c"])
+
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        out = await fn(
+            "j",
+            mock_context,
+            bunch_size=1,
+            ignore_schedule=how == "ignore_schedule",
+            extractor=_extractor(),
+        )
+
+        assert out["stopped_because"] == "bunch_complete"
+        # Spread over what is left of the day, never the closed-window maximum.
+        assert 1 <= out["next_run_after_seconds"] < 100000
+
+    async def test_the_held_budget_is_let_go_on_the_way_out(
+        self, mcp, store, mock_context
+    ):
+        await self._seed(mcp, store, ["a"])
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        await fn("j", mock_context, ignore_schedule=True, extractor=_extractor())
+
+        assert account_budget_in_use.get() is None
+        assert schedule_ignored.get() is False
+
+    async def test_a_last_profile_failing_generically_keeps_its_loads(
+        self, mcp, store, mock_context
+    ):
+        """The navigator files each load's kind into the held copy; a profile
+        that then fails generically saves the job but had no save of the
+        budget, so the loads it made were lost with the copy."""
+        await self._seed(mcp, store, ["a"])
+
+        async def scrape_person(username, requested, callbacks=None):
+            charge_navigation(
+                store,
+                f"https://www.linkedin.com/in/{username}/",
+                datetime.now().astimezone(),
+            )
+            raise RuntimeError("parser blew up after the load")
+
+        extractor = MagicMock()
+        extractor.scrape_person = AsyncMock(side_effect=scrape_person)
+        fn = await get_tool_fn(mcp, "run_enrichment_bunch")
+        await fn("j", mock_context, extractor=extractor)
+
+        now = datetime.now().astimezone()
+        assert store.load("j").failed == {"a": "parser blew up after the load"}
+        assert store.load(ACCOUNT_BUDGET_JOB).ledger.spent_kind(PROFILE, now) == 1
 
     async def test_budget_below_one_profile_cost_stops_cleanly(
         self, mcp, store, mock_context
@@ -880,16 +1141,31 @@ class TestConfigurableLimits:
     applied at call time instead; these prove the environment reaches them.
     """
 
-    async def test_daily_cap_above_the_default_ceiling_is_honoured_when_raised(
-        self, mcp, store, monkeypatch
+    async def test_daily_cap_ceiling_cannot_be_raised_from_the_environment(
+        self, mcp, store, monkeypatch, caplog
     ):
         monkeypatch.setenv(EnvironmentKeys.DAILY_ACTIONS_MAX, "200")
         monkeypatch.setenv(EnvironmentKeys.DAILY_CAP_JITTER, "0")
         fn = await get_tool_fn(mcp, "start_enrichment_job")
+        with caplog.at_level(logging.WARNING):
+            out = await fn("j", ["a"], daily_cap=200, warmup=False)
+
+        assert store.load(ACCOUNT_BUDGET_JOB).daily_cap == 150
+        assert out["account_daily_cap_today"] == 150
+        assert any(
+            EnvironmentKeys.DAILY_ACTIONS_MAX in r.getMessage() for r in caplog.records
+        )
+
+    async def test_daily_cap_ceiling_can_be_lowered_from_the_environment(
+        self, mcp, store, monkeypatch
+    ):
+        monkeypatch.setenv(EnvironmentKeys.DAILY_ACTIONS_MAX, "120")
+        monkeypatch.setenv(EnvironmentKeys.DAILY_CAP_JITTER, "0")
+        fn = await get_tool_fn(mcp, "start_enrichment_job")
         out = await fn("j", ["a"], daily_cap=200, warmup=False)
 
-        assert store.load(ACCOUNT_BUDGET_JOB).daily_cap == 200
-        assert out["account_daily_cap_today"] == 200
+        assert store.load(ACCOUNT_BUDGET_JOB).daily_cap == 120
+        assert out["account_daily_cap_today"] == 120
 
     async def test_daily_cap_above_the_ceiling_is_clamped_not_rejected(
         self, mcp, store, caplog

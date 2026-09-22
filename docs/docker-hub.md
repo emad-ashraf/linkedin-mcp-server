@@ -137,7 +137,12 @@ Use `$env:USERPROFILE\.linkedin-mcp` when constructing the host path outside JSO
 | `TOOL_CALL_GAP_JITTER` | `0.2` | ± fraction applied to `TOOL_CALL_GAP_SECONDS`. |
 | `NAV_DELAY_SECONDS` | `2` | Pause between page navigations inside one tool call, in seconds. |
 | `AUTH_PROBE_CACHE_SECONDS` | `1800` | How long a passed `/feed/` session check is reused across server starts with the same cookies, in seconds (`0` = check on every start). |
-| `DAILY_ACTIONS_MAX` | `150` | Ceiling on any enrichment job's `daily_cap`. Raising it raises detection exposure in step; the defaults are the deliberate ceiling. |
+| `DAILY_ACTIONS_MAX` | `150` | Ceiling on any enrichment job's `daily_cap`. May only be lowered; a higher value is clamped with a warning, since raising it raises detection exposure in step. |
+| `PROFILE_LOADS_MAX` | `80` | Profile page loads per rolling 24 h. May only be lowered. The budget is charged per page load, and a call that would break a cap is refused with `limit_exceeded` and the time to resume. |
+| `SEARCH_PAGES_MAX` | `60` | Search result pages per rolling 24 h. May only be lowered. |
+| `INVITES_MAX` / `INVITES_WEEKLY_MAX` | `20` / `100` | Invitations per rolling 24 h / 7 d. May only be lowered. |
+| `MESSAGES_MAX` | `50` | Messages per rolling 24 h. May only be lowered. |
+| `WORKING_HOURS_DISABLED` | off | The account budget is on business hours by default (09:00-18:00, lunch and weekends off): invitations and messages wait for the window, and profile/search loads run on half their cap outside it. `1` turns both off. The hours follow the container's clock, which is UTC unless `TZ` is set (`-e TZ=Europe/Berlin`). |
 | `DAILY_ACTIONS_DEFAULT` | `100` | `daily_cap` when a job does not set one. |
 | `DAILY_CAP_JITTER` | `0.15` | Fraction shaved off the daily cap at random each day. |
 | `WARMUP_CAPS` | `10,20,50` | Per-day caps during the warm-up ramp, one per step. |

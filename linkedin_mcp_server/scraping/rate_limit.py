@@ -17,6 +17,7 @@ import logging
 import re
 
 from linkedin_mcp_server.config.loaders import EnvironmentKeys
+
 # The committed 429 and the redirect loop live in ``core.rate_limit_markers``,
 # where the auth probe can read them too; re-exported here for the navigator.
 from linkedin_mcp_server.core.rate_limit_markers import (

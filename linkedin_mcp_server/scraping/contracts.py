@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.scraping.identifiers import (
     normalize_person_identifier,
     person_profile_url,
@@ -61,6 +62,23 @@ def rate_limited_section_error() -> dict[str, str]:
     return {
         "error_type": "rate_limit",
         "error_message": RATE_LIMITED_SECTION_TEXT,
+    }
+
+
+def limit_exceeded_section_error(error: ActionLimitError) -> dict[str, Any]:
+    """The ``section_errors`` entry for a section a cap refused to load.
+
+    Filed once, for the section the walk stopped at, with the fields a caller
+    needs to wait it out; the sections loaded before it are returned as paid
+    for. ``ActionLimitError.from_section_error`` reads this back.
+    """
+    return {
+        "error_type": error.error_type,
+        "error_message": str(error),
+        "kind": error.kind,
+        "limit": error.limit,
+        "window": error.window,
+        "resume_at": error.resume_at.isoformat(),
     }
 
 

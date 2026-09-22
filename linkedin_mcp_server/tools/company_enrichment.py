@@ -63,11 +63,15 @@ from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_er
 from linkedin_mcp_server.error_handler import raise_tool_error
 from linkedin_mcp_server.pacing import (
     JobStore,
+    Schedule,
+    account_budget_in_use,
     bunch_searches_max,
     load_account_budget,
     next_bunch_delay,
     request_arrived_at,
+    schedule_ignored,
     step_delay,
+    working_hours_enforced,
 )
 from linkedin_mcp_server.scraping.company_parse import (
     has_about_labels,
@@ -78,11 +82,13 @@ from linkedin_mcp_server.scraping.company_parse import (
 )
 from linkedin_mcp_server.scraping.contracts import RATE_LIMITED_SECTION_TEXT
 from linkedin_mcp_server.scraping.identifiers import company_page_url
+from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.tools.enrichment import (
     RETRY_AFTER_QUEUED_OUT,
     _browser_gone,
     _BrowserGone,
     _closed_target_filed,
+    _limit_filed,
     _RelaunchFailed,
     _soft_rate_limit,
 )
@@ -144,6 +150,10 @@ def register_company_enrichment_tools(
         # dead browser looks like from here -- but only when the filed error
         # says so (see ``_BrowserGone``); a timed-out or auth-walled About is
         # a failed load like any other.
+        # Unreachable while the company kind carries no cap; the day one is
+        # added, a refused About must stop the bunch, not read as a bad page.
+        if refused := _limit_filed(result):
+            raise refused
         if "about" not in sections:
             errors = result.get("section_errors", {})
             error = errors.get("about", {})
@@ -243,371 +253,422 @@ def register_company_enrichment_tools(
 
         now = datetime.now().astimezone()
         budget = load_account_budget(jobs, now)
+        # The navigations below file their kind into this copy, which is the
+        # one saved as it goes; `actions` is recorded here, per navigation.
+        token = account_budget_in_use.set(budget)
+        ignored = schedule_ignored.set(ignore_schedule)
+        try:
+            # "Already resolved" for the search tier means we hold something worth
+            # not re-searching: the company's LinkedIn URL, or fresh firmographics
+            # from a deep fetch. (A search write is never stamped fresh, so keying
+            # serve-from-cache on freshness alone would re-search every resolved
+            # company forever.) With ``about`` on the bar is fresh firmographics,
+            # since the URL alone is not what was asked.
+            def _resolved(rec: Any) -> bool:
+                if rec is None:
+                    return False
+                fresh = rec.firmographics_fresh(now, cache.firmographics_ttl)
+                return fresh or (not about and bool(rec.linkedin_url))
 
-        # "Already resolved" for the search tier means we hold something worth
-        # not re-searching: the company's LinkedIn URL, or fresh firmographics
-        # from a deep fetch. (A search write is never stamped fresh, so keying
-        # serve-from-cache on freshness alone would re-search every resolved
-        # company forever.) With ``about`` on the bar is fresh firmographics,
-        # since the URL alone is not what was asked.
-        def _resolved(rec: Any) -> bool:
-            if rec is None:
-                return False
-            fresh = rec.firmographics_fresh(now, cache.firmographics_ttl)
-            return fresh or (not about and bool(rec.linkedin_url))
-
-        served: dict[str, dict] = {}
-        to_fetch: list[str] = []
-        for name in company_names:
-            if not name.strip():
-                continue
-            if "/company/" in name:
-                # A URL already says what a search would find: the slug.
-                # Searched anyway it cost a navigation and, matched against
-                # the URL's own words, came back with no confident match. Work
-                # on the slug so the cache, the About load and the result
-                # share one key, and seed the URL a search would have cached.
-                name = _slug(name)
-                rec = cache.get(name)
-                if rec is None or not rec.linkedin_url:
-                    cache.record_firmographics(
-                        name, now, source="search", linkedin_url=company_page_url(name)
-                    )
-            rec = cache.get(name)
-            if not refresh and _resolved(rec):
-                served[name] = _firmographics_view(rec, "cache")
-            else:
-                to_fetch.append(name)
-
-        if not to_fetch:
-            return {
-                "served_from_cache": len(served),
-                "fetched": 0,
-                "about_loaded": 0,
-                "results": served,
-                "stopped_because": "all_cached",
-            }
-
-        if not ignore_schedule and not budget.schedule.is_open(now):
-            opens = budget.schedule.next_open(now)
-            return _paced_return(
-                served,
-                0,
-                "outside_working_hours",
-                (opens - now).total_seconds(),
-                detail=f"Working window reopens {opens.isoformat(timespec='minutes')}.",
-            )
-
-        remaining = budget.remaining_today(now)
-        if remaining <= 0:
-            return _paced_return(
-                served,
-                0,
-                "daily_budget_spent",
-                budget.ledger.next_expiry(now),
-                detail="Shared 24h action budget spent; refills gradually.",
-            )
-
-        # From arrival at the middleware, not from here; see the same
-        # computation in run_enrichment_bunch for the 210 s proxy deadline
-        # a queued call can outlive before its own timeout has started.
-        arrived = request_arrived_at.get()
-        deadline = (
-            time.monotonic() if arrived is None else arrived
-        ) + tool_timeout * DEADLINE_FRACTION
-        if time.monotonic() >= deadline:
-            return _paced_return(
-                served,
-                0,
-                "tool_deadline",
-                RETRY_AFTER_QUEUED_OUT,
-                detail=(
-                    "Queued behind other calls for longer than the tool "
-                    "deadline; nothing was loaded and nothing was charged. "
-                    "Call again."
-                ),
-            )
-
-        extractor = extractor or await get_ready_extractor(
-            ctx, tool_name="enrich_companies"
-        )
-        rng = random.Random()
-        spent = 0
-        about_loaded = 0
-        stopped = "bunch_complete"
-
-        def _navigations() -> int:
-            return spent + about_loaded
-
-        def _rate_limited() -> dict[str, Any]:
-            jobs.save(budget)
-            return _paced_return(
-                served,
-                spent,
-                "rate_limited",
-                max(budget.ledger.next_expiry(now), 3600.0),
-                detail="LinkedIn rate-limited; progress saved. Wait ~1h.",
-                about_loaded=about_loaded,
-            )
-
-        async def _search(name: str) -> dict[str, Any]:
-            """One company search, with both shapes of a dead browser raised
-            as ``_BrowserGone`` and a soft rate limit raised as such."""
-            try:
-                # ty: `nonlocal` rebinding in _relaunch loses the narrowing
-                # from the acquisition above, so read it as what it is.
-                live: Any = extractor
-                result = await live.search_companies(name)
-            except Exception as e:
-                if _browser_gone(e):
-                    raise _BrowserGone(str(e)) from e
-                raise
-            if not result.get("sections"):
-                # With nothing loaded, a filed rate limit is the whole answer,
-                # and it is a rate limit, not a dead browser.
-                if limit := _soft_rate_limit(result):
-                    raise RateLimitError(limit)
-                errors = result.get("section_errors", {})
-                if _closed_target_filed(errors):
-                    raise _BrowserGone("search page came back empty", errors)
-            return result
-
-        async def _relaunch(name: str) -> None:
-            # Re-acquiring goes through get_or_create_browser, which relaunches
-            # a dead browser; the extractor is bound to the old page, so it is
-            # re-created too. The caller retries the same navigation once.
-            nonlocal extractor
-            logger.warning("browser gone under %s; relaunching and retrying once", name)
-            try:
-                extractor = await get_ready_extractor(ctx, tool_name="enrich_companies")
-            except Exception as e:
-                raise _RelaunchFailed(e) from e
-
-        def _relaunch_failed(e: _RelaunchFailed) -> NoReturn:
-            # The name was never loaded and stays outstanding, uncharged.
-            jobs.save(budget)
-            raise_tool_error(e.cause, "enrich_companies")
-
-        def _browser_unavailable(e: _BrowserGone) -> dict[str, Any]:
-            # A closed browser is not a fact about the company; nothing was
-            # loaded, so nothing is charged, and the name stays outstanding.
-            logger.warning("Browser unavailable during company enrichment: %s", e)
-            jobs.save(budget)
-            out = _paced_return(
-                served,
-                spent,
-                "browser_unavailable",
-                60.0,
-                detail=(
-                    "The browser is gone and a relaunch did not bring it back; "
-                    "nothing was loaded and nothing was charged. Progress saved."
-                ),
-                about_loaded=about_loaded,
-            )
-            if e.section_errors:
-                out["section_errors"] = e.section_errors
-            return out
-
-        async def _session_expired(e: AuthenticationError) -> NoReturn:
-            # An expired session fails every remaining navigation the same
-            # way, so the bunch stops here rather than burning one load per
-            # name left. The caller has charged the load that found it.
-            jobs.save(budget)
-            try:
-                await handle_auth_error(e, ctx)
-            except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "enrich_companies")
-
-        # `bunch_searches` bounds the number of *navigations actually run*, not
-        # the number of names looked at: a name resolved for free from the
-        # cache (or in passing by an earlier search this call) must not burn a
-        # slot. So iterate the whole to_fetch list and stop once the bunch is
-        # spent, the deadline nears, or the budget can't afford one more load.
-        for name in to_fetch:
-            if _navigations() >= bunch_searches:
-                break
-            if time.monotonic() >= deadline:
-                stopped = "tool_deadline"
-                break
-
-            # A prior search this call may already have resolved this name in
-            # passing (its URL got cached); serve it free, no search spent.
-            rec = cache.get(name)
-            if not refresh and _resolved(rec):
-                served[name] = _firmographics_view(rec, "cache")
-                continue
-
-            if budget.remaining_today(now) <= 0:
-                stopped = "daily_budget_spent"
-                break
-
-            # The search is what turns a name into a /company/ URL. A name
-            # whose URL is already cached (from an earlier call, without
-            # ``about``) skips straight to the About load below.
-            if refresh or rec is None or not rec.linkedin_url:
-                try:
-                    try:
-                        result = await _search(name)
-                    except _BrowserGone:
-                        await _relaunch(name)
-                        result = await _search(name)
-                except _RelaunchFailed as e:
-                    _relaunch_failed(e)
-                except _BrowserGone as e:
-                    return _browser_unavailable(e)
-                except RateLimitError as e:
-                    logger.warning("Rate limited during company enrichment: %s", e)
-                    # The refused navigation is one LinkedIn counted too.
-                    budget.ledger.record(now)
-                    spent += 1
-                    return _rate_limited()
-                except AuthenticationError as e:
-                    budget.ledger.record(now)
-                    spent += 1
-                    await _session_expired(e)
-                except Exception as e:
-                    logger.info("Company search failed for %s: %s", name, e)
-                    served[name] = {"status": "search_failed", "error": str(e)[:160]}
-                    budget.ledger.record(now)  # the page load still happened
-                    spent += 1
-                    jobs.save(budget)
+            served: dict[str, dict] = {}
+            to_fetch: list[str] = []
+            for name in company_names:
+                if not name.strip():
                     continue
+                if "/company/" in name:
+                    # A URL already says what a search would find: the slug.
+                    # Searched anyway it cost a navigation and, matched against
+                    # the URL's own words, came back with no confident match. Work
+                    # on the slug so the cache, the About load and the result
+                    # share one key, and seed the URL a search would have cached.
+                    name = _slug(name)
+                    rec = cache.get(name)
+                    if rec is None or not rec.linkedin_url:
+                        cache.record_firmographics(
+                            name,
+                            now,
+                            source="search",
+                            linkedin_url=company_page_url(name),
+                        )
+                rec = cache.get(name)
+                if not refresh and _resolved(rec):
+                    served[name] = _firmographics_view(rec, "cache")
+                else:
+                    to_fetch.append(name)
 
-                budget.ledger.record(now)
-                spent += 1
-                jobs.save(budget)
-
-                text = result.get("sections", {}).get("search_results", "")
-                refs = result.get("references", {}).get("search_results", [])
-                hits = parse_search_results(refs)
-                cards = {
-                    _slug(card["url"]): card
-                    for card in parse_company_cards(text, refs)
-                    if card["url"]
+            if not to_fetch:
+                return {
+                    "served_from_cache": len(served),
+                    "fetched": 0,
+                    "about_loaded": 0,
+                    "results": served,
+                    "stopped_because": "all_cached",
                 }
 
-                # Cache every company the results page revealed, so overlapping
-                # names later in the list become free hits: the URL, plus the
-                # industry, location and follower count its card showed. NOT
-                # the results-page text: that blob is the whole page (all ~10
-                # companies), not this company's About, so persisting a copy on
-                # every record would bloat the cache and mislead. The page text is
-                # still returned at call level below for the LLM to read.
-                for hit in hits:
-                    card = cards.get(hit["slug"], {})
-                    cache.record_firmographics(
-                        hit["name"],
-                        now,
-                        source="search",
-                        industry=card.get("industry") or "",
-                        headquarters=card.get("location") or "",
-                        followers=card.get("followers"),
-                        linkedin_url=hit["url"],
-                    )
-                # Attribute a hit to the requested name only when it actually
-                # matches: cache.get(name) normalises both sides and hits iff one
-                # of the just-cached companies shares the query's normalised key.
-                # Never fall back to hits[0] -- the top result for "Deloitte
-                # Digital" may be "Deloitte", a different company. On no match,
-                # hand back the candidates and the raw page for the LLM to judge.
-                rec = cache.get(name)
-                if rec is not None and rec.linkedin_url:
-                    served[name] = _firmographics_view(rec, "search", fallback_raw=text)
-                else:
-                    served[name] = {
-                        "status": "no_confident_match",
-                        "source": "search",
-                        "candidates": [h["name"] for h in hits[:10]],
-                        "raw_about": text,
-                    }
-
-            # The About load is a second navigation for the same company, so
-            # it gets its own slot, budget check, and step delay. When the
-            # bunch cannot afford it the search view already served above
-            # stands, and the name stays outstanding for the next call.
-            if (
-                about
-                and rec is not None
-                and rec.linkedin_url
-                and (
-                    refresh or not rec.firmographics_fresh(now, cache.firmographics_ttl)
+            # See run_enrichment_bunch: a lifted gate paces over the clock.
+            gate_lifted = ignore_schedule or not working_hours_enforced()
+            pacing_schedule = Schedule() if gate_lifted else budget.schedule
+            if not gate_lifted and not budget.schedule.is_open(now):
+                opens = budget.schedule.next_open(now)
+                return _paced_return(
+                    served,
+                    0,
+                    "outside_working_hours",
+                    (opens - now).total_seconds(),
+                    detail=f"Working window reopens {opens.isoformat(timespec='minutes')}.",
                 )
-                and _navigations() < bunch_searches
-            ):
-                if budget.remaining_today(now) <= 0:
-                    stopped = "daily_budget_spent"
+
+            remaining = budget.remaining_today(now)
+            if remaining <= 0:
+                return _paced_return(
+                    served,
+                    0,
+                    "daily_budget_spent",
+                    budget.ledger.next_expiry(now),
+                    detail="Shared 24h action budget spent; refills gradually.",
+                )
+
+            # From arrival at the middleware, not from here; see the same
+            # computation in run_enrichment_bunch for the 210 s proxy deadline
+            # a queued call can outlive before its own timeout has started.
+            arrived = request_arrived_at.get()
+            deadline = (
+                time.monotonic() if arrived is None else arrived
+            ) + tool_timeout * DEADLINE_FRACTION
+            if time.monotonic() >= deadline:
+                return _paced_return(
+                    served,
+                    0,
+                    "tool_deadline",
+                    RETRY_AFTER_QUEUED_OUT,
+                    detail=(
+                        "Queued behind other calls for longer than the tool "
+                        "deadline; nothing was loaded and nothing was charged. "
+                        "Call again."
+                    ),
+                )
+
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="enrich_companies"
+            )
+            rng = random.Random()
+            spent = 0
+            about_loaded = 0
+            stopped = "bunch_complete"
+
+            def _navigations() -> int:
+                return spent + about_loaded
+
+            def _rate_limited() -> dict[str, Any]:
+                jobs.save(budget)
+                return _paced_return(
+                    served,
+                    spent,
+                    "rate_limited",
+                    max(budget.ledger.next_expiry(now), 3600.0),
+                    detail="LinkedIn rate-limited; progress saved. Wait ~1h.",
+                    about_loaded=about_loaded,
+                )
+
+            def _limit_exceeded(e: ActionLimitError) -> dict[str, Any]:
+                # The ledger refused a load before it happened: nothing is
+                # charged, the name stays outstanding, and the error says
+                # when to come back. Never recorded -- a refusal is not a
+                # page load LinkedIn saw -- and never filed as the name's
+                # own failure, which would repeat it for every name left.
+                jobs.save(budget)
+                return _paced_return(
+                    served,
+                    spent,
+                    "limit_exceeded",
+                    max((e.resume_at - now).total_seconds(), 0.0),
+                    detail=str(e),
+                    about_loaded=about_loaded,
+                )
+
+            async def _search(name: str) -> dict[str, Any]:
+                """One company search, with both shapes of a dead browser raised
+                as ``_BrowserGone`` and a soft rate limit raised as such."""
+                try:
+                    # ty: `nonlocal` rebinding in _relaunch loses the narrowing
+                    # from the acquisition above, so read it as what it is.
+                    live: Any = extractor
+                    result = await live.search_companies(name)
+                except Exception as e:
+                    if _browser_gone(e):
+                        raise _BrowserGone(str(e)) from e
+                    raise
+                if refused := _limit_filed(result):
+                    raise refused
+                if not result.get("sections"):
+                    # With nothing loaded, a filed rate limit is the whole answer,
+                    # and it is a rate limit, not a dead browser.
+                    if limit := _soft_rate_limit(result):
+                        raise RateLimitError(limit)
+                    errors = result.get("section_errors", {})
+                    if _closed_target_filed(errors):
+                        raise _BrowserGone("search page came back empty", errors)
+                return result
+
+            async def _relaunch(name: str) -> None:
+                # Re-acquiring goes through get_or_create_browser, which relaunches
+                # a dead browser; the extractor is bound to the old page, so it is
+                # re-created too. The caller retries the same navigation once.
+                nonlocal extractor
+                logger.warning(
+                    "browser gone under %s; relaunching and retrying once", name
+                )
+                try:
+                    extractor = await get_ready_extractor(
+                        ctx, tool_name="enrich_companies"
+                    )
+                except Exception as e:
+                    raise _RelaunchFailed(e) from e
+
+            def _relaunch_failed(e: _RelaunchFailed) -> NoReturn:
+                # The name was never loaded and stays outstanding, uncharged.
+                jobs.save(budget)
+                raise_tool_error(e.cause, "enrich_companies")
+
+            def _browser_unavailable(e: _BrowserGone) -> dict[str, Any]:
+                # A closed browser is not a fact about the company; nothing was
+                # loaded, so nothing is charged, and the name stays outstanding.
+                logger.warning("Browser unavailable during company enrichment: %s", e)
+                jobs.save(budget)
+                out = _paced_return(
+                    served,
+                    spent,
+                    "browser_unavailable",
+                    60.0,
+                    detail=(
+                        "The browser is gone and a relaunch did not bring it back; "
+                        "nothing was loaded and nothing was charged. Progress saved."
+                    ),
+                    about_loaded=about_loaded,
+                )
+                if e.section_errors:
+                    out["section_errors"] = e.section_errors
+                return out
+
+            async def _session_expired(e: AuthenticationError) -> NoReturn:
+                # An expired session fails every remaining navigation the same
+                # way, so the bunch stops here rather than burning one load per
+                # name left. The caller has charged the load that found it.
+                jobs.save(budget)
+                try:
+                    await handle_auth_error(e, ctx)
+                except Exception as relogin_exc:
+                    raise_tool_error(relogin_exc, "enrich_companies")
+
+            # `bunch_searches` bounds the number of *navigations actually run*, not
+            # the number of names looked at: a name resolved for free from the
+            # cache (or in passing by an earlier search this call) must not burn a
+            # slot. So iterate the whole to_fetch list and stop once the bunch is
+            # spent, the deadline nears, or the budget can't afford one more load.
+            for name in to_fetch:
+                if _navigations() >= bunch_searches:
                     break
-                # The loop-top check ran before the search; a slow search can
-                # have carried past the deadline since.
                 if time.monotonic() >= deadline:
                     stopped = "tool_deadline"
                     break
-                await asyncio.sleep(step_delay(rng=rng))
-                try:
+
+                # A prior search this call may already have resolved this name in
+                # passing (its URL got cached); serve it free, no search spent.
+                rec = cache.get(name)
+                if not refresh and _resolved(rec):
+                    served[name] = _firmographics_view(rec, "cache")
+                    continue
+
+                if budget.remaining_today(now) <= 0:
+                    stopped = "daily_budget_spent"
+                    break
+
+                # The search is what turns a name into a /company/ URL. A name
+                # whose URL is already cached (from an earlier call, without
+                # ``about``) skips straight to the About load below.
+                if refresh or rec is None or not rec.linkedin_url:
                     try:
-                        await _load_about(
-                            extractor,
-                            name,
-                            _slug(rec.linkedin_url),
-                            now,
-                            rec.company_urn,
-                        )
-                    except _BrowserGone:
-                        await _relaunch(name)
-                        await _load_about(
-                            extractor,
-                            name,
-                            _slug(rec.linkedin_url),
-                            now,
-                            rec.company_urn,
-                        )
-                except _RelaunchFailed as e:
-                    _relaunch_failed(e)
-                except _BrowserGone as e:
-                    return _browser_unavailable(e)
-                except RateLimitError as e:
-                    logger.warning("Rate limited during About load: %s", e)
+                        try:
+                            result = await _search(name)
+                        except _BrowserGone:
+                            await _relaunch(name)
+                            result = await _search(name)
+                    except _RelaunchFailed as e:
+                        _relaunch_failed(e)
+                    except _BrowserGone as e:
+                        return _browser_unavailable(e)
+                    except ActionLimitError as e:
+                        return _limit_exceeded(e)
+                    except RateLimitError as e:
+                        logger.warning("Rate limited during company enrichment: %s", e)
+                        # The refused navigation is one LinkedIn counted too.
+                        budget.ledger.record(now)
+                        spent += 1
+                        return _rate_limited()
+                    except AuthenticationError as e:
+                        budget.ledger.record(now)
+                        spent += 1
+                        await _session_expired(e)
+                    except Exception as e:
+                        logger.info("Company search failed for %s: %s", name, e)
+                        served[name] = {
+                            "status": "search_failed",
+                            "error": str(e)[:160],
+                        }
+                        budget.ledger.record(now)  # the page load still happened
+                        spent += 1
+                        jobs.save(budget)
+                        continue
+
                     budget.ledger.record(now)
+                    spent += 1
+                    jobs.save(budget)
+
+                    text = result.get("sections", {}).get("search_results", "")
+                    refs = result.get("references", {}).get("search_results", [])
+                    hits = parse_search_results(refs)
+                    cards = {
+                        _slug(card["url"]): card
+                        for card in parse_company_cards(text, refs)
+                        if card["url"]
+                    }
+
+                    # Cache every company the results page revealed, so overlapping
+                    # names later in the list become free hits: the URL, plus the
+                    # industry, location and follower count its card showed. NOT
+                    # the results-page text: that blob is the whole page (all ~10
+                    # companies), not this company's About, so persisting a copy on
+                    # every record would bloat the cache and mislead. The page text is
+                    # still returned at call level below for the LLM to read.
+                    for hit in hits:
+                        card = cards.get(hit["slug"], {})
+                        cache.record_firmographics(
+                            hit["name"],
+                            now,
+                            source="search",
+                            industry=card.get("industry") or "",
+                            headquarters=card.get("location") or "",
+                            followers=card.get("followers"),
+                            linkedin_url=hit["url"],
+                        )
+                    # Attribute a hit to the requested name only when it actually
+                    # matches: cache.get(name) normalises both sides and hits iff one
+                    # of the just-cached companies shares the query's normalised key.
+                    # Never fall back to hits[0] -- the top result for "Deloitte
+                    # Digital" may be "Deloitte", a different company. On no match,
+                    # hand back the candidates and the raw page for the LLM to judge.
+                    rec = cache.get(name)
+                    if rec is not None and rec.linkedin_url:
+                        served[name] = _firmographics_view(
+                            rec, "search", fallback_raw=text
+                        )
+                    else:
+                        served[name] = {
+                            "status": "no_confident_match",
+                            "source": "search",
+                            "candidates": [h["name"] for h in hits[:10]],
+                            "raw_about": text,
+                        }
+
+                # The About load is a second navigation for the same company, so
+                # it gets its own slot, budget check, and step delay. When the
+                # bunch cannot afford it the search view already served above
+                # stands, and the name stays outstanding for the next call.
+                if (
+                    about
+                    and rec is not None
+                    and rec.linkedin_url
+                    and (
+                        refresh
+                        or not rec.firmographics_fresh(now, cache.firmographics_ttl)
+                    )
+                    and _navigations() < bunch_searches
+                ):
+                    if budget.remaining_today(now) <= 0:
+                        stopped = "daily_budget_spent"
+                        break
+                    # The loop-top check ran before the search; a slow search can
+                    # have carried past the deadline since.
+                    if time.monotonic() >= deadline:
+                        stopped = "tool_deadline"
+                        break
+                    await asyncio.sleep(step_delay(rng=rng))
+                    try:
+                        try:
+                            await _load_about(
+                                extractor,
+                                name,
+                                _slug(rec.linkedin_url),
+                                now,
+                                rec.company_urn,
+                            )
+                        except _BrowserGone:
+                            await _relaunch(name)
+                            await _load_about(
+                                extractor,
+                                name,
+                                _slug(rec.linkedin_url),
+                                now,
+                                rec.company_urn,
+                            )
+                    except _RelaunchFailed as e:
+                        _relaunch_failed(e)
+                    except _BrowserGone as e:
+                        return _browser_unavailable(e)
+                    except ActionLimitError as e:
+                        return _limit_exceeded(e)
+                    except RateLimitError as e:
+                        logger.warning("Rate limited during About load: %s", e)
+                        budget.ledger.record(now)
+                        about_loaded += 1
+                        return _rate_limited()
+                    except AuthenticationError as e:
+                        budget.ledger.record(now)
+                        about_loaded += 1
+                        await _session_expired(e)
+                    except Exception as e:
+                        logger.info("About load failed for %s: %s", name, e)
+                        # No search ran when the URL was already cached, so there
+                        # may be no view yet to hang the error on.
+                        view = served.setdefault(
+                            name, _firmographics_view(rec, "cache")
+                        )
+                        view["about_error"] = str(e)[:160]
+                    else:
+                        served[name] = _firmographics_view(
+                            cache.get(name), "company_page"
+                        )
+                    budget.ledger.record(now)  # the page load happened either way
                     about_loaded += 1
-                    return _rate_limited()
-                except AuthenticationError as e:
-                    budget.ledger.record(now)
-                    about_loaded += 1
-                    await _session_expired(e)
-                except Exception as e:
-                    logger.info("About load failed for %s: %s", name, e)
-                    # No search ran when the URL was already cached, so there
-                    # may be no view yet to hang the error on.
-                    view = served.setdefault(name, _firmographics_view(rec, "cache"))
-                    view["about_error"] = str(e)[:160]
-                else:
-                    served[name] = _firmographics_view(cache.get(name), "company_page")
-                budget.ledger.record(now)  # the page load happened either way
-                about_loaded += 1
-                jobs.save(budget)
+                    jobs.save(budget)
+
+                now = datetime.now().astimezone()
+                await ctx.report_progress(
+                    progress=_navigations(),
+                    total=bunch_searches,
+                    message=f"{spent} searched, {about_loaded} about, {len(served)} known",
+                )
+                if _navigations() < bunch_searches:
+                    await asyncio.sleep(step_delay(rng=rng))
 
             now = datetime.now().astimezone()
-            await ctx.report_progress(
-                progress=_navigations(),
-                total=bunch_searches,
-                message=f"{spent} searched, {about_loaded} about, {len(served)} known",
+            remaining = budget.remaining_today(now)
+            outstanding = sum(1 for n in to_fetch if not _resolved(cache.get(n)))
+            if remaining <= 0:
+                stopped, wait = "daily_budget_spent", budget.ledger.next_expiry(now)
+            elif outstanding == 0:
+                stopped, wait = "all_done", None
+            else:
+                wait = next_bunch_delay(
+                    remaining, bunch_searches, now, pacing_schedule, rng
+                )
+            jobs.save(budget)
+            return _paced_return(
+                served, spent, stopped, wait, about_loaded=about_loaded
             )
-            if _navigations() < bunch_searches:
-                await asyncio.sleep(step_delay(rng=rng))
-
-        now = datetime.now().astimezone()
-        remaining = budget.remaining_today(now)
-        outstanding = sum(1 for n in to_fetch if not _resolved(cache.get(n)))
-        if remaining <= 0:
-            stopped, wait = "daily_budget_spent", budget.ledger.next_expiry(now)
-        elif outstanding == 0:
-            stopped, wait = "all_done", None
-        else:
-            wait = next_bunch_delay(
-                remaining, bunch_searches, now, budget.schedule, rng
-            )
-        jobs.save(budget)
-        return _paced_return(served, spent, stopped, wait, about_loaded=about_loaded)
+        finally:
+            account_budget_in_use.reset(token)
+            schedule_ignored.reset(ignored)
 
     @mcp.tool(
         timeout=tool_timeout,
@@ -665,119 +726,121 @@ def register_company_enrichment_tools(
             }
 
         budget = load_account_budget(jobs, now)
-        needed = int(want_firmographics) + int(want_jobs)
-        if budget.remaining_today(now) < needed:
-            return {
-                "company": company,
-                "status": "daily_budget_spent",
-                "next_run_after_seconds": round(budget.ledger.next_expiry(now)),
-                **_firmographics_view(rec, "cache"),
-            }
-
-        extractor = extractor or await get_ready_extractor(
-            ctx, tool_name="enrich_company_deep"
-        )
-        urn = rec.company_urn if rec else ""
-        # Why the jobs half was not recorded, when it was wanted and the load
-        # came back unusable; the caller must not read that as a refresh.
-        jobs_failure: str | None = None
-
+        token = account_budget_in_use.set(budget)
         try:
-            # Firmographics from the About tab; also yields the numeric company
-            # URN, which the open-roles lookup below is keyed on.
-            if want_firmographics:
-                try:
-                    urn = await _load_about(extractor, slug, slug, now, urn)
-                finally:
-                    # Charged whether About loaded, was rate-limited,
-                    # auth-walled or crashed: the navigation happened either
-                    # way -- same as enrich_companies -- and on failure the
-                    # record is left stale for a retry rather than never
-                    # recorded.
-                    budget.ledger.record(now)
-                    jobs.save(budget)
+            needed = int(want_firmographics) + int(want_jobs)
+            if budget.remaining_today(now) < needed:
+                return {
+                    "company": company,
+                    "status": "daily_budget_spent",
+                    "next_run_after_seconds": round(budget.ledger.next_expiry(now)),
+                    **_firmographics_view(rec, "cache"),
+                }
 
-            # Open roles come from job SEARCH filtered by the company URN -- the
-            # company Page's own /jobs/ tab is empty for most employers. Needs
-            # the URN, so a jobs-only refresh relies on the one cached earlier.
-            if want_jobs and urn:
-                jobs_url = (
-                    f"https://www.linkedin.com/jobs/search/?f_C={urn}&geoId=92000000"
-                )
-                try:
-                    extracted = await extractor.extract_page(
-                        jobs_url, section_name="jobs"
-                    )
-                finally:
-                    budget.ledger.record(now)
-                    jobs.save(budget)
-                text = extracted.text or ""
-                # extract_page can hand back an error section or the soft
-                # rate-limit sentinel *without raising*. Caching that would
-                # stamp jobs fresh for the TTL and serve a failed lookup as
-                # real data. Only record on a genuine page; the load happened
-                # either way, so it still costs a budget action, and the jobs
-                # half stays stale so the next call retries.
-                if text == RATE_LIMITED_SECTION_TEXT:
-                    jobs_failure = "rate_limited"
-                elif extracted.error:
-                    jobs_failure = str(
-                        extracted.error.get("error_message") or "extraction failed"
-                    )[:160]
-                elif not text:
-                    jobs_failure = "empty page"
-                else:
-                    parsed = parse_job_search(text)
-                    cache.record_jobs(
-                        slug,
-                        now,
-                        count=parsed.count,
-                        sample=parsed.sample,
-                        raw_jobs=text,
-                    )
-        except RateLimitError:
-            # Already charged: each navigation above records in its finally.
-            jobs.save(budget)
-            return {
-                "company": company,
-                "next_run_after_seconds": 3600,
-                **_firmographics_view(cache.get(slug) or rec, "cache"),
-                # After the view: an uncached company's view carries its own
-                # "unknown" status, and the rate limit is the answer here.
-                "status": "rate_limited",
-            }
-        except AuthenticationError as e:
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="enrich_company_deep"
+            )
+            urn = rec.company_urn if rec else ""
+            # Why the jobs half was not recorded, when it was wanted and the load
+            # came back unusable; the caller must not read that as a refresh.
+            jobs_failure: str | None = None
+
             try:
-                await handle_auth_error(e, ctx)
-            except Exception as relogin_exc:
-                raise_tool_error(relogin_exc, "enrich_company_deep")
-        except Exception as e:
-            raise_tool_error(e, "enrich_company_deep")  # NoReturn
+                # Firmographics from the About tab; also yields the numeric company
+                # URN, which the open-roles lookup below is keyed on.
+                if want_firmographics:
+                    try:
+                        urn = await _load_about(extractor, slug, slug, now, urn)
+                    finally:
+                        # Charged whether About loaded, was rate-limited,
+                        # auth-walled or crashed: the navigation happened either
+                        # way -- same as enrich_companies -- and on failure the
+                        # record is left stale for a retry rather than never
+                        # recorded.
+                        budget.ledger.record(now)
+                        jobs.save(budget)
 
-        jobs.save(budget)
-        if jobs_failure == "rate_limited":
-            return {
+                # Open roles come from job SEARCH filtered by the company URN -- the
+                # company Page's own /jobs/ tab is empty for most employers. Needs
+                # the URN, so a jobs-only refresh relies on the one cached earlier.
+                if want_jobs and urn:
+                    jobs_url = f"https://www.linkedin.com/jobs/search/?f_C={urn}&geoId=92000000"
+                    try:
+                        extracted = await extractor.extract_page(
+                            jobs_url, section_name="jobs"
+                        )
+                    finally:
+                        budget.ledger.record(now)
+                        jobs.save(budget)
+                    text = extracted.text or ""
+                    # extract_page can hand back an error section or the soft
+                    # rate-limit sentinel *without raising*. Caching that would
+                    # stamp jobs fresh for the TTL and serve a failed lookup as
+                    # real data. Only record on a genuine page; the load happened
+                    # either way, so it still costs a budget action, and the jobs
+                    # half stays stale so the next call retries.
+                    if text == RATE_LIMITED_SECTION_TEXT:
+                        jobs_failure = "rate_limited"
+                    elif extracted.error:
+                        jobs_failure = str(
+                            extracted.error.get("error_message") or "extraction failed"
+                        )[:160]
+                    elif not text:
+                        jobs_failure = "empty page"
+                    else:
+                        parsed = parse_job_search(text)
+                        cache.record_jobs(
+                            slug,
+                            now,
+                            count=parsed.count,
+                            sample=parsed.sample,
+                            raw_jobs=text,
+                        )
+            except RateLimitError:
+                # Already charged: each navigation above records in its finally.
+                jobs.save(budget)
+                return {
+                    "company": company,
+                    "next_run_after_seconds": 3600,
+                    **_firmographics_view(cache.get(slug) or rec, "cache"),
+                    # After the view: an uncached company's view carries its own
+                    # "unknown" status, and the rate limit is the answer here.
+                    "status": "rate_limited",
+                }
+            except AuthenticationError as e:
+                try:
+                    await handle_auth_error(e, ctx)
+                except Exception as relogin_exc:
+                    raise_tool_error(relogin_exc, "enrich_company_deep")
+            except Exception as e:
+                raise_tool_error(e, "enrich_company_deep")  # NoReturn
+
+            jobs.save(budget)
+            if jobs_failure == "rate_limited":
+                return {
+                    "company": company,
+                    "status": "rate_limited",
+                    "next_run_after_seconds": 3600,
+                    **_firmographics_view(cache.get(slug) or rec, "cache"),
+                }
+            out = {
                 "company": company,
-                "status": "rate_limited",
-                "next_run_after_seconds": 3600,
-                **_firmographics_view(cache.get(slug) or rec, "cache"),
+                "status": "jobs_failed" if jobs_failure else "fetched",
+                **_firmographics_view(cache.get(slug), "company_page"),
             }
-        out = {
-            "company": company,
-            "status": "jobs_failed" if jobs_failure else "fetched",
-            **_firmographics_view(cache.get(slug), "company_page"),
-        }
-        if jobs_failure:
-            out["jobs_note"] = (
-                f"Open roles not refreshed ({jobs_failure}); the cached jobs "
-                "half is left stale so the next call retries it."
-            )
-        elif want_jobs and not urn:
-            out["jobs_note"] = (
-                "Open roles unavailable: no company URN known (fetch "
-                "firmographics first, or the About page exposed no id)."
-            )
-        return out
+            if jobs_failure:
+                out["jobs_note"] = (
+                    f"Open roles not refreshed ({jobs_failure}); the cached jobs "
+                    "half is left stale so the next call retries it."
+                )
+            elif want_jobs and not urn:
+                out["jobs_note"] = (
+                    "Open roles unavailable: no company URN known (fetch "
+                    "firmographics first, or the About page exposed no id)."
+                )
+            return out
+        finally:
+            account_budget_in_use.reset(token)
 
     @mcp.tool(
         timeout=tool_timeout,

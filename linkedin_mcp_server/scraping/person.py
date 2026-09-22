@@ -12,11 +12,13 @@ from patchright._impl._errors import TargetClosedError
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core.exceptions import LinkedInScraperException
+from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
 from linkedin_mcp_server.scraping.capture import CaptureMode, SectionCapture
 from linkedin_mcp_server.scraping.contracts import (
     RATE_LIMITED_SECTION_TEXT,
     FilterValidationError,
+    limit_exceeded_section_error,
     rate_limited_section_error,
 )
 from linkedin_mcp_server.scraping.facets import FacetResolver
@@ -315,6 +317,13 @@ class PersonScraper:
                         and not rate_limited
                     ):
                         profile_urn = await self._profile_page._extract_profile_urn()
+                except ActionLimitError as e:
+                    # Refused before it loaded, so nothing was charged; the
+                    # sections before it were, and are returned. Stops like
+                    # the soft rate limit above: every later section would be
+                    # refused the same way.
+                    section_errors[section_name] = limit_exceeded_section_error(e)
+                    break
                 except LinkedInScraperException:
                     raise
                 except TargetClosedError:

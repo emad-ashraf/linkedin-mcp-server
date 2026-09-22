@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, Literal
 
 import logging
@@ -30,6 +31,8 @@ from linkedin_mcp_server.core.proxy_errors import (
 )
 from linkedin_mcp_server.debug_trace import record_page_trace
 from linkedin_mcp_server.debug_utils import stabilize_navigation
+from linkedin_mcp_server.exceptions import ActionLimitError
+from linkedin_mcp_server.pacing import JobStore, charge_navigation
 from linkedin_mcp_server.privacy import (
     is_private_linkedin_navigation_url,
     redact_private_navigation_value,
@@ -284,6 +287,23 @@ class PageNavigator:
             suggested_wait_time=retry_after,
         )
 
+    def _charge_navigation(self, url: str) -> None:
+        """One unit of the shared account budget per page load, refused first.
+
+        Every page load a tool makes passes through here, so this is where
+        LinkedIn's count and the ledger's agree. Best-effort on the ledger
+        itself: a read-only or full home directory must cost a count, never
+        the navigation. A cap refusal is not that and propagates.
+        """
+        try:
+            charge_navigation(JobStore(), url, datetime.now().astimezone())
+        except ActionLimitError:
+            raise
+        except Exception:
+            logger.debug(
+                "Could not charge the navigation to the account budget", exc_info=True
+            )
+
     async def _goto_with_auth_checks(
         self,
         url: str,
@@ -298,6 +318,11 @@ class PageNavigator:
         (``barrier_confirmed``); one that clears earns the target one more
         attempt, with ``confirm_barrier=False`` so a second sighting is final.
         """
+        # Every re-entry -- the remember-me retry, the one more attempt after
+        # a barrier that cleared -- passes allow_remember_me=False for the
+        # same page, so this is the one charge per navigation asked for.
+        if allow_remember_me:
+            self._charge_navigation(url)
         page = self._session.page
         hops: list[str] = []
         listener_registered = False

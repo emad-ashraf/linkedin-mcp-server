@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -15,6 +16,7 @@ from linkedin_mcp_server.core.exceptions import (
     AuthenticationError,
     InvalidReferenceError,
 )
+from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.scraping import company as company_module
 from linkedin_mcp_server.scraping.capture import (
     CaptureMode,
@@ -181,6 +183,37 @@ class TestScrapeCompany:
         assert len(urls) == 1
         assert "/about/" in urls[0]
         assert set(result["sections"]) == {"about"}
+
+    async def test_a_cap_reached_mid_walk_keeps_the_paid_sections(self, mock_page):
+        """Filed once for the refused section and the walk stops, like the
+        soft rate limit: the sections before it were paid for and are kept."""
+        scraper = _scraper(mock_page)
+        refusal = ActionLimitError(
+            "company", limit=5, window="24 h", resume_at=datetime(2026, 8, 6, 9, 0)
+        )
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                side_effect=[extracted("about text"), refusal, extracted("jobs")],
+            ) as mock_extract,
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await scraper.scrape_company(
+                "testcorp", {"about", "posts", "jobs"}
+            )
+
+        assert mock_extract.await_count == 2
+        assert set(result["sections"]) == {"about"}
+        refused = next(iter(result["section_errors"]))
+        error = result["section_errors"][refused]
+        assert error["error_type"] == "limit_exceeded"
+        assert (error["limit"], error["window"]) == (5, "24 h")
+        assert set(result["section_errors"]) == {refused}
 
     async def test_all_sections_visit_correct_urls(self, mock_page):
         scraper = _scraper(mock_page)

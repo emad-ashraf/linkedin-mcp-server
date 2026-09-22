@@ -1,13 +1,22 @@
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any, Callable, Coroutine, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from fastmcp.tools import FunctionTool
 
 from linkedin_mcp_server.callbacks import MCPContextProgressCallback
+from linkedin_mcp_server.config.loaders import EnvironmentKeys
+from linkedin_mcp_server.pacing import (
+    INVITES,
+    MESSAGES,
+    JobStore,
+    load_account_budget,
+)
 from linkedin_mcp_server.scraping.contracts import (
     RATE_LIMITED_SECTION_TEXT,
     SEND_INTERRUPTED_WARNING,
@@ -1341,6 +1350,151 @@ class TestMessagingTools:
                 mock_context,
                 extractor=mock_extractor,
             )
+
+
+def _kind_spent(tmp_path, kind: str) -> int:
+    # The jobs root the autouse ledger-isolation fixture hands the tools.
+    now = datetime.now()
+    return load_account_budget(JobStore(tmp_path / "jobs"), now).ledger.spent_kind(
+        kind, now
+    )
+
+
+class TestWritesAreCappedAtTheAction:
+    """Invites and messages count at the submit, not by URL (#58).
+
+    A cap refuses before the browser is touched, and a refusal costs nothing.
+    An outcome LinkedIn declined is not an invite; one it may have accepted
+    but could not be verified is, because a repeat can invite twice.
+    """
+
+    async def _connect(self, status: str, mock_context, **kwargs):
+        expected = {"url": "u", "status": status, "message": "m", "note_sent": False}
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.person import register_person_tools
+
+        mcp = FastMCP("test")
+        register_person_tools(mcp)
+        tool_fn = await get_tool_fn(mcp, "connect_with_person")
+        await tool_fn("test-user", mock_context, extractor=mock_extractor, **kwargs)
+        return mock_extractor
+
+    async def _send(self, result: dict, mock_context, *, confirm_send=True):
+        mock_extractor = _make_mock_extractor(result)
+
+        from linkedin_mcp_server.tools.messaging import register_messaging_tools
+
+        mcp = FastMCP("test")
+        register_messaging_tools(mcp)
+        tool_fn = await get_tool_fn(mcp, "send_message")
+        await tool_fn(
+            "testuser", "Hello!", confirm_send, mock_context, extractor=mock_extractor
+        )
+        return mock_extractor
+
+    @pytest.mark.parametrize("status", ["connected", "send_unverified"])
+    async def test_an_invite_that_exists_or_may_is_counted(
+        self, mock_context, tmp_path, status
+    ):
+        await self._connect(status, mock_context)
+        assert _kind_spent(tmp_path, INVITES) == 1
+
+    @pytest.mark.parametrize(
+        "status", ["not_sent", "dialog_not_found", "pending", "already_connected"]
+    )
+    async def test_an_invite_linkedin_declined_is_not_counted(
+        self, mock_context, tmp_path, status
+    ):
+        await self._connect(status, mock_context)
+        assert _kind_spent(tmp_path, INVITES) == 0
+
+    async def test_a_capped_invite_is_refused_before_the_browser(
+        self, mock_context, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv(EnvironmentKeys.INVITES_MAX, "1")
+        await self._connect("connected", mock_context)
+
+        with pytest.raises(ToolError, match="limit_exceeded: invites") as excinfo:
+            await self._connect("connected", mock_context)
+
+        assert "Resume at" in str(excinfo.value)
+        assert _kind_spent(tmp_path, INVITES) == 1
+
+    async def test_a_message_that_left_or_may_have_is_counted(
+        self, mock_context, tmp_path
+    ):
+        await self._send(
+            {"status": "sent", "sent": True, "retry_safe": False}, mock_context
+        )
+        await self._send(
+            {"status": "send_unconfirmed", "sent": False, "retry_safe": False},
+            mock_context,
+        )
+        assert _kind_spent(tmp_path, MESSAGES) == 2
+
+    async def test_a_message_that_never_left_is_not_counted(
+        self, mock_context, tmp_path
+    ):
+        await self._send(
+            {"status": "send_unavailable", "sent": False, "retry_safe": True},
+            mock_context,
+        )
+        assert _kind_spent(tmp_path, MESSAGES) == 0
+
+    async def test_a_capped_message_is_refused_before_the_browser(
+        self, mock_context, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv(EnvironmentKeys.MESSAGES_MAX, "1")
+        await self._send(
+            {"status": "sent", "sent": True, "retry_safe": False}, mock_context
+        )
+
+        with pytest.raises(ToolError, match="limit_exceeded: messages"):
+            await self._send({"status": "sent", "sent": True}, mock_context)
+
+        assert _kind_spent(tmp_path, MESSAGES) == 1
+
+    @staticmethod
+    def _unwritable_store(tmp_path):
+        store = MagicMock(wraps=JobStore(tmp_path / "jobs"))
+        store.save.side_effect = OSError("read-only home")
+        return lambda *a, **k: store
+
+    async def test_a_ledger_failure_never_fails_a_delivered_message(
+        self, mock_context, tmp_path, monkeypatch
+    ):
+        from linkedin_mcp_server.tools import messaging
+
+        monkeypatch.setattr(messaging, "JobStore", self._unwritable_store(tmp_path))
+        extractor = await self._send(
+            {"status": "sent", "sent": True, "retry_safe": False}, mock_context
+        )
+        extractor.send_message.assert_awaited_once()
+
+    async def test_a_ledger_failure_never_fails_a_delivered_invite(
+        self, mock_context, tmp_path, monkeypatch
+    ):
+        from linkedin_mcp_server.tools import person
+
+        monkeypatch.setattr(person, "JobStore", self._unwritable_store(tmp_path))
+        extractor = await self._connect("connected", mock_context)
+        extractor.connect_with_person.assert_awaited_once()
+
+    async def test_a_dry_run_is_not_gated(self, mock_context, tmp_path, monkeypatch):
+        monkeypatch.setenv(EnvironmentKeys.MESSAGES_MAX, "1")
+        await self._send(
+            {"status": "sent", "sent": True, "retry_safe": False}, mock_context
+        )
+
+        extractor = await self._send(
+            {"status": "dry_run", "sent": False, "retry_safe": True},
+            mock_context,
+            confirm_send=False,
+        )
+
+        extractor.send_message.assert_awaited_once()
+        assert _kind_spent(tmp_path, MESSAGES) == 1
 
 
 class TestGetMyProfileTool:

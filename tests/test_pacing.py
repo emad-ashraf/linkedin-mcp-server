@@ -5,25 +5,41 @@ Every function under test takes ``now`` explicitly, so nothing here sleeps.
 
 import logging
 from datetime import date, datetime, timedelta
+from unittest.mock import patch
 
 import pytest
 
 from linkedin_mcp_server.config.loaders import EnvironmentKeys
+from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.limits import env_float
 from linkedin_mcp_server.pacing import (
     ACCOUNT_BUDGET_JOB,
     DEFAULT_TOOL_CALL_GAP,
+    INVITES,
     MAX_BUNCH_PAUSE,
+    MESSAGES,
     MIN_BUNCH_PAUSE,
+    PROFILE,
+    SEARCH,
+    WEEK_SECONDS,
     WINDOW_SECONDS,
     Job,
     JobStore,
     Ledger,
     Schedule,
     TOOL_CALL_GAP_JITTER,
+    account_budget_in_use,
+    charge_navigation,
     jittered_cap,
+    kind_headroom,
     load_account_budget,
+    max_daily_actions,
+    navigation_kind,
     next_bunch_delay,
+    record_action,
+    refuse_action,
+    refuse_if_limited,
+    schedule_ignored,
     step_delay,
     tool_call_gap,
     warmup_cap,
@@ -373,11 +389,48 @@ class TestConfigurableLimits:
 
     # DAILY_ACTIONS_MAX
 
-    def test_daily_max_raises_the_ceiling(self, monkeypatch):
+    def test_daily_max_lowers_the_ceiling(self, monkeypatch):
+        monkeypatch.setenv(EnvironmentKeys.DAILY_ACTIONS_MAX, "120")
+        monkeypatch.setenv(EnvironmentKeys.DAILY_CAP_JITTER, "0")
+        job = Job(name="j", started_on=self.START, daily_cap=200, warmup=True)
+        assert job.effective_cap(WED_10AM) == 120
+
+    def test_daily_max_cannot_raise_the_ceiling(self, monkeypatch, caplog):
+        """150 is the ceiling, and the environment used to lift it: the live
+        ledger this was written against read ``daily_cap: 250``."""
         monkeypatch.setenv(EnvironmentKeys.DAILY_ACTIONS_MAX, "200")
         monkeypatch.setenv(EnvironmentKeys.DAILY_CAP_JITTER, "0")
         job = Job(name="j", started_on=self.START, daily_cap=200, warmup=True)
-        assert job.effective_cap(WED_10AM) == 200
+        with caplog.at_level(logging.WARNING):
+            assert job.effective_cap(WED_10AM) == 150
+        assert self._warned(caplog, EnvironmentKeys.DAILY_ACTIONS_MAX)
+
+    def test_the_clamp_warns_once_per_value_not_once_per_read(
+        self, monkeypatch, caplog
+    ):
+        """The ceiling is read on every page load; measured with
+        DAILY_ACTIONS_MAX=250, one warning per navigation."""
+        monkeypatch.setenv(EnvironmentKeys.DAILY_ACTIONS_MAX, "250")
+        with caplog.at_level(logging.WARNING):
+            assert max_daily_actions() == 150
+            assert max_daily_actions() == 150
+            monkeypatch.setenv(EnvironmentKeys.DAILY_ACTIONS_MAX, "300")
+            assert max_daily_actions() == 150
+        clamps = [r for r in caplog.records if "Clamping" in r.getMessage()]
+        assert [r.getMessage() for r in clamps] == [
+            "Clamping DAILY_ACTIONS_MAX=250 to the ceiling 150",
+            "Clamping DAILY_ACTIONS_MAX=300 to the ceiling 150",
+        ]
+
+    def test_a_persisted_cap_above_the_ceiling_is_clamped_on_read(self, tmp_path):
+        store = JobStore(tmp_path)
+        path = store.root / f"{ACCOUNT_BUDGET_JOB}.json"
+        path.write_text(
+            '{"name": "__account_budget__", "started_on": "2026-08-01", '
+            '"daily_cap": 250}',
+            encoding="utf-8",
+        )
+        assert store.load(ACCOUNT_BUDGET_JOB).daily_cap == 150
 
     def test_daily_max_garbage_falls_back_with_a_warning(self, monkeypatch, caplog):
         monkeypatch.setenv(EnvironmentKeys.DAILY_ACTIONS_MAX, "lots")
@@ -548,3 +601,433 @@ class TestConfigurableLimits:
         assert all(8.0 <= g <= 12.0 for g in gaps)
         assert len(gaps) > 1
         assert self._warned(caplog, EnvironmentKeys.TOOL_CALL_GAP_JITTER)
+
+
+class TestAccountBudgetSchedule:
+    """The account budget defaults to business hours; a stored one is kept."""
+
+    def test_a_fresh_account_budget_is_on_business_hours(self, tmp_path):
+        budget = load_account_budget(JobStore(tmp_path), WED_10AM)
+        assert budget.schedule == BH()
+        # And it is what the file says, not only what this call returned.
+        assert load_account_budget(JobStore(tmp_path), WED_10AM).schedule == BH()
+
+    def test_an_existing_ledger_keeps_its_stored_schedule(self, tmp_path):
+        store = JobStore(tmp_path)
+        load_account_budget(store, WED_10AM, schedule=Schedule())
+        assert load_account_budget(store, WED_10AM).schedule == Schedule()
+
+    def test_a_per_work_job_still_defaults_to_always_open(self):
+        assert Job(name="j", started_on=date(2020, 1, 1)).schedule == Schedule()
+
+
+class TestNavigationKind:
+    @pytest.mark.parametrize(
+        ("url", "kind"),
+        [
+            ("https://www.linkedin.com/in/testuser/", "profile"),
+            ("https://www.linkedin.com/in/testuser/details/experience/", "profile"),
+            ("https://www.linkedin.com/in/me/", "profile"),
+            ("https://www.linkedin.com/company/acme/people/", "company"),
+            ("https://www.linkedin.com/search/results/people/?keywords=x", "search"),
+            ("https://www.linkedin.com/messaging/compose/?x=1", "messaging"),
+            ("https://www.linkedin.com/feed/", "feed"),
+            ("https://www.linkedin.com/jobs/view/123/", "other"),
+            ("https://www.linkedin.com/preload/custom-invite/?vanityName=u", "other"),
+        ],
+    )
+    def test_files_a_url_under_its_kind(self, url, kind):
+        assert navigation_kind(url) == kind
+
+
+class TestLedgerKinds:
+    def test_kinds_are_counted_apart_from_actions(self):
+        ledger = Ledger()
+        ledger.record_kind(PROFILE, WED_10AM)
+        ledger.record_kind(SEARCH, WED_10AM)
+        assert ledger.spent_kind(PROFILE, WED_10AM) == 1
+        assert ledger.spent_kind(SEARCH, WED_10AM) == 1
+        assert ledger.spent(WED_10AM) == 0
+
+    def test_a_kind_ages_out_of_its_window(self):
+        ledger = Ledger()
+        ledger.record_kind(INVITES, WED_10AM)
+        a_day_on = WED_10AM + timedelta(seconds=WINDOW_SECONDS + 1)
+        assert ledger.spent_kind(INVITES, a_day_on) == 0
+        assert ledger.spent_kind(INVITES, a_day_on, WEEK_SECONDS) == 1
+        assert (
+            ledger.spent_kind(INVITES, WED_10AM + timedelta(days=8), WEEK_SECONDS) == 0
+        )
+
+    def test_kinds_survive_a_round_trip(self, tmp_path):
+        store = JobStore(tmp_path)
+        budget = load_account_budget(store, WED_10AM)
+        budget.ledger.record_kind(PROFILE, WED_10AM)
+        store.save(budget)
+        assert (
+            load_account_budget(store, WED_10AM).ledger.spent_kind(PROFILE, WED_10AM)
+            == 1
+        )
+
+    def test_pruning_keeps_a_week_of_kinds(self):
+        ledger = Ledger()
+        ledger.record_kind(INVITES, WED_10AM)
+        ledger.record(WED_10AM)
+        ledger.prune(WED_10AM + timedelta(days=2))
+        assert ledger.kinds[INVITES] == [WED_10AM.timestamp()]
+        assert ledger.actions == []
+        ledger.prune(WED_10AM + timedelta(days=8))
+        assert ledger.kinds[INVITES] == []
+
+
+def _budget(schedule: Schedule | None = None) -> Job:
+    return Job(
+        name=ACCOUNT_BUDGET_JOB,
+        started_on=date(2020, 1, 1),
+        schedule=schedule or Schedule(),
+    )
+
+
+def _spend(budget: Job, kind: str, count: int, at: datetime) -> None:
+    for _ in range(count):
+        budget.ledger.record_kind(kind, at)
+
+
+class TestPerKindCaps:
+    """Each kind refuses at N+1 and says when the oldest unit frees up."""
+
+    @pytest.mark.parametrize(
+        ("kind", "cap"), [(PROFILE, 80), (SEARCH, 60), (INVITES, 20), (MESSAGES, 50)]
+    )
+    def test_the_daily_cap_refuses_one_past_it(self, kind, cap):
+        budget = _budget()
+        _spend(budget, kind, cap - 1, WED_10AM)
+        refuse_if_limited(budget, kind, WED_10AM)  # the Nth is allowed
+
+        budget.ledger.record_kind(kind, WED_10AM)
+        with pytest.raises(ActionLimitError) as excinfo:
+            refuse_if_limited(budget, kind, WED_10AM + timedelta(hours=1))
+
+        error = excinfo.value
+        assert error.error_type == "limit_exceeded"
+        assert error.kind == kind
+        assert error.limit == cap
+        assert error.window == "24 h"
+        assert error.resume_at == WED_10AM + timedelta(hours=24)
+        assert "limit_exceeded" in str(error)
+
+    def test_invites_are_also_capped_per_week(self):
+        budget = _budget()
+        # 20 a day on each of the last five days: none today, 100 this week.
+        for day in range(5):
+            _spend(budget, INVITES, 20, WED_10AM - timedelta(days=day + 1))
+        now = WED_10AM + timedelta(hours=1)
+        assert budget.ledger.spent_kind(INVITES, now) == 0
+
+        with pytest.raises(ActionLimitError) as excinfo:
+            refuse_if_limited(budget, INVITES, now)
+
+        assert excinfo.value.limit == 100
+        assert excinfo.value.window == "7 d"
+        # The oldest twenty were sent five days ago and free up two days on.
+        assert excinfo.value.resume_at == WED_10AM - timedelta(days=5) + timedelta(
+            days=7
+        )
+
+    def test_uncapped_kinds_are_counted_but_never_refused(self):
+        budget = _budget()
+        _spend(budget, "company", 500, WED_10AM)
+        refuse_if_limited(budget, "company", WED_10AM)
+
+    @pytest.mark.parametrize(
+        ("key", "kind"),
+        [
+            (EnvironmentKeys.PROFILE_LOADS_MAX, PROFILE),
+            (EnvironmentKeys.SEARCH_PAGES_MAX, SEARCH),
+            (EnvironmentKeys.INVITES_MAX, INVITES),
+            (EnvironmentKeys.MESSAGES_MAX, MESSAGES),
+        ],
+    )
+    def test_the_environment_lowers_a_cap(self, monkeypatch, key, kind):
+        monkeypatch.setenv(key, "3")
+        budget = _budget()
+        _spend(budget, kind, 3, WED_10AM)
+        with pytest.raises(ActionLimitError) as excinfo:
+            refuse_if_limited(budget, kind, WED_10AM)
+        assert excinfo.value.limit == 3
+
+    @pytest.mark.parametrize(
+        ("key", "kind", "default"),
+        [
+            (EnvironmentKeys.PROFILE_LOADS_MAX, PROFILE, 80),
+            (EnvironmentKeys.SEARCH_PAGES_MAX, SEARCH, 60),
+            (EnvironmentKeys.INVITES_MAX, INVITES, 20),
+            (EnvironmentKeys.MESSAGES_MAX, MESSAGES, 50),
+        ],
+    )
+    def test_the_environment_cannot_raise_a_cap(
+        self, monkeypatch, caplog, key, kind, default
+    ):
+        monkeypatch.setenv(key, str(default * 2))
+        budget = _budget()
+        _spend(budget, kind, default, WED_10AM)
+        with (
+            caplog.at_level(logging.WARNING),
+            pytest.raises(ActionLimitError) as excinfo,
+        ):
+            refuse_if_limited(budget, kind, WED_10AM)
+        assert excinfo.value.limit == default
+        assert any(key in r.getMessage() for r in caplog.records)
+
+    def test_the_weekly_invite_cap_lowers_but_never_raises(self, monkeypatch, caplog):
+        monkeypatch.setenv(EnvironmentKeys.INVITES_WEEKLY_MAX, "30")
+        budget = _budget()
+        _spend(budget, INVITES, 30, WED_10AM - timedelta(days=2))
+        with pytest.raises(ActionLimitError) as excinfo:
+            refuse_if_limited(budget, INVITES, WED_10AM)
+        assert (excinfo.value.limit, excinfo.value.window) == (30, "7 d")
+
+        monkeypatch.setenv(EnvironmentKeys.INVITES_WEEKLY_MAX, "300")
+        _spend(budget, INVITES, 70, WED_10AM - timedelta(days=2))
+        with (
+            caplog.at_level(logging.WARNING),
+            pytest.raises(ActionLimitError) as excinfo,
+        ):
+            refuse_if_limited(budget, INVITES, WED_10AM)
+        assert excinfo.value.limit == 100
+        assert any(
+            EnvironmentKeys.INVITES_WEEKLY_MAX in r.getMessage() for r in caplog.records
+        )
+
+
+class TestWorkingHours:
+    """Writes wait for the schedule; reads run on half their cap outside it."""
+
+    @pytest.mark.parametrize("kind", [INVITES, MESSAGES])
+    def test_a_write_outside_the_schedule_is_refused_until_it_reopens(self, kind):
+        with pytest.raises(ActionLimitError) as excinfo:
+            refuse_if_limited(_budget(BH()), kind, WED_8PM)
+        error = excinfo.value
+        assert error.error_type == "limit_exceeded"
+        assert error.limit == 0
+        assert error.window == "working hours"
+        assert error.resume_at == datetime(2026, 8, 6, 9, 0)
+        assert "working hours" in str(error)
+
+    def test_resume_at_skips_lunch(self):
+        with pytest.raises(ActionLimitError) as excinfo:
+            refuse_if_limited(_budget(BH()), INVITES, WED_NOON)
+        assert excinfo.value.resume_at == datetime(2026, 8, 5, 13, 0)
+
+    def test_resume_at_skips_the_weekend(self):
+        with pytest.raises(ActionLimitError) as excinfo:
+            refuse_if_limited(_budget(BH()), MESSAGES, SAT_10AM)
+        assert excinfo.value.resume_at == datetime(2026, 8, 10, 9, 0)  # Monday
+
+    def test_resume_at_keeps_the_schedule_timezone(self):
+        """The schedule is local time, so the answer carries the zone `now`
+        came in, and the ISO text in the message names it."""
+        local = WED_8PM.astimezone()
+        with pytest.raises(ActionLimitError) as excinfo:
+            refuse_if_limited(_budget(BH()), INVITES, local)
+        assert excinfo.value.resume_at.tzinfo == local.tzinfo
+        assert excinfo.value.resume_at.isoformat(timespec="minutes") in str(
+            excinfo.value
+        )
+
+    def test_a_write_inside_the_schedule_passes(self):
+        refuse_if_limited(_budget(BH()), INVITES, WED_10AM)
+
+    @pytest.mark.parametrize(("kind", "half"), [(PROFILE, 40), (SEARCH, 30)])
+    def test_reads_outside_the_schedule_run_on_half_the_cap(self, kind, half):
+        budget = _budget(BH())
+        _spend(budget, kind, half - 1, WED_8PM)
+        refuse_if_limited(budget, kind, WED_8PM)
+
+        budget.ledger.record_kind(kind, WED_8PM)
+        with pytest.raises(ActionLimitError) as excinfo:
+            refuse_if_limited(budget, kind, WED_8PM)
+        assert excinfo.value.limit == half
+        # The full cap is back at 09:00, well before the oldest unit ages out.
+        assert excinfo.value.resume_at == datetime(2026, 8, 6, 9, 0)
+
+        # And the same ledger is fine once the window opens.
+        refuse_if_limited(budget, kind, datetime(2026, 8, 6, 9, 0))
+
+    def test_the_permissive_default_schedule_never_refuses(self):
+        budget = _budget()
+        refuse_if_limited(budget, INVITES, SAT_10AM)
+        _spend(budget, PROFILE, 79, WED_3AM)
+        refuse_if_limited(budget, PROFILE, WED_3AM)
+
+    @pytest.mark.parametrize("raw", ["1", "true", "YES"])
+    def test_the_opt_out_lifts_the_gate_and_the_halving(self, monkeypatch, raw):
+        monkeypatch.setenv(EnvironmentKeys.WORKING_HOURS_DISABLED, raw)
+        budget = _budget(BH())
+        refuse_if_limited(budget, INVITES, WED_8PM)
+        _spend(budget, PROFILE, 79, WED_8PM)
+        refuse_if_limited(budget, PROFILE, WED_8PM)
+
+    def test_ignore_schedule_lifts_the_halving_for_one_caller(self):
+        budget = _budget(BH())
+        _spend(budget, PROFILE, 45, WED_8PM)
+        with pytest.raises(ActionLimitError):
+            refuse_if_limited(budget, PROFILE, WED_8PM)
+        refuse_if_limited(budget, PROFILE, WED_8PM, ignore_schedule=True)
+
+    def test_a_navigation_under_schedule_ignored_runs_on_the_full_cap(self, tmp_path):
+        store = JobStore(tmp_path)
+        held = load_account_budget(store, WED_8PM, schedule=BH())
+        _spend(held, PROFILE, 45, WED_8PM)
+        token = account_budget_in_use.set(held)
+        ignored = schedule_ignored.set(True)
+        try:
+            charge_navigation(store, "https://www.linkedin.com/in/u/", WED_8PM)
+        finally:
+            schedule_ignored.reset(ignored)
+            account_budget_in_use.reset(token)
+        assert held.ledger.spent_kind(PROFILE, WED_8PM) == 46
+
+    def test_the_opt_out_needs_a_truthy_value(self, monkeypatch):
+        monkeypatch.setenv(EnvironmentKeys.WORKING_HOURS_DISABLED, "0")
+        with pytest.raises(ActionLimitError):
+            refuse_if_limited(_budget(BH()), INVITES, WED_8PM)
+
+
+class TestKindHeadroom:
+    """What a bulk tool plans against before it starts."""
+
+    def test_headroom_is_the_tightest_cap_less_what_is_spent(self):
+        budget = _budget()
+        _spend(budget, PROFILE, 30, WED_10AM - timedelta(hours=2))
+        headroom, wait = kind_headroom(budget, PROFILE, WED_10AM)
+        assert headroom == 50
+        assert wait == pytest.approx(22 * 3600, abs=1)
+
+    def test_headroom_never_goes_negative(self):
+        budget = _budget()
+        _spend(budget, PROFILE, 90, WED_10AM)
+        assert kind_headroom(budget, PROFILE, WED_10AM)[0] == 0
+
+    def test_the_weekly_invite_cap_can_be_the_tight_one(self):
+        budget = _budget()
+        _spend(budget, INVITES, 95, WED_10AM - timedelta(days=3))
+        headroom, wait = kind_headroom(budget, INVITES, WED_10AM)
+        assert headroom == 5
+        assert wait == pytest.approx(4 * 24 * 3600, abs=1)
+
+    def test_off_hours_halves_the_headroom_and_waits_for_the_window(self):
+        budget = _budget(BH())
+        _spend(budget, PROFILE, 30, WED_8PM)
+        headroom, wait = kind_headroom(budget, PROFILE, WED_8PM)
+        assert headroom == 10
+        assert wait == 13 * 3600  # 09:00 next morning, not 24 h on
+        assert kind_headroom(budget, PROFILE, WED_8PM, ignore_schedule=True) == (
+            50,
+            pytest.approx(24 * 3600, abs=1),
+        )
+
+    def test_an_uncapped_kind_reports_the_daily_ceiling(self):
+        assert kind_headroom(_budget(), "company", WED_10AM) == (150, 0.0)
+
+
+class TestChargeNavigation:
+    def test_a_page_load_costs_one_action_and_one_of_its_kind(self, tmp_path):
+        store = JobStore(tmp_path)
+        charge_navigation(store, "https://www.linkedin.com/in/u/", WED_10AM)
+        charge_navigation(
+            store, "https://www.linkedin.com/search/results/all/", WED_10AM
+        )
+
+        budget = load_account_budget(store, WED_10AM)
+        assert budget.ledger.spent(WED_10AM) == 2
+        assert budget.ledger.spent_kind(PROFILE, WED_10AM) == 1
+        assert budget.ledger.spent_kind(SEARCH, WED_10AM) == 1
+
+    def test_a_refused_load_is_not_charged(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(EnvironmentKeys.PROFILE_LOADS_MAX, "1")
+        store = JobStore(tmp_path)
+        charge_navigation(store, "https://www.linkedin.com/in/u/", WED_10AM)
+        with pytest.raises(ActionLimitError):
+            charge_navigation(store, "https://www.linkedin.com/in/v/", WED_10AM)
+
+        budget = load_account_budget(store, WED_10AM)
+        assert budget.ledger.spent(WED_10AM) == 1
+        assert budget.ledger.spent_kind(PROFILE, WED_10AM) == 1
+
+    def test_a_held_budget_takes_the_kind_and_keeps_its_own_actions(self, tmp_path):
+        """A bulk tool records `actions` itself, one per page load, and saves
+        its copy; the navigation adds the kind to that copy and nothing to
+        disk, or the tool's next save would throw the kind away."""
+        store = JobStore(tmp_path)
+        held = load_account_budget(store, WED_10AM)
+        token = account_budget_in_use.set(held)
+        try:
+            charge_navigation(store, "https://www.linkedin.com/in/u/", WED_10AM)
+        finally:
+            account_budget_in_use.reset(token)
+
+        assert held.ledger.spent_kind(PROFILE, WED_10AM) == 1
+        assert held.ledger.spent(WED_10AM) == 0
+        on_disk = load_account_budget(store, WED_10AM)
+        assert on_disk.ledger.spent(WED_10AM) == 0
+        assert on_disk.ledger.spent_kind(PROFILE, WED_10AM) == 0
+
+    def test_a_held_budget_is_still_capped(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(EnvironmentKeys.PROFILE_LOADS_MAX, "1")
+        store = JobStore(tmp_path)
+        held = load_account_budget(store, WED_10AM)
+        held.ledger.record_kind(PROFILE, WED_10AM)
+        token = account_budget_in_use.set(held)
+        try:
+            with pytest.raises(ActionLimitError):
+                charge_navigation(store, "https://www.linkedin.com/in/u/", WED_10AM)
+        finally:
+            account_budget_in_use.reset(token)
+
+
+class TestWriteActions:
+    def test_a_write_is_refused_before_and_counted_after(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(EnvironmentKeys.INVITES_MAX, "1")
+        store = JobStore(tmp_path)
+        refuse_action(store, INVITES, WED_10AM)
+        record_action(store, INVITES, WED_10AM)
+        with pytest.raises(ActionLimitError) as excinfo:
+            refuse_action(store, INVITES, WED_10AM)
+        assert excinfo.value.resume_at == WED_10AM + timedelta(hours=24)
+        # Refusing is not counting: still the one invite on disk.
+        assert (
+            load_account_budget(store, WED_10AM).ledger.spent_kind(INVITES, WED_10AM)
+            == 1
+        )
+
+    def test_a_ledger_that_cannot_be_saved_costs_the_count_not_the_write(
+        self, tmp_path, caplog
+    ):
+        """The message has left; a full home directory must not turn a
+        delivered message into a tool error."""
+        store = JobStore(tmp_path)
+        with (
+            patch.object(store, "save", side_effect=OSError("disk full")),
+            caplog.at_level(logging.WARNING),
+        ):
+            record_action(store, MESSAGES, WED_10AM)
+        assert any(
+            "Could not count the messages" in r.getMessage() for r in caplog.records
+        )
+
+    def test_a_ledger_that_cannot_be_read_refuses_nothing(self, tmp_path, caplog):
+        store = JobStore(tmp_path)
+        with (
+            patch.object(store, "exists", return_value=True),
+            patch.object(store, "load", side_effect=OSError("unreadable")),
+            caplog.at_level(logging.WARNING),
+        ):
+            refuse_action(store, INVITES, WED_10AM)
+        assert any("allowing the invites" in r.getMessage() for r in caplog.records)
+
+    def test_a_write_is_not_an_action_of_the_daily_budget(self, tmp_path):
+        """Its page loads were charged one by one as they happened."""
+        store = JobStore(tmp_path)
+        record_action(store, MESSAGES, WED_10AM)
+        assert load_account_budget(store, WED_10AM).ledger.spent(WED_10AM) == 0

@@ -17,10 +17,16 @@ The model mirrors what the established LinkedIn automation tools converged on:
   ages out exactly 24 hours after it happened. A midnight reset lets a job
   spend its whole budget at 23:00 and again at 00:01, which is precisely the
   burst shape that gets flagged.
-* **Working hours**, opt-in via ``Schedule.business_hours()`` (09:00-18:00
-  local, weekends off, lunch skipped), because a member who views profiles at
-  04:00 on a Sunday is not browsing. The default schedule is permissive (24/7)
-  so the pacing never blocks a run the operator did not ask to restrict.
+* **Working hours** (09:00-18:00 local, weekends off, lunch skipped, via
+  ``Schedule.business_hours()``), because a member who views profiles at
+  04:00 on a Sunday is not browsing. A per-work job still defaults to 24/7,
+  and the shared account budget once did too: a restrictive default used to
+  refuse whole bunches in the evening for operators who had never asked for
+  a working-hours limit. That no longer applies, since the schedule no
+  longer blocks reads -- it halves their caps outside the window and gates
+  only invitations and messages -- so the account budget now defaults to
+  business hours; ``WORKING_HOURS_DISABLED`` opts out, and an existing
+  ledger keeps whatever schedule it stored.
 * **Randomized** gaps and a jittered daily cap, so the traffic carries no
   fixed period and no suspiciously round daily total.
 * A **warm-up ramp**, because the pattern change matters as much as the level:
@@ -34,19 +40,23 @@ import contextvars
 import json
 import logging
 import math
+import os
 import random
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from linkedin_mcp_server.config.loaders import EnvironmentKeys
+from linkedin_mcp_server.config.loaders import TRUTHY_VALUES, EnvironmentKeys
+from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.limits import env_float, env_int, env_int_list
 
 logger = logging.getLogger(__name__)
 
 WINDOW_SECONDS = 24 * 60 * 60
+WEEK_SECONDS = 7 * WINDOW_SECONDS
 
 #: Monotonic instant (``time.monotonic()``) at which the current MCP tool
 #: request reached the middleware -- before it queued for the scraper lock, not
@@ -67,6 +77,29 @@ request_arrived_at: contextvars.ContextVar[float | None] = contextvars.ContextVa
 # default below it (DAILY_ACTIONS_DEFAULT), since views are cheaper than invites.
 MAX_DAILY_ACTIONS = 150
 DEFAULT_DAILY_ACTIONS = 100
+
+# Rolling caps per kind of activity, one page load or one submitted write
+# each (#58). The variable next to each may lower it and never raise it:
+# these are the ceiling, and the daily cap above used to be raisable from the
+# environment, which is how a live ledger came to read ``daily_cap: 250``.
+PROFILE_LOADS_MAX = 80  # PROFILE_LOADS_MAX, per 24 h
+SEARCH_PAGES_MAX = 60  # SEARCH_PAGES_MAX, per 24 h
+INVITES_MAX = 20  # INVITES_MAX, per 24 h
+INVITES_WEEKLY_MAX = 100  # INVITES_WEEKLY_MAX, per 7 d
+MESSAGES_MAX = 50  # MESSAGES_MAX, per 24 h
+
+# Kinds a navigation is filed under, by URL. Only ``profile`` and ``search``
+# carry a cap; the rest are counted so the ledger says what the account did.
+PROFILE, COMPANY, SEARCH, MESSAGING, FEED, OTHER = (
+    "profile",
+    "company",
+    "search",
+    "messaging",
+    "feed",
+    "other",
+)
+# Kinds counted at the write, not at a URL: an invite submitted, a message sent.
+INVITES, MESSAGES = "invites", "messages"
 
 # Slice shaved off the daily cap by the per-day draw (DAILY_CAP_JITTER):
 # uniform(1 - jitter, 1.0), so the total is never a round number.
@@ -103,8 +136,81 @@ TOOL_CALL_GAP_JITTER = 0.2
 
 
 def max_daily_actions() -> int:
-    """The configured ceiling on the daily cap."""
-    return env_int(EnvironmentKeys.DAILY_ACTIONS_MAX, MAX_DAILY_ACTIONS, minimum=1)
+    """The ceiling on the daily cap; the environment may lower it, never raise it."""
+    return _env_at_most(EnvironmentKeys.DAILY_ACTIONS_MAX, MAX_DAILY_ACTIONS)
+
+
+# Clamps already warned about, as (key, value). The ceilings are read on
+# every page load, and an operator with DAILY_ACTIONS_MAX=250 in the
+# environment would otherwise see the same line once per navigation.
+_clamp_warned: set[tuple[str, int]] = set()
+
+
+def _env_at_most(key: str, ceiling: int) -> int:
+    value = env_int(key, ceiling, minimum=1)
+    if value > ceiling:
+        if (key, value) not in _clamp_warned:
+            _clamp_warned.add((key, value))
+            logger.warning("Clamping %s=%d to the ceiling %d", key, value, ceiling)
+        return ceiling
+    return value
+
+
+def kind_caps(kind: str) -> tuple[tuple[int, int], ...]:
+    """The ``(limit, window seconds)`` pairs `kind` is held to; none for most."""
+    if kind == PROFILE:
+        return (
+            (
+                _env_at_most(EnvironmentKeys.PROFILE_LOADS_MAX, PROFILE_LOADS_MAX),
+                WINDOW_SECONDS,
+            ),
+        )
+    if kind == SEARCH:
+        return (
+            (
+                _env_at_most(EnvironmentKeys.SEARCH_PAGES_MAX, SEARCH_PAGES_MAX),
+                WINDOW_SECONDS,
+            ),
+        )
+    if kind == INVITES:
+        return (
+            (_env_at_most(EnvironmentKeys.INVITES_MAX, INVITES_MAX), WINDOW_SECONDS),
+            (
+                _env_at_most(EnvironmentKeys.INVITES_WEEKLY_MAX, INVITES_WEEKLY_MAX),
+                WEEK_SECONDS,
+            ),
+        )
+    if kind == MESSAGES:
+        return (
+            (_env_at_most(EnvironmentKeys.MESSAGES_MAX, MESSAGES_MAX), WINDOW_SECONDS),
+        )
+    return ()
+
+
+def working_hours_enforced() -> bool:
+    """False only under ``WORKING_HOURS_DISABLED``; the schedule then only paces bunches."""
+    raw = os.environ.get(EnvironmentKeys.WORKING_HOURS_DISABLED, "")
+    return raw.strip().lower() not in TRUTHY_VALUES
+
+
+def navigation_kind(url: str) -> str:
+    """File a LinkedIn URL under the kind its page load is counted as."""
+    path = urlparse(url).path
+    # A member's detail pages (`/in/<slug>/details/...`) and overlays sit
+    # under the profile path, so one prefix files them all.
+    if path.startswith("/in/"):
+        return PROFILE
+    if path.startswith("/company/"):
+        return COMPANY
+    # Not `/jobs/search/`: that is a job board page, filed as `other` on
+    # purpose, and only the people and company search pages spend this cap.
+    if path.startswith("/search/"):
+        return SEARCH
+    if path.startswith("/messaging/"):
+        return MESSAGING
+    if path.startswith("/feed/"):
+        return FEED
+    return OTHER
 
 
 def default_daily_actions() -> int:
@@ -281,13 +387,41 @@ class Ledger:
     """Timestamps of actions performed, as a rolling 24-hour window."""
 
     actions: list[float] = field(default_factory=list)
+    #: The same instants filed by kind, for the per-kind caps. Kept apart from
+    #: ``actions`` so the daily cap and each kind's cap are read on their own:
+    #: an enrichment bunch writes ``actions`` itself, one per page load, and
+    #: the navigation that page load is adds only its kind.
+    kinds: dict[str, list[float]] = field(default_factory=dict)
 
     def prune(self, now: datetime) -> None:
         cutoff = now.timestamp() - WINDOW_SECONDS
         self.actions = [t for t in self.actions if t > cutoff]
+        # A week is the longest window any kind is held to.
+        week_cutoff = now.timestamp() - WEEK_SECONDS
+        self.kinds = {
+            kind: [t for t in stamps if t > week_cutoff]
+            for kind, stamps in self.kinds.items()
+        }
 
     def record(self, now: datetime) -> None:
         self.actions.append(now.timestamp())
+
+    def record_kind(self, kind: str, now: datetime) -> None:
+        self.kinds.setdefault(kind, []).append(now.timestamp())
+
+    def spent_kind(self, kind: str, now: datetime, window: int = WINDOW_SECONDS) -> int:
+        cutoff = now.timestamp() - window
+        return sum(1 for t in self.kinds.get(kind, ()) if t > cutoff)
+
+    def kind_expiry(
+        self, kind: str, now: datetime, window: int = WINDOW_SECONDS
+    ) -> float:
+        """Seconds until the oldest `kind` entry inside `window` ages out."""
+        cutoff = now.timestamp() - window
+        inside = [t for t in self.kinds.get(kind, ()) if t > cutoff]
+        if not inside:
+            return 0.0
+        return max(min(inside) + window - now.timestamp(), 0.0)
 
     def spent(self, now: datetime) -> int:
         self.prune(now)
@@ -449,6 +583,7 @@ class Job:
             "failed": self.failed,
             "strikes": self.strikes,
             "actions": self.ledger.actions,
+            "kinds": self.ledger.kinds,
             "daily_cap": self.daily_cap,
             "warmup": self.warmup,
             "schedule": {
@@ -477,8 +612,15 @@ class Job:
             done=dict(raw.get("done", {})),
             failed=dict(raw.get("failed", {})),
             strikes=dict(raw.get("strikes", {})),
-            ledger=Ledger(actions=list(raw.get("actions", []))),
-            daily_cap=raw.get("daily_cap", default_daily_actions()),
+            ledger=Ledger(
+                actions=list(raw.get("actions", [])),
+                kinds={k: list(v) for k, v in (raw.get("kinds") or {}).items()},
+            ),
+            # Clamped on read as well as in effective_cap: a ledger written
+            # while the environment could still raise the ceiling reads 250.
+            daily_cap=min(
+                raw.get("daily_cap", default_daily_actions()), max_daily_actions()
+            ),
             schedule=schedule,
             warmup=raw.get("warmup", True),
         )
@@ -560,7 +702,8 @@ def load_account_budget(
     A non-None ``daily_cap``/``warmup``/``schedule`` updates the stored budget
     (last writer wins) and is persisted, so a caller can set the account-wide
     cap once and every subsystem then honours it. With all three None this is a
-    pure read (still materialising a default budget on first use).
+    pure read (still materialising a default budget on first use, on business
+    hours -- see the module docstring for why that default is safe here).
     """
     if store.exists(ACCOUNT_BUDGET_JOB):
         budget = store.load(ACCOUNT_BUDGET_JOB)
@@ -583,7 +726,160 @@ def load_account_budget(
         started_on=now.date(),
         daily_cap=daily_cap if daily_cap is not None else default_daily_actions(),
         warmup=warmup if warmup is not None else False,
-        schedule=schedule if schedule is not None else Schedule(),
+        schedule=schedule if schedule is not None else Schedule.business_hours(),
     )
     store.save(budget)
     return budget
+
+
+#: The account budget a bulk tool holds in memory for the length of its call.
+#: Such a tool records ``actions`` itself, one per page load, and saves its
+#: copy after every profile -- so a navigation inside it must add its kind to
+#: that copy, not to the file the tool is about to overwrite. ``None`` when no
+#: such tool is running, and the charge goes straight to disk. Set by the tool
+#: once it has loaded its budget and reset by the same tool on its way out.
+account_budget_in_use: contextvars.ContextVar[Job | None] = contextvars.ContextVar(
+    "linkedin_mcp_account_budget_in_use", default=None
+)
+
+#: Set alongside ``account_budget_in_use`` by a bulk tool called with
+#: ``ignore_schedule``: its page loads run on the full caps, not the halved
+#: off-hours ones, since the caller asked for the catch-up knowingly.
+schedule_ignored: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "linkedin_mcp_schedule_ignored", default=False
+)
+
+
+def _window_label(window: int) -> str:
+    return "7 d" if window >= WEEK_SECONDS else "24 h"
+
+
+def _effective_caps(
+    budget: Job, kind: str, now: datetime, *, ignore_schedule: bool
+) -> tuple[bool, list[tuple[int, int]]]:
+    """Whether the schedule is closed, and `kind`'s caps as they apply now.
+
+    A read outside the window is let through on half its cap: a member who
+    browses at 03:00 is odd, one who sends invitations then is odder.
+    """
+    off_hours = (
+        working_hours_enforced()
+        and not ignore_schedule
+        and not budget.schedule.is_open(now)
+    )
+    caps = [
+        (max(limit // 2, 1) if off_hours else limit, window)
+        for limit, window in kind_caps(kind)
+    ]
+    return off_hours, caps
+
+
+def kind_headroom(
+    budget: Job, kind: str, now: datetime, *, ignore_schedule: bool = False
+) -> tuple[int, float]:
+    """Units of `kind` left under its tightest cap, and seconds until one frees.
+
+    For a bulk tool to plan against before it starts, the way it plans
+    against the daily cap: a bunch must not start what it cannot finish.
+    Uncapped kinds report the daily cap's own ceiling and no wait.
+    """
+    off_hours, caps = _effective_caps(
+        budget, kind, now, ignore_schedule=ignore_schedule
+    )
+    headroom: int | None = None
+    wait = 0.0
+    for limit, window in caps:
+        left = limit - budget.ledger.spent_kind(kind, now, window)
+        if headroom is None or left < headroom:
+            headroom = left
+            wait = budget.ledger.kind_expiry(kind, now, window)
+    if headroom is None:
+        return MAX_DAILY_ACTIONS, 0.0
+    if off_hours:
+        # The full cap is back the moment the schedule reopens.
+        wait = min(wait, (budget.schedule.next_open(now) - now).total_seconds())
+    return max(headroom, 0), wait
+
+
+def refuse_if_limited(
+    budget: Job, kind: str, now: datetime, *, ignore_schedule: bool = False
+) -> None:
+    """Raise ``ActionLimitError`` before one more `kind` would break a cap.
+
+    Outside the schedule a write waits for it to reopen, and a read is let
+    through on half its cap. Nothing is charged for a refusal.
+    """
+    off_hours, caps = _effective_caps(
+        budget, kind, now, ignore_schedule=ignore_schedule
+    )
+    if off_hours and kind in (INVITES, MESSAGES):
+        raise ActionLimitError(
+            kind,
+            limit=0,
+            window="working hours",
+            resume_at=budget.schedule.next_open(now),
+        )
+    for limit, window in caps:
+        if budget.ledger.spent_kind(kind, now, window) < limit:
+            continue
+        resume_at = now + timedelta(
+            seconds=budget.ledger.kind_expiry(kind, now, window)
+        )
+        if off_hours:
+            # The full cap is back the moment the schedule reopens.
+            resume_at = min(resume_at, budget.schedule.next_open(now))
+        raise ActionLimitError(
+            kind, limit=limit, window=_window_label(window), resume_at=resume_at
+        )
+
+
+def charge_navigation(store: JobStore, url: str, now: datetime) -> None:
+    """Spend one page load of the shared account budget, refusing it first.
+
+    Called once per navigation, which is what LinkedIn counts: a fourteen
+    section profile read is fourteen loads, not one call.
+    """
+    kind = navigation_kind(url)
+    held = account_budget_in_use.get()
+    budget = held if held is not None else load_account_budget(store, now)
+    refuse_if_limited(budget, kind, now, ignore_schedule=schedule_ignored.get())
+    budget.ledger.record_kind(kind, now)
+    if held is None:
+        budget.ledger.record(now)
+        # Nothing else on this path prunes, and the file would carry every
+        # page load of the account's life.
+        budget.ledger.prune(now)
+        store.save(budget)
+
+
+def refuse_action(store: JobStore, kind: str, now: datetime) -> None:
+    """Refuse a write before it is attempted when its cap or the schedule says so.
+
+    Best-effort on the ledger, like the navigation charge: a home directory
+    that cannot be read refuses nothing, since nothing has been sent yet.
+    """
+    try:
+        budget = load_account_budget(store, now)
+    except Exception:
+        logger.warning(
+            "Could not read the account budget; allowing the %s", kind, exc_info=True
+        )
+        return
+    refuse_if_limited(budget, kind, now)
+
+
+def record_action(store: JobStore, kind: str, now: datetime) -> None:
+    """Count one write that was submitted, or may have been.
+
+    Best-effort: the write has happened, and a ledger that cannot be saved
+    must cost the count, never turn a delivered message into a tool error.
+    """
+    try:
+        budget = load_account_budget(store, now)
+        budget.ledger.record_kind(kind, now)
+        budget.ledger.prune(now)
+        store.save(budget)
+    except Exception:
+        logger.warning(
+            "Could not count the %s against the account budget", kind, exc_info=True
+        )

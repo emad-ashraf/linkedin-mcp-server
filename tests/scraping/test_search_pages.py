@@ -3,12 +3,14 @@ company search."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
 import logging
 
 import pytest
 
+from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.scraping import search_pages as search_pages_module
 from linkedin_mcp_server.scraping.capture import (
     CaptureMode,
@@ -529,6 +531,36 @@ class TestPaginateSearch:
         assert gathered.page_texts == ["Person 1"]
         assert gathered.pages == [_page(1)]
         assert gathered.section_errors["search_results"]["error_type"] == "rate_limit"
+
+    async def test_a_cap_midway_keeps_earlier_pages_uncharged_for_the_rest(
+        self, mock_page
+    ):
+        """A page the search cap refused is filed like a throttled one and
+        ends the walk; raising would discard the pages already paid for."""
+        capture = _capture(mock_page)
+        refusal = ActionLimitError(
+            "search", limit=60, window="24 h", resume_at=datetime(2026, 8, 6, 9, 0)
+        )
+        with (
+            patch.object(
+                capture,
+                "capture",
+                new_callable=AsyncMock,
+                side_effect=[_page(1), refusal, _page(3)],
+            ) as fetch,
+            patch(
+                "linkedin_mcp_server.scraping.session.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            gathered = await self._walk(capture, max_pages=5)
+
+        assert fetch.await_count == 2
+        assert gathered.page_texts == ["Person 1"]
+        error = gathered.section_errors["search_results"]
+        assert error["error_type"] == "limit_exceeded"
+        assert error["limit"] == 60
+        assert error["resume_at"] == "2026-08-06T09:00:00"
 
     async def test_a_throttled_page_reports_the_rate_limit_over_its_error(
         self, mock_page
