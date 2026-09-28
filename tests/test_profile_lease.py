@@ -57,8 +57,8 @@ def _spawn(*args: str) -> subprocess.Popen[str]:
     )
 
 
-def _await_line(process: subprocess.Popen[str], expected: str) -> None:
-    """Block until *process* prints a line containing *expected*.
+def _await_line(process: subprocess.Popen[str], expected: str) -> str:
+    """Block until *process* prints a line containing *expected*, and return it.
 
     Fails rather than hangs when the worker dies early: ``readline`` returns
     ``""`` forever at EOF, so a loop that only checked its content would spin
@@ -68,7 +68,7 @@ def _await_line(process: subprocess.Popen[str], expected: str) -> None:
     while True:
         line = process.stdout.readline()
         if expected in line:
-            return
+            return line
         if line == "":  # EOF: the worker will never say anything more
             break
     stderr = process.stderr.read() if process.stderr else ""
@@ -455,7 +455,14 @@ class TestRefusingAForeignHolder:
         )
         holder = _spawn("hold", str(tmp_path), "10")
         try:
-            _await_line(holder, "HELD")
+            # Not ``holder.pid``: on Windows ``sys.executable`` inside a uv venv
+            # is CPython's ``venvlauncher`` shim, which ``CreateProcessW``es the
+            # base interpreter and waits on it. ``Popen.pid`` is the shim; the
+            # interpreter that takes the lock and writes the record is its child
+            # (measured in CI: shim 5372, interpreter 5284). The record names the
+            # process holding the lock, which is the one the message tells you to
+            # stop, so the worker reports its own pid instead.
+            worker_pid = int(_await_line(holder, "HELD").split()[1])
             lease = ProfileLease(tmp_path)
             started = time.monotonic()
             with pytest.raises(BrowserBusyError) as excinfo:
@@ -463,7 +470,7 @@ class TestRefusingAForeignHolder:
             assert time.monotonic() - started < 1
             assert not lease.held
             message = str(excinfo.value)
-            assert f"pid {holder.pid}" in message
+            assert f"pid {worker_pid}" in message
             assert f"version {__version__}" in message
             assert "0.0.0+elsewhere" in message
             # Waiting and retrying cannot help against a version mismatch.
