@@ -43,9 +43,10 @@ from linkedin_mcp_server.bootstrap import (
     RuntimePolicy,
     SetupState,
     start_background_browser_setup_if_needed,
+    wait_for_login_to_finish,
 )
 from linkedin_mcp_server.config.schema import AppConfig
-from linkedin_mcp_server.core.exceptions import NetworkError
+from linkedin_mcp_server.core.exceptions import AccountRestrictedError, NetworkError
 from linkedin_mcp_server.exceptions import (
     AuthenticationBootstrapFailedError,
     AuthenticationInProgressError,
@@ -431,6 +432,7 @@ class TestBrowserSetupReady:
 
     def test_false_when_metadata_absent(self, isolate_profile_dir, monkeypatch):
         _patch_targets_and_version(monkeypatch)
+        _materialize_install(browsers_path(), ["chromium-1217"])
         assert browser_setup_ready() is False
 
     def test_false_when_browsers_dir_missing(self, isolate_profile_dir, monkeypatch):
@@ -446,31 +448,86 @@ class TestBrowserSetupReady:
         _write_metadata(install_metadata_path(), bdir)
         assert browser_setup_ready() is True
 
-    def test_false_when_marker_missing(self, isolate_profile_dir, monkeypatch):
+    @pytest.mark.parametrize("metadata_version", [_PATCHRIGHT_VERSION, "1.42.0"])
+    def test_false_when_marker_missing(
+        self, isolate_profile_dir, monkeypatch, metadata_version
+    ):
         _patch_targets_and_version(monkeypatch)
         bdir = browsers_path()
         bdir.mkdir(parents=True, exist_ok=True)
         (bdir / "chromium-1217").mkdir()
         (bdir / "chromium_headless_shell-1217").mkdir()
         # No INSTALLATION_COMPLETE files
-        _write_metadata(install_metadata_path(), bdir)
+        _write_metadata(
+            install_metadata_path(), bdir, patchright_version=metadata_version
+        )
         assert browser_setup_ready() is False
 
+    @pytest.mark.parametrize("metadata_version", [_PATCHRIGHT_VERSION, "1.42.0"])
     def test_false_when_required_revision_missing(
-        self, isolate_profile_dir, monkeypatch
+        self, isolate_profile_dir, monkeypatch, metadata_version
     ):
         _patch_targets_and_version(monkeypatch)
         bdir = browsers_path()
         _materialize_install(bdir, ["chromium-1208", "chromium_headless_shell-1208"])
-        _write_metadata(install_metadata_path(), bdir)
+        _write_metadata(
+            install_metadata_path(), bdir, patchright_version=metadata_version
+        )
         assert browser_setup_ready() is False
 
-    def test_false_on_pkg_version_mismatch(self, isolate_profile_dir, monkeypatch):
-        _patch_targets_and_version(monkeypatch, version="1.42.0")
+    @pytest.mark.parametrize("metadata_version", ["1.40.0", "1.42.0"])
+    def test_ready_with_peer_metadata_and_own_revision(
+        self, isolate_profile_dir, monkeypatch, metadata_version
+    ):
+        _patch_targets_and_version(monkeypatch)
         bdir = browsers_path()
-        _materialize_install(bdir, ["chromium-1217", "chromium_headless_shell-1217"])
-        _write_metadata(install_metadata_path(), bdir, patchright_version="1.41.0")
-        assert browser_setup_ready() is False
+        _materialize_install(bdir, ["chromium-1217"])
+        _write_metadata(
+            install_metadata_path(), bdir, patchright_version=metadata_version
+        )
+        assert browser_setup_ready() is True
+
+    @pytest.mark.parametrize(
+        "version,revision,peer_version",
+        [("1.62.3", "1234", "1.63.0"), ("1.63.0", "1243", "1.62.3")],
+    )
+    async def test_peer_metadata_does_not_restart_setup(
+        self, isolate_profile_dir, monkeypatch, version, revision, peer_version
+    ):
+        from linkedin_mcp_server import bootstrap
+
+        _patch_inline_wait(monkeypatch, 0)
+        _patch_targets_and_version(
+            monkeypatch, targets={"chromium-": revision}, version=version
+        )
+        _make_auth_ready(isolate_profile_dir)
+        bdir = browsers_path()
+        _materialize_install(bdir, ["chromium-1234", "chromium-1243"])
+        installer = AsyncMock()
+        monkeypatch.setattr(bootstrap, "_run_browser_setup", installer)
+        monkeypatch.setattr(
+            bootstrap, "_schedule_retained_browser_revision_report", lambda: None
+        )
+        initialize_bootstrap("managed")
+
+        try:
+            async with asyncio.timeout(5):
+                for writer_version in (version, peer_version, version, peer_version):
+                    with monkeypatch.context() as writer:
+                        writer.setattr(
+                            bootstrap,
+                            "_patchright_pkg_version",
+                            lambda: writer_version,
+                        )
+                        bootstrap._write_install_metadata(bdir, {"chromium-": True})
+                    metadata = install_metadata_path().read_bytes()
+
+                    await ensure_tool_ready_or_raise("search_jobs")
+
+                    installer.assert_not_awaited()
+                    assert install_metadata_path().read_bytes() == metadata
+        finally:
+            await bootstrap.stop_background_browser_setup()
 
     def test_false_on_browsers_path_mismatch(
         self, isolate_profile_dir, monkeypatch, tmp_path
@@ -5207,6 +5264,176 @@ class TestPatchrightInstallStreaming:
         assert managed.assigned
 
 
+class TestWindowsInstallerTempFallback:
+    @pytest.fixture
+    def windows_temp(self, tmp_path, monkeypatch):
+        from linkedin_mcp_server import bootstrap, windows_acl
+
+        home = tmp_path / "home"
+        temporary = home / "AppData" / "Local" / "Temp"
+        temporary.mkdir(parents=True)
+        monkeypatch.setattr(bootstrap, "os", SimpleNamespace(name="nt", environ={}))
+        monkeypatch.setattr(bootstrap, "get_config", lambda: AppConfig())
+        monkeypatch.setattr(bootstrap.tempfile, "gettempdir", lambda: str(temporary))
+        monkeypatch.setattr(bootstrap.Path, "home", lambda: home)
+        real_lstat = Path.lstat
+
+        def windows_lstat(path):
+            details = real_lstat(path)
+            return SimpleNamespace(
+                st_mode=details.st_mode,
+                st_dev=details.st_dev,
+                st_ino=details.st_ino,
+                st_file_attributes=0,
+            )
+
+        monkeypatch.setattr(Path, "lstat", windows_lstat)
+        monkeypatch.setattr(windows_acl, "close_directory_pin", lambda _pin: None)
+        return home, temporary
+
+    @pytest.mark.parametrize("os_error", [False, True])
+    def test_rejected_default_temp_falls_back_to_home(
+        self, windows_temp, monkeypatch, caplog, os_error
+    ):
+        from linkedin_mcp_server import bootstrap, windows_acl
+        from linkedin_mcp_server.private_state import PrivateStateError
+
+        home, temporary = windows_temp
+        refusal = f"{home / 'AppData'} grants S-1-15-2-1 permission to remove or re-permission the installer path below it"
+
+        def create(parent, *, prefix):
+            if parent == temporary:
+                raise (
+                    PermissionError(refusal) if os_error else PrivateStateError(refusal)
+                )
+            target = parent / f"{prefix}example"
+            target.mkdir()
+            return target, object()
+
+        monkeypatch.setattr(windows_acl, "create_owner_only_directory", create)
+        with caplog.at_level(logging.INFO):
+            root = bootstrap._create_installer_temporary_root()
+
+        assert root.path.parent == home
+        assert root.path.is_dir()
+        assert root.pin is not None
+        assert list(temporary.iterdir()) == []
+        assert refusal in caplog.text
+
+    @pytest.mark.parametrize(
+        "error", [PermissionError("temp denied"), FileNotFoundError("temp removed")]
+    )
+    def test_default_parent_resolution_failure_falls_back(
+        self, windows_temp, monkeypatch, error
+    ):
+        from linkedin_mcp_server import bootstrap, windows_acl
+
+        home, _temporary = windows_temp
+
+        def unavailable_parent():
+            raise error
+
+        def create(parent, *, prefix):
+            target = parent / f"{prefix}example"
+            target.mkdir()
+            return target, object()
+
+        monkeypatch.setattr(
+            bootstrap, "_installer_temporary_parent", unavailable_parent
+        )
+        monkeypatch.setattr(windows_acl, "create_owner_only_directory", create)
+
+        root = bootstrap._create_installer_temporary_root()
+        assert root.path.parent == home
+        assert root.path.is_dir()
+
+    def test_safe_default_keeps_system_temp(self, windows_temp, monkeypatch):
+        from linkedin_mcp_server import bootstrap, windows_acl
+
+        _home, temporary = windows_temp
+
+        def create(parent, *, prefix):
+            target = parent / f"{prefix}example"
+            target.mkdir()
+            return target, object()
+
+        monkeypatch.setattr(windows_acl, "create_owner_only_directory", create)
+        root = bootstrap._create_installer_temporary_root()
+
+        assert root.path.parent == temporary
+        assert root.path.is_dir()
+
+    @pytest.mark.parametrize("configured", ["config", "environment"])
+    @pytest.mark.parametrize("resolution_fails", [False, True])
+    def test_explicit_temp_never_falls_back(
+        self, windows_temp, monkeypatch, configured, resolution_fails
+    ):
+        from linkedin_mcp_server import bootstrap, windows_acl
+        from linkedin_mcp_server.private_state import PrivateStateError
+
+        home, temporary = windows_temp
+        if configured == "config":
+            config = AppConfig()
+            config.browser.installer_temp_dir = str(temporary)
+            monkeypatch.setattr(bootstrap, "get_config", lambda: config)
+        else:
+            bootstrap.os.environ["INSTALLER_TEMP_DIR"] = str(temporary)
+        attempted = []
+
+        def refuse(parent, *, prefix):
+            attempted.append(parent)
+            raise PrivateStateError("sandbox grant")
+
+        monkeypatch.setattr(windows_acl, "create_owner_only_directory", refuse)
+        if resolution_fails:
+            temporary.rmdir()
+        with pytest.raises(PrivateStateError, match="INSTALLER_TEMP_DIR"):
+            bootstrap._create_installer_temporary_root()
+
+        assert attempted == ([] if resolution_fails else [temporary])
+        assert list(home.iterdir()) == [home / "AppData"]
+
+    def test_unsafe_home_reports_both_failures(self, windows_temp, monkeypatch):
+        from linkedin_mcp_server import bootstrap, windows_acl
+        from linkedin_mcp_server.private_state import PrivateStateError
+
+        home, temporary = windows_temp
+
+        def refuse(parent, *, prefix):
+            raise PrivateStateError(f"unsafe {parent}")
+
+        monkeypatch.setattr(windows_acl, "create_owner_only_directory", refuse)
+        with pytest.raises(PrivateStateError, match="INSTALLER_TEMP_DIR") as caught:
+            bootstrap._create_installer_temporary_root()
+
+        assert f"unsafe {temporary}" in str(caught.value)
+        assert f"unsafe {home}" in str(caught.value)
+        assert list(home.iterdir()) == [home / "AppData"]
+
+    @pytest.mark.parametrize(
+        "error", [PermissionError("home denied"), RuntimeError("no home")]
+    )
+    def test_unavailable_home_keeps_recovery_guidance(
+        self, windows_temp, monkeypatch, error
+    ):
+        from linkedin_mcp_server import bootstrap, windows_acl
+        from linkedin_mcp_server.private_state import PrivateStateError
+
+        def refuse(parent, *, prefix):
+            raise PrivateStateError("sandbox grant")
+
+        def unavailable_home():
+            raise error
+
+        monkeypatch.setattr(windows_acl, "create_owner_only_directory", refuse)
+        monkeypatch.setattr(bootstrap.Path, "home", unavailable_home)
+        with pytest.raises(PrivateStateError, match="INSTALLER_TEMP_DIR") as caught:
+            bootstrap._create_installer_temporary_root()
+
+        assert "sandbox grant" in str(caught.value)
+        assert str(error) in str(caught.value)
+
+
 class TestCredentialRedaction:
     """Every userinfo shape a mirror URL can carry, not only user:password."""
 
@@ -9185,6 +9412,220 @@ class TestProxyErrorSurvivesTheImportTask:
 
         # No login task started: the proxy has to be fixed first.
         assert get_bootstrap_state().login_task is None
+
+
+class TestARestrictedAccountOpensNoLoginWindow:
+    """LinkedIn's restriction ends the login, and no retry reopens one.
+
+    Nothing a person types into a new window can lift it, so each window after
+    the first would only land on the same page.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_session(self, isolate_profile_dir, monkeypatch):
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap.browser_setup_ready", lambda: True
+        )
+        monkeypatch.setattr("linkedin_mcp_server.bootstrap._auth_ready", lambda: False)
+        initialize_bootstrap("managed")
+
+    def _restricted_login(self, monkeypatch) -> list[int]:
+        started: list[int] = []
+
+        async def fake_login_flow() -> None:
+            started.append(1)
+            raise AccountRestrictedError()
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._run_login_flow", fake_login_flow
+        )
+        return started
+
+    async def test_the_next_call_reports_it_instead_of_logging_in_again(
+        self, monkeypatch
+    ):
+        started = self._restricted_login(monkeypatch)
+        _patch_inline_wait(monkeypatch, 0)
+
+        with pytest.raises(AuthenticationInProgressError):
+            await ensure_tool_ready_or_raise("get_person_profile")
+        login_task = get_bootstrap_state().login_task
+        assert login_task is not None
+        await asyncio.wait({login_task})
+
+        with pytest.raises(AccountRestrictedError, match="identity verification"):
+            await ensure_tool_ready_or_raise("get_person_profile")
+
+        assert started == [1]
+        assert get_bootstrap_state().login_task is None
+
+    async def test_the_inline_wait_reports_it(self, monkeypatch):
+        started = self._restricted_login(monkeypatch)
+        _patch_inline_wait(monkeypatch, 5)
+
+        with pytest.raises(AccountRestrictedError, match="identity verification"):
+            await ensure_tool_ready_or_raise("get_person_profile")
+
+        assert started == [1]
+
+    async def test_a_restricted_import_is_not_followed_by_a_manual_login(
+        self, monkeypatch, _stub_import_env
+    ):
+        started = self._restricted_login(monkeypatch)
+        _patch_inline_wait(monkeypatch, 5, auto_import=True)
+
+        async def restricted_import(_ctx=None):
+            raise AccountRestrictedError()
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._try_auto_import_session",
+            restricted_import,
+        )
+
+        for _ in range(2):
+            with pytest.raises(AccountRestrictedError):
+                await ensure_tool_ready_or_raise("get_person_profile")
+
+        assert started == []
+        assert get_bootstrap_state().login_task is None
+
+    async def test_a_poller_after_a_restricted_import_opens_no_login(
+        self, monkeypatch, _stub_import_env
+    ):
+        # The import's own awaiter is not the only reader: a second poller can
+        # run after the import finished and before that awaiter sees the error.
+        started = self._restricted_login(monkeypatch)
+        _patch_inline_wait(monkeypatch, 0, auto_import=True)
+        other: asyncio.Task[None] | None = None
+
+        async def restricted_import(_ctx=None):
+            nonlocal other
+            other = asyncio.create_task(_start_login_if_needed())
+            raise AccountRestrictedError()
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._try_auto_import_session",
+            restricted_import,
+        )
+
+        # Straight into the login logic, as a readiness check reaches it, so the
+        # second poller is scheduled before the first sees the import's error.
+        with pytest.raises(AccountRestrictedError):
+            await _start_login_if_needed()
+        assert other is not None
+        with pytest.raises(AccountRestrictedError):
+            await other
+
+        assert started == []
+        assert get_bootstrap_state().login_task is None
+
+    async def test_a_cancelled_import_awaiter_leaves_no_login_behind(
+        self, monkeypatch, _stub_import_env
+    ):
+        # If the call that awaited the import is cancelled before it can record
+        # the refusal, the finished import still answers the next call.
+        started = self._restricted_login(monkeypatch)
+        _patch_inline_wait(monkeypatch, 0, auto_import=True)
+        import_done = asyncio.Event()
+
+        async def restricted_import(_ctx=None):
+            import_done.set()
+            raise AccountRestrictedError()
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._try_auto_import_session",
+            restricted_import,
+        )
+
+        first = asyncio.create_task(ensure_tool_ready_or_raise("get_person_profile"))
+        await import_done.wait()
+        first.cancel()
+        with pytest.raises((asyncio.CancelledError, AccountRestrictedError)):
+            await first
+
+        with pytest.raises(AccountRestrictedError):
+            await ensure_tool_ready_or_raise("get_person_profile")
+
+        assert started == []
+        assert get_bootstrap_state().login_task is None
+
+    async def test_waiting_for_the_sign_in_ends_with_the_restriction(self, monkeypatch):
+        # What the frontend waits on while repairing auth for the shared owner.
+        self._restricted_login(monkeypatch)
+        _patch_inline_wait(monkeypatch, 0)
+        with pytest.raises(AuthenticationInProgressError):
+            await ensure_tool_ready_or_raise("get_person_profile")
+
+        with pytest.raises(AccountRestrictedError):
+            await asyncio.wait_for(wait_for_login_to_finish(5), timeout=10)
+
+    async def test_a_retired_stale_session_gets_a_login_of_its_own(self, monkeypatch):
+        # A session on disk that failed is retired for a fresh login, and that
+        # login's own outcome is the answer, not the earlier refusal.
+        get_bootstrap_state().account_restricted = True
+        never_done = asyncio.Event()
+
+        async def pending_login() -> None:
+            await never_done.wait()
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._run_login_flow", pending_login
+        )
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._force_move_auth_state_aside",
+            lambda *_args: None,
+        )
+        _patch_inline_wait(monkeypatch, 0)
+
+        try:
+            with pytest.raises(AuthenticationStartedError):
+                await invalidate_auth_and_trigger_relogin()
+            with pytest.raises(AuthenticationInProgressError):
+                await ensure_tool_ready_or_raise("get_person_profile")
+        finally:
+            never_done.set()
+            login_task = get_bootstrap_state().login_task
+            if login_task is not None:
+                login_task.cancel()
+
+    async def test_the_unclaimed_import_is_not_spawned_either(
+        self, monkeypatch, _stub_import_env
+    ):
+        """The one state only the first guard covers, and the costliest.
+
+        A retired stale session clears `import_attempted` and
+        `account_restricted` together and starts a login; that login ends on
+        the restriction, which sets the flag again and drops the login task
+        while `import_attempted` is still False. Nothing downstream can stop
+        what follows: the guards after the lock are reached only through the
+        import or login branches, and control never leaves
+        `not _state.import_attempted and _auto_import_allowed()`. An auto-import
+        is a headless Chromium, a keychain read and a rotation of the source
+        profile, spent on an account LinkedIn has already refused.
+        """
+        started = self._restricted_login(monkeypatch)
+        _patch_inline_wait(monkeypatch, 0, auto_import=True)
+        imports: list[int] = []
+
+        async def record_import(_ctx=None) -> bool:
+            imports.append(1)
+            return False
+
+        monkeypatch.setattr(
+            "linkedin_mcp_server.bootstrap._try_auto_import_session", record_import
+        )
+        state = get_bootstrap_state()
+        state.account_restricted = True
+        state.import_attempted = False
+
+        with pytest.raises(AccountRestrictedError, match="identity verification"):
+            await _start_login_if_needed()
+
+        # The raise alone proves nothing here: a later guard answers with the
+        # same exception once the import has already run.
+        assert imports == []
+        assert get_bootstrap_state().import_task is None
+        assert started == []
 
 
 class TestAnOwnerNeverSignsInItself:

@@ -14,6 +14,7 @@ import pytest
 
 from linkedin_mcp_server.config.loaders import EnvironmentKeys
 from linkedin_mcp_server.core.exceptions import (
+    AccountRestrictedError,
     AuthenticationError,
     ProxyConnectionError,
     RateLimitError,
@@ -28,6 +29,8 @@ from linkedin_mcp_server.pacing import (
 )
 from linkedin_mcp_server.scraping import navigation as navigation_module
 from linkedin_mcp_server.scraping import session as session_module
+from linkedin_mcp_server.scraping.capture import SectionCapture
+from linkedin_mcp_server.scraping.content import PageContentReader
 from linkedin_mcp_server.scraping.navigation import PageNavigator
 from linkedin_mcp_server.scraping.rate_limit import (
     RATE_LIMIT_BACKOFF_DELAY,
@@ -1672,3 +1675,40 @@ class TestEveryNavigationIsCharged:
 
         mock_page.goto.assert_awaited_once()
         assert any("Could not charge" in r.getMessage() for r in caplog.records)
+
+
+class TestARestrictedAccountStopsTheScrape:
+    """LinkedIn's restriction page is neither content nor a login to redo."""
+
+    @pytest.mark.parametrize(
+        "navigation_fails", [False, True], ids=["redirect", "failed navigation"]
+    )
+    async def test_the_restriction_page_raises_before_extraction(
+        self, mock_page, navigation_fails: bool
+    ):
+        async def land_on_the_restriction(*_args, **_kwargs):
+            navigate(
+                mock_page,
+                "https://www.linkedin.com/flagship-web/login/login-restriction/",
+            )
+            if navigation_fails:
+                raise PatchrightError("net::ERR_ABORTED")
+
+        mock_page.goto = AsyncMock(side_effect=land_on_the_restriction)
+        session = ScrapingSession(mock_page)
+        capture = SectionCapture(
+            session, PageNavigator(session), PageContentReader(session)
+        )
+
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.navigation.resolve_remember_me_prompt",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            pytest.raises(AccountRestrictedError, match="identity verification"),
+        ):
+            await capture.extract_page(
+                "https://www.linkedin.com/company/testco/posts/",
+                section_name="posts",
+            )

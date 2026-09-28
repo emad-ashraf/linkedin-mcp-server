@@ -23,6 +23,7 @@ from linkedin_mcp_server.core.rate_limit_markers import (
 )
 from linkedin_mcp_server.core import (
     AUTH_COOKIE_NAMES,
+    AccountRestrictedError,
     AuthenticationError,
     BrowserManager,
     NetworkError,
@@ -254,12 +255,24 @@ async def _feed_auth_succeeds(
             await _log_feed_failure_context(browser, barrier)
             return not await barrier_confirmed(browser.page, barrier)
         return True
-    except (NetworkError, RateLimitError):
+    except (AccountRestrictedError, NetworkError, RateLimitError):
         # Already classified: the remember-me retries above run inside this
         # try, and the inner call has done the probing, tracing and logging
         # below once. Letting it fall through re-probed the prompt on a page
         # that had failed, wrote a second feed-navigation-error trace, and
         # wrapped the message twice.
+        #
+        # The restriction belongs here for a sharper reason than tidiness. It
+        # used to escape only because the handler below re-reads the URL and
+        # `detect_auth_barrier_quick` raises a second time -- but in between,
+        # `resolve_remember_me_prompt` waits up to 3s for #rememberme-div, and
+        # a restriction page that bounces to /login in that window is read as
+        # an auth blocker instead. A restricted account has no `li_at`, so
+        # `barrier_confirmed` believes a login redirect at once, the probe
+        # answers False, and the caller rotates the profile over LinkedIn's
+        # refusal. Losing `_log_feed_failure_context` here is the price:
+        # `_raise_if_account_restricted` already logged the URL, and the
+        # feed-after-goto trace is already on disk.
         raise
     except Exception as exc:
         # Before anything else: a proxy fault is not a dead session. Returning

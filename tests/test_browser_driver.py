@@ -10,6 +10,7 @@ import pytest
 from linkedin_mcp_server.config.schema import AppConfig
 from linkedin_mcp_server.pacing import JobStore, read_account_cooldown
 from linkedin_mcp_server.core.exceptions import (
+    AccountRestrictedError,
     NetworkError,
     ProxyConnectionError,
     RateLimitError,
@@ -181,6 +182,96 @@ async def test_same_runtime_uses_source_profile(tmp_path):
     ctor.assert_called_once()
     assert ctor.call_args.kwargs["user_data_dir"] == tmp_path / "profile"
     source_browser.import_cookies.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_restricted_account_stops_the_startup_feed_check(tmp_path):
+    """Not a dead session: the caller must not retire it and log in again."""
+    profile_dir = _write_source_state(tmp_path, runtime_id="macos-arm64-host")
+    source_browser = _make_mock_browser()
+    source_browser.page.url = (
+        "https://www.linkedin.com/flagship-web/login/login-restriction/"
+    )
+
+    with (
+        patch(
+            "linkedin_mcp_server.drivers.browser.get_runtime_id",
+            return_value="macos-arm64-host",
+        ),
+        patch(
+            "linkedin_mcp_server.drivers.browser.BrowserManager",
+            return_value=source_browser,
+        ),
+        patch(
+            "linkedin_mcp_server.drivers.browser.resolve_remember_me_prompt",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        pytest.raises(AccountRestrictedError, match="identity verification"),
+    ):
+        await get_or_create_browser()
+
+    source_browser.close.assert_awaited()
+    assert source_state_path(profile_dir).exists()
+    assert (profile_dir / "Default" / "Cookies").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_restriction_that_bounces_to_login_is_still_a_restriction(tmp_path):
+    """The restriction must not be re-read as an expired session mid-probe.
+
+    Measured shape: the probe's own error handler waits up to 3s for
+    #rememberme-div before it re-reads the URL, and LinkedIn can bounce the
+    restriction page to /login inside that window. A restricted account has no
+    li_at, so /login is a barrier `barrier_confirmed` believes at once -- the
+    probe would answer False, the caller would raise AuthenticationError, and
+    the recovery would rotate the source profile over LinkedIn's refusal.
+    """
+    profile_dir = _write_source_state(tmp_path, runtime_id="macos-arm64-host")
+    source_browser = _make_mock_browser()
+    source_browser.page.url = (
+        "https://www.linkedin.com/flagship-web/login/login-restriction/"
+    )
+    # No session cookie, which is what makes a /login redirect believable at
+    # once rather than worth a second look.
+    source_browser.page.context.cookies = AsyncMock(return_value=[])
+
+    waits: list[int] = []
+
+    async def wait_for_the_prompt(page, **_kwargs) -> bool:
+        waits.append(1)
+        if len(waits) > 1:
+            page.url = "https://www.linkedin.com/login"
+        return False
+
+    confirmed = AsyncMock(return_value=True)
+
+    with (
+        patch(
+            "linkedin_mcp_server.drivers.browser.get_runtime_id",
+            return_value="macos-arm64-host",
+        ),
+        patch(
+            "linkedin_mcp_server.drivers.browser.BrowserManager",
+            return_value=source_browser,
+        ),
+        patch(
+            "linkedin_mcp_server.drivers.browser.resolve_remember_me_prompt",
+            wait_for_the_prompt,
+        ),
+        patch(
+            "linkedin_mcp_server.drivers.browser.barrier_confirmed", confirmed
+        ) as barrier,
+        pytest.raises(AccountRestrictedError, match="identity verification"),
+    ):
+        await get_or_create_browser()
+
+    # Never reached, and that is the whole point: reaching it at all means the
+    # restriction was reclassified as a barrier to confirm.
+    barrier.assert_not_awaited()
+    # One wait, inside the try. A second means the handler took over.
+    assert waits == [1]
+    assert source_state_path(profile_dir).exists()
 
 
 @pytest.mark.asyncio
