@@ -14,7 +14,7 @@ from pydantic import Field
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.core.exceptions import (
     AuthenticationError,
-    LinkedInScraperException,
+    InvalidReferenceError,
 )
 from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
 from linkedin_mcp_server.error_handler import raise_tool_error
@@ -22,6 +22,11 @@ from linkedin_mcp_server.pacing import MESSAGES, JobStore, record_action, refuse
 from linkedin_mcp_server.scraping.contracts import (
     SEND_INTERRUPTED_WARNING,
     refuse_an_invalid_message,
+)
+from linkedin_mcp_server.scraping.identifiers import (
+    normalize_person_identifier,
+    normalize_profile_urn,
+    normalize_thread_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,13 +127,16 @@ def register_messaging_tools(
         """
         if not linkedin_username and not thread_id:
             raise_tool_error(
-                LinkedInScraperException(
+                InvalidReferenceError(
                     "Provide at least one of linkedin_username or thread_id"
                 ),
                 "get_conversation",
             )
-
         try:
+            if thread_id:
+                thread_id = normalize_thread_id(thread_id)
+            else:
+                linkedin_username = normalize_person_identifier(linkedin_username or "")
             extractor = extractor or await get_ready_extractor(
                 ctx, tool_name="get_conversation"
             )
@@ -282,6 +290,9 @@ def register_messaging_tools(
             # submits nothing and owes nothing.
             if confirm_send:
                 refuse_action(JobStore(), MESSAGES, datetime.now().astimezone())
+            linkedin_username = normalize_person_identifier(linkedin_username)
+            if profile_urn is not None:
+                profile_urn = normalize_profile_urn(profile_urn)
             extractor = extractor or await get_ready_extractor(
                 ctx, tool_name="send_message"
             )
