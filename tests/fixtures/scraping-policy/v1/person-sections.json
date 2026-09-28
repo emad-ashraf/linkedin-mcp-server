@@ -121,14 +121,14 @@
       "call": "scrape_person",
       "kind": "wait_for_function",
       "operation": "profile_message_target_ready",
-      "program_digest": "5531e0c2f203",
+      "program_digest": "8ea34a57344c",
       "timeout_ms": 1000
     },
     {
       "call": "scrape_person",
       "kind": "evaluate",
       "operation": "profile_message_target",
-      "program_digest": "36fb48edb849"
+      "program_digest": "d6c4299a7b18"
     },
     {
       "call": "scrape_person",

@@ -101,6 +101,13 @@ def register_messaging_tools(
         messaging data responses. The conversation row is never selected, so
         an unread conversation remains unread.
 
+        A conversation is attributed to linkedin_username only through a
+        participant's own profile URL in that response, never through whichever
+        thread the messaging page happens to have open. A username that matches
+        no conversation, or an index past the ones it matches, is refused
+        rather than resolved to another thread. Pass a known thread_id to
+        bypass username/index resolution.
+
         Args:
             ctx: FastMCP context for progress reporting
             linkedin_username: LinkedIn username of the conversation participant; a full profile URL is accepted too

@@ -218,7 +218,7 @@ class ConversationReader:
         display_name = await self._profile_page._read_profile_display_name()
         if not display_name:
             raise LinkedInScraperException(
-                "Could not resolve a display name for the requested profile."
+                f"Could not resolve a display name for {username}."
             )
 
         offset = await self._load_messaging_page(
@@ -249,11 +249,13 @@ class ConversationReader:
             candidates = self._unique_conversations(candidates + inbox_candidates)
         if not matches:
             raise LinkedInScraperException(
-                "Could not find a conversation for the requested profile."
+                f"Could not find a conversation for {username}."
+                " Pass a known thread_id instead."
             )
         if index >= len(matches):
             raise LinkedInScraperException(
-                f"index {index} out of range: only {len(matches)} thread(s) exist."
+                f"index {index} out of range: only {len(matches)} thread(s) "
+                f"exist for {username}. Pass a known thread_id instead."
             )
         return matches[index], candidates
 

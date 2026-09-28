@@ -466,6 +466,67 @@ class TestGetConversation:
 
         assert capture.fetch_calls[0][0] is second
 
+    async def test_username_without_a_match_refuses_instead_of_guessing(
+        self, mock_page
+    ):
+        stranger = _conversation("2-stranger", title="Grace Hopper", username="grace")
+        capture = FakeCapture([_inbox(stranger)])
+        reader = _reader(mock_page)
+        nav = AsyncMock()
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.conversations.MessagingApiCapture",
+                return_value=capture,
+            ),
+            patch.object(PageNavigator, "_navigate_to_page", nav),
+            patch.object(reader, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                reader, "_scroll_main_scrollable_region", new_callable=AsyncMock
+            ),
+            patch.object(
+                ProfilePageReader,
+                "_read_profile_display_name",
+                new_callable=AsyncMock,
+                return_value="Ada Lovelace",
+            ),
+        ):
+            with pytest.raises(LinkedInScraperException) as error:
+                await reader.get_conversation(linkedin_username="ada")
+
+        assert "ada" in str(error.value)
+        assert "thread_id" in str(error.value)
+        assert capture.fetch_calls == []
+
+    async def test_username_index_past_its_threads_refuses_instead_of_guessing(
+        self, mock_page
+    ):
+        first = _conversation("2-first", username="ada")
+        # A non-matching neighbour: the refusal counts the participant's own
+        # threads, not every thread the inbox handed over.
+        stranger = _conversation("2-second", title="Grace Hopper", username="grace")
+        capture = FakeCapture([_inbox(first, stranger)])
+        reader = _reader(mock_page)
+        with (
+            patch(
+                "linkedin_mcp_server.scraping.conversations.MessagingApiCapture",
+                return_value=capture,
+            ),
+            patch.object(PageNavigator, "_navigate_to_page", new_callable=AsyncMock),
+            patch.object(reader, "_wait_for_main_text", new_callable=AsyncMock),
+            patch.object(
+                ProfilePageReader,
+                "_read_profile_display_name",
+                new_callable=AsyncMock,
+                return_value="Ada Lovelace",
+            ),
+        ):
+            with pytest.raises(LinkedInScraperException) as error:
+                await reader.get_conversation(linkedin_username="ada", index=1)
+
+        assert "only 1 thread(s) exist for ada" in str(error.value)
+        assert "thread_id" in str(error.value)
+        assert capture.fetch_calls == []
+
     async def test_no_identifier_is_refused_before_page_work(self, mock_page):
         reader = _reader(mock_page)
         with patch.object(
