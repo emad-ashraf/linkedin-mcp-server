@@ -114,9 +114,9 @@ COMPANY_SIZE_LETTERS: dict[str, str] = {
 
 
 def _normalize_csv(value: str, mapping: dict[str, str]) -> str:
-    """Normalize a comma-separated filter value using the provided mapping."""
+    """Normalize and encode each token in a comma-separated filter value."""
     parts = [v.strip() for v in value.split(",")]
-    return ",".join(mapping.get(p, p) for p in parts)
+    return ",".join(quote_plus(mapping.get(p, p), safe="") for p in parts)
 
 
 def _normalize_industry_name(name: str) -> str:

@@ -116,6 +116,7 @@ def register_company_tools(
     async def get_company_posts(
         company_name: str,
         ctx: Context,
+        max_scrolls: Annotated[int, Field(ge=1, le=50)] | None = None,
         extractor: Any | None = None,
     ) -> dict[str, Any]:
         """
@@ -124,6 +125,8 @@ def register_company_tools(
         Args:
             company_name: LinkedIn company name (e.g., "docker", "anthropic", "microsoft"). A full company URL is accepted too and is reduced to the slug.
             ctx: FastMCP context for progress reporting
+            max_scrolls: Maximum scroll-to-bottom iterations to load more posts.
+                Default (None) uses 10. Increase to read further back in the feed.
 
         Returns:
             Dict with url, sections (name -> raw text), and optional references.
@@ -141,7 +144,9 @@ def register_company_tools(
 
             company_name = normalize_company_identifier(company_name)
             url = company_page_url(company_name, "/posts/")
-            extracted = await extractor.extract_page(url, section_name="posts")
+            extracted = await extractor.extract_page(
+                url, section_name="posts", max_scrolls=max_scrolls
+            )
 
             sections: dict[str, str] = {}
             references: dict[str, list[Reference]] = {}
