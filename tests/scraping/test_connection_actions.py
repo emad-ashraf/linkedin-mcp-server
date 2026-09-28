@@ -16,6 +16,8 @@ from __future__ import annotations
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.scraping.connection import ActionSignals
@@ -920,6 +922,232 @@ class TestInviteDialog:
         mock_message.assert_awaited_once()
         mock_dismiss.assert_awaited_once()
 
+    async def test_note_sent_despite_premium_banner_when_textarea_appears(
+        self, mock_page
+    ):
+        """A Premium nudge banner alongside a live textarea is not a block.
+
+        LinkedIn renders the "N personalized invitations remaining" /
+        Activate Premium banner on this step as a persistent upsell nudge,
+        not only when the free quota is truly exhausted, and it can still be
+        in the DOM for a moment right after a successful Send, before it
+        unmounts with the closing dialog. The regression this guards: an
+        earlier version bailed the instant that banner was detectable —
+        either the moment the textarea appeared, or the moment Send
+        succeeded — silently dropping the note on every single send that
+        rendered it, independent of actual remaining quota.
+
+        ``_get_premium_upsell_message`` is mocked to always return a message
+        (a banner that is genuinely detectable start to finish), so a
+        version that still gates either check on banner presence alone
+        fails this test; only gating on textarea absence / dialog staying
+        open lets it pass.
+        """
+        actions = _actions(mock_page)
+        textarea = MagicMock()
+        textarea.count = AsyncMock(return_value=0)
+        textarea.first = textarea
+        # Textarea mounts successfully, and afterwards the dialog closes on
+        # schedule after Send — both are plain "did not time out" waits, and
+        # the Premium banner is present in the DOM throughout regardless.
+        textarea.wait_for = AsyncMock(return_value=None)
+        add_note_button = MagicMock()
+        add_note_button.click = AsyncMock(return_value=None)
+        buttons = MagicMock()
+        buttons.count = AsyncMock(return_value=2)
+        buttons.nth.return_value = add_note_button
+        _scope_dialog(mock_page, buttons=buttons, textarea=textarea)
+
+        with (
+            patch.object(
+                actions, "_dialog_is_open", new_callable=AsyncMock, return_value=True
+            ),
+            patch.object(
+                actions, "_dialog_is_closed", new_callable=AsyncMock, return_value=True
+            ),
+            patch.object(
+                actions,
+                "_dialog_text",
+                new_callable=AsyncMock,
+                return_value=DIALOG_TEXT,
+            ),
+            patch.object(
+                actions,
+                "_fill_dialog_textarea",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as mock_fill,
+            patch.object(
+                actions,
+                "_click_dialog_primary_button",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(actions, "_dismiss_dialog", new_callable=AsyncMock),
+            patch.object(
+                actions,
+                "_get_premium_upsell_message",
+                new_callable=AsyncMock,
+                return_value=PREMIUM_MESSAGE,
+            ) as mock_message,
+        ):
+            result = await actions._submit_invite_dialog("Hello")
+
+        # Proves the reveal-step bail is gone: the code must reach the fill
+        # call rather than returning the instant the banner is detectable.
+        mock_fill.assert_awaited_once_with("Hello")
+        assert result == (True, True, None, DIALOG_TEXT)
+        # Neither the reveal-step check nor the post-submit check calls
+        # _get_premium_upsell_message on this path: the textarea appeared
+        # (skips the reveal-step gate) and the dialog closed on schedule
+        # (skips the post-submit gate). A version that still gates either
+        # check on banner presence alone would call this and return a
+        # blocked result instead of (True, True, None, ...) above.
+        mock_message.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "recount",
+        [1, RuntimeError("count failed")],
+        ids=["textarea-mounted", "recount-failed"],
+    )
+    async def test_failed_fill_beside_a_mounted_textarea_is_not_a_note_limit(
+        self, mock_page, recount
+    ):
+        """A fill that fails while the textarea may still be there sends nothing.
+
+        The Premium nudge banner is detectable throughout, so reading it
+        after any failed fill reported ``custom_note_limit_reached`` for an
+        account with quota left (observed live: the dialog said three
+        personalized invitations remained). A recount that fails proves no
+        absence, so it reports no quota either.
+        """
+        actions = _actions(mock_page)
+        textarea = MagicMock()
+        textarea.count = AsyncMock(side_effect=[1, recount])
+        buttons = MagicMock()
+        buttons.count = AsyncMock(return_value=2)
+        _scope_dialog(mock_page, buttons=buttons, textarea=textarea)
+
+        with (
+            patch.object(
+                actions, "_dialog_is_open", new_callable=AsyncMock, return_value=True
+            ),
+            patch.object(
+                actions,
+                "_dialog_text",
+                new_callable=AsyncMock,
+                return_value=DIALOG_TEXT,
+            ),
+            patch.object(
+                actions,
+                "_fill_dialog_textarea",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                actions,
+                "_get_premium_upsell_message",
+                new_callable=AsyncMock,
+                return_value=PREMIUM_MESSAGE,
+            ),
+            patch.object(
+                actions, "_click_dialog_primary_button", new_callable=AsyncMock
+            ) as mock_send,
+            patch.object(
+                actions, "_dismiss_dialog", new_callable=AsyncMock
+            ) as mock_dismiss,
+        ):
+            result = await actions._submit_invite_dialog("Hello")
+
+        assert result == (False, False, None, DIALOG_TEXT)
+        mock_send.assert_not_called()
+        mock_dismiss.assert_awaited_once()
+
+    async def test_failed_fill_after_the_upsell_replaced_the_textarea(self, mock_page):
+        """The upsell taking the textarea's place is still a note limit."""
+        actions = _actions(mock_page)
+        textarea = MagicMock()
+        # Mounted when the dialog opens, gone once the fill has failed.
+        textarea.count = AsyncMock(side_effect=[1, 0])
+        buttons = MagicMock()
+        buttons.count = AsyncMock(return_value=2)
+        _scope_dialog(mock_page, buttons=buttons, textarea=textarea)
+
+        with (
+            patch.object(
+                actions, "_dialog_is_open", new_callable=AsyncMock, return_value=True
+            ),
+            patch.object(
+                actions,
+                "_dialog_text",
+                new_callable=AsyncMock,
+                return_value=DIALOG_TEXT,
+            ),
+            patch.object(
+                actions,
+                "_fill_dialog_textarea",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                actions,
+                "_get_premium_upsell_message",
+                new_callable=AsyncMock,
+                return_value=PREMIUM_MESSAGE,
+            ),
+            patch.object(
+                actions, "_dismiss_dialog", new_callable=AsyncMock
+            ) as mock_dismiss,
+        ):
+            result = await actions._submit_invite_dialog("Hello")
+
+        assert result == (False, False, PREMIUM_MESSAGE, DIALOG_TEXT)
+        mock_dismiss.assert_awaited_once()
+
+    async def test_failed_fill_beside_a_hidden_textarea_is_a_note_limit(
+        self, mock_page
+    ):
+        """A textarea the upsell left mounted but hidden is no note field."""
+        actions = _actions(mock_page)
+        mounted = MagicMock()
+        mounted.count = AsyncMock(return_value=1)
+        shown = MagicMock()
+        shown.count = AsyncMock(return_value=0)
+        buttons = MagicMock()
+        buttons.count = AsyncMock(return_value=2)
+        dialog = _scope_dialog(mock_page, buttons=buttons, textarea=mounted)
+        dialog.locator = MagicMock(
+            side_effect=lambda selector: shown if "visible" in selector else mounted
+        )
+
+        with (
+            patch.object(
+                actions, "_dialog_is_open", new_callable=AsyncMock, return_value=True
+            ),
+            patch.object(
+                actions,
+                "_dialog_text",
+                new_callable=AsyncMock,
+                return_value=DIALOG_TEXT,
+            ),
+            patch.object(
+                actions,
+                "_fill_dialog_textarea",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch.object(
+                actions,
+                "_get_premium_upsell_message",
+                new_callable=AsyncMock,
+                return_value=PREMIUM_MESSAGE,
+            ),
+            patch.object(actions, "_dismiss_dialog", new_callable=AsyncMock),
+        ):
+            result = await actions._submit_invite_dialog("Hello")
+
+        assert result == (False, False, PREMIUM_MESSAGE, DIALOG_TEXT)
+
     async def test_reports_premium_after_send_click_failure(self, mock_page):
         """Premium upsell intercepting the Send click is a note-limit block.
 
@@ -1003,10 +1231,14 @@ class TestInviteDialog:
         """A Send click that succeeds is not yet a note that was delivered.
 
         LinkedIn accepts the click and then swaps the invite dialog for the
-        quota upsell, so the only evidence that the note went nowhere is the
-        modal standing open afterwards. Reporting this as a send would tell
-        the caller a note reached a member who never got one, and the two
-        earlier upsell probes cannot see it: both sit on failure paths.
+        quota upsell modal, which matches the same dialog selector as the
+        invite dialog it replaced — so the close-wait genuinely times out
+        rather than resolving, and that timeout is the real, structural
+        signal (no label text read) that distinguishes this from a benign
+        nudge banner that closes with the dialog on a real send. Reporting
+        this as a send would tell the caller a note reached a member who
+        never got one, and the two earlier upsell probes cannot see it: both
+        sit on failure paths.
         """
         actions = _actions(mock_page)
 
@@ -1021,7 +1253,13 @@ class TestInviteDialog:
                 actions, "_dialog_is_open", new_callable=AsyncMock, return_value=True
             ),
             patch.object(
-                actions, "_dialog_is_closed", new_callable=AsyncMock
+                actions,
+                "_dialog_is_closed",
+                new_callable=AsyncMock,
+                # The close wait times out: the upsell modal that replaced
+                # the invite dialog still matches _DIALOG_SELECTOR, so it
+                # never goes away.
+                return_value=False,
             ) as mock_closed,
             patch.object(
                 actions,
@@ -1056,8 +1294,10 @@ class TestInviteDialog:
         assert result == (False, False, PREMIUM_MESSAGE, DIALOG_TEXT)
         mock_message.assert_awaited_once()
         mock_dismiss.assert_awaited_once()
-        # The close wait belongs to the delivered path, which this is not.
-        mock_closed.assert_not_awaited()
+        # The close wait is what proves this is the blocked path: it is
+        # attempted and answers "still open", which is the real signal
+        # gating the premium check below it.
+        mock_closed.assert_awaited_once_with(timeout=5000)
 
     async def test_the_quota_probe_never_clicks_the_primary_button(self, mock_page):
         """The probe opens the note editor and touches nothing else.
