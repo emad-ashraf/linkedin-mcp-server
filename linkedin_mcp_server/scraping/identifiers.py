@@ -55,6 +55,7 @@ __all__ = [
     "normalize_job_id",
     "normalize_opaque_id",
     "normalize_person_identifier",
+    "normalize_profile_urn",
     "normalize_thread_id",
     "person_profile_url",
 ]
@@ -140,6 +141,9 @@ _THREAD_ROUTE = ("messaging", "thread")
 # one here extracts ``\d+``, and anything else navigates to a 404 that costs a
 # page load to discover.
 _NUMERIC_ID = re.compile(r"^[0-9]+$")
+
+_PROFILE_URN_PREFIX = "urn:li:fsd_profile:"
+_PROFILE_URN_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _decoded(value: str) -> str | None:
@@ -362,7 +366,11 @@ def normalize_person_identifier(value: str, *, allow_self_alias: bool = False) -
 def normalize_company_identifier(value: str) -> str:
     """The page slug for an organization, from a link or from the slug itself.
 
-    Idempotent, and raises the same way :func:`normalize_person_identifier` does.
+    Raises the same way :func:`normalize_person_identifier` does. **Not**
+    idempotent for a host-shaped slug: ``/company/linkedin.com/`` yields
+    ``linkedin.com``, which a second pass reads as a host and refuses (same for
+    ``de.linkedin.com`` and ``lnkd.in``). Callers normalize exactly once and
+    pass the caller's own form on — see ``tools/company.py``.
     """
     value = value.strip()
     if not value:
@@ -474,3 +482,15 @@ def normalize_job_id(value: str) -> str:
 def normalize_thread_id(value: str) -> str:
     """The id for a conversation, from the id or from a reference to it."""
     return normalize_opaque_id(value, field="thread_id", route=_THREAD_ROUTE)
+
+
+def normalize_profile_urn(value: str) -> str:
+    """A raw profile id or full profile URN, in the caller's original form."""
+    value = value.strip()
+    identifier = value.removeprefix(_PROFILE_URN_PREFIX)
+    if not _PROFILE_URN_ID.fullmatch(identifier):
+        raise InvalidReferenceError(
+            "profile_urn is not a LinkedIn id. Pass the id exactly as a previous "
+            "result returned it, with no URL, path or query around it."
+        )
+    return value

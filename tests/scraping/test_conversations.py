@@ -298,6 +298,12 @@ class TestReadStateWrites:
 
 
 class TestGetConversation:
+    async def test_no_selector_is_an_invalid_reference(self, mock_page):
+        """The caller named nobody, so this is a correctable argument, not a
+        defect: `InvalidReferenceError` keeps issue-report diagnostics off it."""
+        with pytest.raises(InvalidReferenceError, match="at least one"):
+            await _reader(mock_page).get_conversation()
+
     async def test_direct_id_uses_one_inbox_navigation_and_no_thread_navigation(
         self, mock_page
     ):
