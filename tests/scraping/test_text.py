@@ -4,7 +4,9 @@ import re
 
 from linkedin_mcp_server.scraping.text import (
     DETAIL_CAPTURE_EN_US,
+    JOB_POSTING_EN_US,
     JOB_SEARCH_EN_US,
+    JobPostingTextTable,
     strip_conversation_chrome,
     strip_linkedin_noise,
     truncate_linkedin_noise,
@@ -87,6 +89,22 @@ class TestDetailCaptureText:
                             && !text.startsWith('Explore premium profiles');
                     }"""
         )
+
+
+class TestJobPostingText:
+    def test_en_us_table_names_the_description_heading(self):
+        assert JOB_POSTING_EN_US.description_headings == ("About the job",)
+        assert '["About the job"]' in JOB_POSTING_EN_US.readiness_expression()
+
+    def test_headings_are_embedded_as_json_string_literals(self):
+        table = JobPostingTextTable(description_headings=("À propos de l'offre",))
+        assert '["À propos de l\'offre"]' in table.readiness_expression()
+
+    def test_has_description_needs_the_heading_as_a_whole_line(self):
+        assert JOB_POSTING_EN_US.has_description("Engineer\n  About the job  \nBuild")
+        assert not JOB_POSTING_EN_US.has_description("Read About the job below")
+        assert not JOB_POSTING_EN_US.has_description("Engineer\nAcme\nApply")
+        assert not JOB_POSTING_EN_US.has_description("")
 
 
 class TestStripLinkedInNoise:

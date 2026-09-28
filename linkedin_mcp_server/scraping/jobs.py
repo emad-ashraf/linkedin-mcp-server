@@ -11,7 +11,11 @@ import time
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.core.exceptions import LinkedInScraperException
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
-from linkedin_mcp_server.scraping.capture import CapturePlan, SectionCapture
+from linkedin_mcp_server.scraping.capture import (
+    CaptureMode,
+    CapturePlan,
+    SectionCapture,
+)
 from linkedin_mcp_server.scraping.contracts import (
     RATE_LIMITED_SECTION_TEXT,
     rate_limited_section_error,
@@ -31,6 +35,7 @@ from linkedin_mcp_server.scraping.job_policy import (
     dropped_offset_section_error,
     label_similar_jobs,
     lost_keywords_section_error,
+    missing_description_section_error,
     no_matching_jobs_section_error,
     reconcile_search_references,
 )
@@ -38,7 +43,11 @@ from linkedin_mcp_server.scraping.link_metadata import Reference, dedupe_referen
 from linkedin_mcp_server.scraping.navigation import PageNavigator
 from linkedin_mcp_server.scraping.search_urls import build_job_search_url
 from linkedin_mcp_server.scraping.session import ScrapingSession, nav_delay
-from linkedin_mcp_server.scraping.text import JOB_SEARCH_EN_US, JobSearchTextTable
+from linkedin_mcp_server.scraping.text import (
+    JOB_POSTING_EN_US,
+    JOB_SEARCH_EN_US,
+    JobSearchTextTable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +88,7 @@ class JobScraper:
         extracted = await self._capture.capture(
             url,
             section_name="job_posting",
-            plan=CapturePlan(),
+            plan=CapturePlan(CaptureMode.JOB_POSTING),
         )
 
         sections: dict[str, str] = {}
@@ -91,6 +100,8 @@ class JobScraper:
                 references["job_posting"] = label_similar_jobs(
                     extracted.references, job_id
                 )
+            if not JOB_POSTING_EN_US.has_description(extracted.text):
+                section_errors["job_posting"] = missing_description_section_error()
         elif extracted.text == RATE_LIMITED_SECTION_TEXT:
             section_errors["job_posting"] = rate_limited_section_error()
         elif extracted.error:

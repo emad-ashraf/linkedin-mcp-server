@@ -13,7 +13,11 @@ from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.scraping import jobs as jobs_module
-from linkedin_mcp_server.scraping.capture import CapturePlan, SectionCapture
+from linkedin_mcp_server.scraping.capture import (
+    CaptureMode,
+    CapturePlan,
+    SectionCapture,
+)
 from linkedin_mcp_server.scraping.content import PageContentReader
 from linkedin_mcp_server.scraping.contracts import (
     RATE_LIMITED_SECTION_TEXT,
@@ -95,7 +99,7 @@ class TestScrapeJob:
         capture.assert_awaited_once_with(
             "https://www.linkedin.com/jobs/view/12345/",
             section_name="job_posting",
-            plan=CapturePlan(),
+            plan=CapturePlan(CaptureMode.JOB_POSTING),
         )
         assert result["url"] == "https://www.linkedin.com/jobs/view/12345/"
         assert "job_posting" in result["sections"]
@@ -166,6 +170,37 @@ class TestScrapeJob:
             "job posting",
             "similar job",
         ]
+
+    async def test_scrape_job_reports_a_posting_without_its_description(
+        self, mock_page
+    ):
+        scraper = _scraper(mock_page)
+        with patch.object(
+            scraper._capture,
+            "capture",
+            new_callable=AsyncMock,
+            return_value=extracted("Software Engineer\nAcme\nEasy Apply"),
+        ):
+            result = await scraper.scrape_job("12345")
+
+        assert result["sections"] == {
+            "job_posting": "Software Engineer\nAcme\nEasy Apply"
+        }
+        error = result["section_errors"]["job_posting"]
+        assert error["error_type"] == "description_missing"
+
+    async def test_scrape_job_with_its_description_reports_nothing(self, mock_page):
+        scraper = _scraper(mock_page)
+        with patch.object(
+            scraper._capture,
+            "capture",
+            new_callable=AsyncMock,
+            return_value=extracted("Software Engineer\nAbout the job\nBuild agents"),
+        ):
+            result = await scraper.scrape_job("12345")
+
+        assert "job_posting" in result["sections"]
+        assert "section_errors" not in result
 
 
 class TestSearchJobs:
