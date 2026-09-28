@@ -47,7 +47,7 @@ def _hold(auth_root: str, seconds: float) -> int:
     if not lease.try_acquire():
         print("BUSY", flush=True)
         return 1
-    print("HELD", flush=True)
+    print(f"HELD {os.getpid()}", flush=True)
     time.sleep(seconds)
     lease.release()
     print("RELEASED", flush=True)
@@ -117,7 +117,7 @@ def _die_holding(auth_root: str) -> int:
     if not lease.try_acquire():
         print("BUSY", flush=True)
         return 1
-    print("HELD", flush=True)
+    print(f"HELD {os.getpid()}", flush=True)
     sys.stdout.flush()
     os._exit(0)  # no unwinding, no release: only the kernel can free this
 
