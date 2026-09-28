@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING
 
 from .exceptions import (
+    AccountRestrictedError,
     AuthenticationError,
     ElementNotFoundError,
     LinkedInScraperException,
@@ -89,6 +90,7 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "AUTH_COOKIE_NAMES",
+    "AccountRestrictedError",
     "AuthenticationError",
     "BrowserManager",
     "auth_cookies",
