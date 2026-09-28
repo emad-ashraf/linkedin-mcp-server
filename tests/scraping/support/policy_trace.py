@@ -661,6 +661,7 @@ def semantic_program_id(program: str) -> str:
         ("""closest('li, article, [role="article"]')""", "content_search_count"),
         ('a[href*="/in/"]', "company_people_ready"),
         ("text.startsWith('Load more')", "profile_details_ready"),
+        ("lines.includes(heading)", "job_description_ready"),
         ("premium/", "premium_dialog_text"),
         ('main a[href*="/in/"]', "sidebar_expanded_profiles"),
     )

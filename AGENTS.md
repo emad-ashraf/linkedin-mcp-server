@@ -147,7 +147,7 @@ All scraping tools return: `{url, sections: {name: raw_text}}`.
 Optional additional keys:
 
 - `references: {section_name: [{kind, url, text?, context?, value?}]}` — LinkedIn URLs are relative paths; `value` carries non-URL identifiers (e.g. company URN id for `kind: "company_urn"`)
-- `section_errors: {section_name: {error_type, error_message, issue_template_path, runtime, ...}}`
+- `section_errors: {section_name: {error_type, error_message, issue_template_path, runtime, ...}}` — expected page states carry only `error_type` and `error_message`, because there is no defect to file: `contact_info` reports `OverlayRootNotFoundError` when neither `dialog[open]` nor `.artdeco-modal__content` was on the page, and the profile text underneath is never substituted for contact details; `get_job_details` reports `description_missing` when the captured text carries no description heading, and keeps the text it did read
 - `unknown_sections: [name, ...]`
 - `job_ids: [id, ...]` (search_jobs and get_saved_jobs)
 - `people: [{name, degree, headline, location, snippet, url[, followers]}]` (search_people) and `companies: [{name, industry, location, tagline, followers, url}]` (search_companies) — rows parsed from each page's text by `scraping/search_parse.py` before the pages are joined, deduped by `url` across pages; `url` may be null when a card could not be paired with an anchor. A parser failure logs a warning and yields an empty list; the raw text is still returned.

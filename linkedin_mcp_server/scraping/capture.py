@@ -24,7 +24,9 @@ from linkedin_mcp_server.scraping.navigation import PageNavigator
 from linkedin_mcp_server.scraping.session import ScrapingSession
 from linkedin_mcp_server.scraping.text import (
     DETAIL_CAPTURE_EN_US,
+    JOB_POSTING_EN_US,
     DetailCaptureTextTable,
+    JobPostingTextTable,
     filter_linkedin_noise_lines,
     truncate_linkedin_noise,
 )
@@ -67,6 +69,10 @@ CONTENT_SEARCH_COUNT_JS = r"""() => {
 CONTENT_SEARCH_SCROLL_BUDGET = 60.0
 
 
+class OverlayRootNotFoundError(RuntimeError):
+    """The overlay read found neither accepted overlay root on the page."""
+
+
 class CaptureMode(Flag):
     """Independent post-navigation behaviors applied during section capture."""
 
@@ -77,6 +83,7 @@ class CaptureMode(Flag):
     DETAILS = auto()
     OVERLAY = auto()
     CONTENT_SEARCH = auto()
+    JOB_POSTING = auto()
 
 
 @dataclass(frozen=True)
@@ -102,13 +109,13 @@ def capture_plan_for_url(url: str, max_scrolls: int | None = None) -> CapturePla
         "/company/" in path and path.rstrip("/").endswith("/posts")
     ):
         mode |= CaptureMode.ACTIVITY
-    if "/search/results/" in url:
+    if "/search/results/" in path:
         mode |= CaptureMode.SEARCH_RESULTS
     if "/search/results/content/" in path:
         mode |= CaptureMode.CONTENT_SEARCH
-    if "/company/" in url and "/people/" in url:
+    if "/company/" in path and "/people/" in path:
         mode |= CaptureMode.COMPANY_PEOPLE
-    if "/details/" in url:
+    if "/details/" in path:
         mode |= CaptureMode.DETAILS
     return CapturePlan(mode=mode, max_scrolls=max_scrolls)
 
@@ -122,11 +129,13 @@ class SectionCapture:
         navigator: PageNavigator,
         content: PageContentReader,
         detail_text: DetailCaptureTextTable = DETAIL_CAPTURE_EN_US,
+        job_posting_text: JobPostingTextTable = JOB_POSTING_EN_US,
     ):
         self._session = session
         self._navigator = navigator
         self._content = content
         self._detail_text = detail_text
+        self._job_posting_text = job_posting_text
 
     async def extract_page(
         self,
@@ -176,6 +185,19 @@ class SectionCapture:
             # fail, not the section. Isolating it here is where the incident's
             # error was swallowed.
             raise
+        except OverlayRootNotFoundError as e:
+            # A compact, self-explaining section error rather than issue
+            # diagnostics: the overlay simply did not open, which is a page
+            # state and not a defect to file.
+            logger.warning("Failed to extract overlay %s: %s", url, e)
+            return ExtractedSection(
+                text="",
+                references=[],
+                error={
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                },
+            )
         except Exception as e:
             is_overlay = CaptureMode.OVERLAY in plan.mode
             logger.warning(
@@ -296,6 +318,20 @@ class SectionCapture:
                 except Exception as e:
                     logger.debug("Show more click failed: %s", e)
                     break
+
+        # A posting renders its header, apply controls and company boilerplate
+        # before the description panel, so a page read once `<main>` exists
+        # can come back whole except for the description. Nothing structural
+        # marks the panel as loaded; its heading is the only signal, hence the
+        # locale table. A timeout still extracts what rendered.
+        if CaptureMode.JOB_POSTING in plan.mode:
+            try:
+                await self._session.page.wait_for_function(
+                    self._job_posting_text.readiness_expression(),
+                    timeout=10000,
+                )
+            except PlaywrightTimeoutError:
+                logger.debug("Job description did not appear on %s", url)
 
         if CaptureMode.CONTENT_SEARCH in plan.mode:
             await self._scroll_content_search_results(
@@ -456,15 +492,36 @@ class SectionCapture:
                 "dialog[open], .artdeco-modal__content"
             )
         except PlaywrightTimeoutError:
-            logger.debug("No modal overlay found on %s, falling back to main", url)
+            logger.debug(
+                "Overlay wait timed out on %s; checking roots at read time", url
+            )
 
-        # The contact-info overlay is the modal, so dismissing it here would
-        # destroy the content before the reader can fall back through its roots.
+        # Do not dismiss the contact-info modal. Only the source from this read
+        # may authorize contact content; its body fallback must never do so (#1094).
         raw_result = await self._content._extract_root_content(
-            ["dialog[open]", ".artdeco-modal__content", "main"],
+            ["dialog[open]", ".artdeco-modal__content"],
         )
-        raw = raw_result["text"]
+        if raw_result.get("source") != "root":
+            if raw_result.get("source") == "body":
+                # Preserve the old main-then-body noise heuristic, not its payload.
+                # Body-wide classification alone changes that heuristic's scope.
+                throttle_result = await self._content._extract_root_content(["main"])
+                throttle_text = throttle_result["text"]
+                if throttle_text.strip() and not truncate_linkedin_noise(throttle_text):
+                    logger.warning(
+                        "Overlay %s returned only LinkedIn chrome (likely rate-limited)",
+                        url,
+                    )
+                    return ExtractedSection(
+                        text=RATE_LIMITED_SECTION_TEXT, references=[]
+                    )
+            raise OverlayRootNotFoundError(
+                f"No overlay root (dialog[open] or .artdeco-modal__content) "
+                f"matched on {url}; no underlying-page text or links were "
+                f"returned for {section_name}"
+            )
 
+        raw = raw_result["text"]
         if not raw:
             return ExtractedSection(text="", references=[])
         truncated = truncate_linkedin_noise(raw)
