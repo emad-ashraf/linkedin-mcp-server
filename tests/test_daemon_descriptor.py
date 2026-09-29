@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import stat
 import subprocess
 import sys
@@ -1501,7 +1502,6 @@ class TestEndpointSpelling:
             ("127.0.0.1", "/mcp\ta"),
             ("127.0.0.1", "/mcp\x0b"),
             ("127.0.0.1", "/mcp\udcff"),
-            ("127.0.0.1.", "/mcp"),
             ("127.0.0.1..", "/mcp"),
             ("localhost..", "/mcp"),
         ],
@@ -1518,6 +1518,36 @@ class TestEndpointSpelling:
 
         with pytest.raises(DescriptorError):
             descriptor.check_endpoint_is_local()
+
+    def test_a_single_trailing_dot_follows_the_resolver(self, tmp_path: Path):
+        """``127.0.0.1.`` is a spelling only the platform resolver can settle.
+
+        It is a fully qualified form of a literal, and whether it resolves is
+        not ours to decide: macOS answers ``127.0.0.1``, while a ``..`` in any
+        position is refused by the ``idna`` codec everywhere. Upstream listed
+        this case as always refused, which is true where it was measured and
+        false here, so the suite was red on macOS for a spelling the machine
+        considers perfectly reachable.
+
+        The invariant that matters is not the spelling but the answer: a host
+        is accepted only when it resolves, and only to loopback. Asserting that
+        in both directions keeps the case honest on either platform.
+        """
+        host = "127.0.0.1."
+        try:
+            socket.getaddrinfo(host, 49152, type=socket.SOCK_STREAM)
+        except (OSError, UnicodeError):
+            resolves = False
+        else:
+            resolves = True
+
+        descriptor = _descriptor(tmp_path, new_token(), host=host, path="/mcp")
+
+        if resolves:
+            descriptor.check_endpoint_is_local()
+        else:
+            with pytest.raises(DescriptorError):
+                descriptor.check_endpoint_is_local()
 
     @pytest.mark.parametrize(
         "answers",
