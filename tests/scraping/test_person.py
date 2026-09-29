@@ -1378,13 +1378,14 @@ class TestScrapePersonProfileUrn:
                 "_extract_profile_urn",
                 new_callable=AsyncMock,
                 return_value=loaded_urn,
-            ),
+            ) as extract_urn,
         ):
             result = await scraper.scrape_person(
                 "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo", {"main_profile"}
             )
 
         assert result.get("public_profile_url") == expected
+        extract_urn.assert_awaited_once_with(expected_loaded_url=loaded_url)
 
     async def test_includes_profile_urn_in_result_when_found(self, mock_page):
         """scrape_person includes profile_urn in result when _extract_profile_urn returns a value."""

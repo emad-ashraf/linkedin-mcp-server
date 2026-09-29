@@ -261,6 +261,7 @@ class PersonScraper:
         section_errors: dict[str, dict[str, Any]] = {}
         profile_urn: str | None = None
         public_profile_url: str | None = None
+        loaded_profile_url: str | None = None
         rate_limited = False
 
         requested_ordered = [
@@ -319,9 +320,8 @@ class PersonScraper:
                     if extracted.text and extracted.text != RATE_LIMITED_SECTION_TEXT:
                         sections[section_name] = extracted.text
                         if section_name == "main_profile":
-                            public_profile_url = _public_profile_url(
-                                self._session.page.url
-                            )
+                            loaded_profile_url = self._session.page.url
+                            public_profile_url = _public_profile_url(loaded_profile_url)
                         if extracted.references:
                             references[section_name] = extracted.references
                     elif extracted.text == RATE_LIMITED_SECTION_TEXT:
@@ -344,7 +344,14 @@ class PersonScraper:
                         and profile_urn is None
                         and not rate_limited
                     ):
-                        profile_urn = await self._profile_page._extract_profile_urn()
+                        if _OPAQUE_MEMBER_PATH_RE.fullmatch(username):
+                            profile_urn = await self._profile_page._extract_profile_urn(
+                                expected_loaded_url=(
+                                    loaded_profile_url or self._session.page.url
+                                )
+                            )
+                        else:
+                            profile_urn = await self._profile_page._extract_profile_urn()
                 except ActionLimitError as e:
                     # Refused before it loaded, so nothing was charged; the
                     # sections before it were, and are returned. Stops like
