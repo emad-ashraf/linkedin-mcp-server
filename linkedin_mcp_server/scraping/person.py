@@ -351,7 +351,9 @@ class PersonScraper:
                                 )
                             )
                         else:
-                            profile_urn = await self._profile_page._extract_profile_urn()
+                            profile_urn = (
+                                await self._profile_page._extract_profile_urn()
+                            )
                 except ActionLimitError as e:
                     # Refused before it loaded, so nothing was charged; the
                     # sections before it were, and are returned. Stops like
