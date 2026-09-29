@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import logging
 import re
@@ -48,6 +48,29 @@ if TYPE_CHECKING:
     from linkedin_mcp_server.callbacks import ProgressCallback
 
 logger = logging.getLogger(__name__)
+
+_OPAQUE_MEMBER_PATH_RE = re.compile(r"^ACo[A-Za-z0-9_-]{20,}$")
+
+
+def _public_profile_url(loaded_url: str) -> str | None:
+    """Return a public person URL only from the loaded profile's actual URL."""
+    parsed = urlparse(loaded_url)
+    host = (parsed.hostname or "").casefold().removeprefix("www.")
+    parts = [part for part in parsed.path.split("/") if part]
+    slug = unquote(parts[1]) if len(parts) == 2 else ""
+    if (
+        parsed.scheme != "https"
+        or host != "linkedin.com"
+        or len(parts) != 2
+        or parts[0].casefold() != "in"
+        or not slug
+        or len(slug) > 100
+        or not slug[0].isalnum()
+        or any(not (character.isalnum() or character in "-_") for character in slug)
+        or _OPAQUE_MEMBER_PATH_RE.fullmatch(slug)
+    ):
+        return None
+    return f"https://www.linkedin.com/in/{quote(slug, safe='-_')}/"
 
 
 def _js_literal(value: str, quote: str) -> str:
@@ -237,6 +260,7 @@ class PersonScraper:
         references: dict[str, list[Reference]] = {}
         section_errors: dict[str, dict[str, Any]] = {}
         profile_urn: str | None = None
+        public_profile_url: str | None = None
         rate_limited = False
 
         requested_ordered = [
@@ -294,6 +318,10 @@ class PersonScraper:
 
                     if extracted.text and extracted.text != RATE_LIMITED_SECTION_TEXT:
                         sections[section_name] = extracted.text
+                        if section_name == "main_profile":
+                            public_profile_url = _public_profile_url(
+                                self._session.page.url
+                            )
                         if extracted.references:
                             references[section_name] = extracted.references
                     elif extracted.text == RATE_LIMITED_SECTION_TEXT:
@@ -363,6 +391,12 @@ class PersonScraper:
         }
         if profile_urn:
             result["profile_urn"] = profile_urn
+        if (
+            public_profile_url
+            and _OPAQUE_MEMBER_PATH_RE.fullmatch(username)
+            and profile_urn == username
+        ):
+            result["public_profile_url"] = public_profile_url
         if references:
             result["references"] = references
         if section_errors:

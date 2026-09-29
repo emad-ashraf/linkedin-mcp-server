@@ -1335,6 +1335,57 @@ class TestMainProfileAlreadyLoaded:
 
 
 class TestScrapePersonProfileUrn:
+    @pytest.mark.parametrize(
+        ("loaded_url", "loaded_urn", "expected"),
+        [
+            (
+                "https://www.linkedin.com/in/ada-buyer/?trk=messaging",
+                "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo",
+                "https://www.linkedin.com/in/ada-buyer/",
+            ),
+            (
+                "https://www.linkedin.com/in/ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo/",
+                "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo",
+                None,
+            ),
+            (
+                "https://www.linkedin.com/checkpoint/challenge/",
+                "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo",
+                None,
+            ),
+            (
+                "https://www.linkedin.com/in/another-person/",
+                "ACoOTHER91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo",
+                None,
+            ),
+            ("https://www.linkedin.com/in/ada-buyer/", None, None),
+        ],
+    )
+    async def test_public_profile_url_uses_loaded_redirect(
+        self, mock_page, loaded_url, loaded_urn, expected
+    ):
+        mock_page.url = loaded_url
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                new_callable=AsyncMock,
+                return_value=extracted("profile text"),
+            ),
+            patch.object(
+                scraper._profile_page,
+                "_extract_profile_urn",
+                new_callable=AsyncMock,
+                return_value=loaded_urn,
+            ),
+        ):
+            result = await scraper.scrape_person(
+                "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo", {"main_profile"}
+            )
+
+        assert result.get("public_profile_url") == expected
+
     async def test_includes_profile_urn_in_result_when_found(self, mock_page):
         """scrape_person includes profile_urn in result when _extract_profile_urn returns a value."""
         urn = "ACoAAB1IelEBLEkqTkNbZ-a1D8mq5R-6C1ihSEk"
