@@ -19,6 +19,51 @@ def _reader(page) -> ProfilePageReader:
 
 
 class TestExtractProfileUrn:
+    async def test_reads_unique_profile_topcard_when_compose_action_is_unavailable(
+        self, mock_page
+    ):
+        member_id = "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo"
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "pageUrl": "https://www.linkedin.com/in/ada-buyer/",
+                "topcardIds": [f"com.linkedin.sdui.profile.card.ref{member_id}Topcard"],
+            }
+        )
+
+        assert await _reader(mock_page)._extract_profile_urn(
+            expected_loaded_url="https://www.linkedin.com/in/ada-buyer/"
+        ) == member_id
+
+    async def test_rejects_conflicting_profile_topcards(self, mock_page):
+        first = "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo"
+        second = "ACoOTHER91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo"
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "pageUrl": "https://www.linkedin.com/in/ada-buyer/",
+                "topcardIds": [
+                    f"com.linkedin.sdui.profile.card.ref{first}Topcard",
+                    f"com.linkedin.sdui.profile.card.ref{second}Topcard",
+                ],
+            }
+        )
+
+        assert await _reader(mock_page)._extract_profile_urn(
+            expected_loaded_url="https://www.linkedin.com/in/ada-buyer/"
+        ) is None
+
+    async def test_rejects_topcard_after_page_url_changes(self, mock_page):
+        member_id = "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo"
+        mock_page.evaluate = AsyncMock(
+            return_value={
+                "pageUrl": "https://www.linkedin.com/in/another-person/",
+                "topcardIds": [f"com.linkedin.sdui.profile.card.ref{member_id}Topcard"],
+            }
+        )
+
+        assert await _reader(mock_page)._extract_profile_urn(
+            expected_loaded_url="https://www.linkedin.com/in/ada-buyer/"
+        ) is None
+
     async def test_returns_urn_from_atomic_top_card_snapshot(self, mock_page):
         mock_page.evaluate = AsyncMock(
             return_value={
