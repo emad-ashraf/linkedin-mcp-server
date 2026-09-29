@@ -46,7 +46,7 @@ This MCP server is **free** and **open source**, supported by [**Unipile**](http
 
 | Tool | Description |
 |------|-------------|
-| `get_person_profile` | Get profile info with explicit section selection (experience, education, interests, honors, languages, certifications, skills, projects, contact_info, posts) |
+| `get_person_profile` | Get profile info with explicit section selection (experience, education, interests, honors, languages, certifications, skills, projects, contact_info, posts). For an opaque member ID, returns `public_profile_url` only when the loaded public `/in/<vanity>/` page has the same member URN. |
 | `get_my_profile` | Get the authenticated user's own LinkedIn profile (same sections as get_person_profile) |
 | `connect_with_person` | Send a connection request or accept an incoming one, with optional note |
 | `get_sidebar_profiles` | Extract profile URLs from sidebar recommendation sections ("More profiles for you", "Explore premium profiles", "People you may know") on a profile page |
