@@ -74,7 +74,11 @@ class ProfilePageReader:
         if not isinstance(topcard_ids, list) or len(topcard_ids) != 1:
             return None
         topcard_id = topcard_ids[0]
-        match = _TOPCARD_ID_RE.fullmatch(topcard_id) if isinstance(topcard_id, str) else None
+        match = (
+            _TOPCARD_ID_RE.fullmatch(topcard_id)
+            if isinstance(topcard_id, str)
+            else None
+        )
         return match.group(1) if match else None
 
     async def _read_profile_display_name(self) -> str | None:
