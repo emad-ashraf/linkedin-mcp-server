@@ -759,7 +759,7 @@ off.
 | `DAILY_ACTIONS_MAX` | `150` | Ceiling on any enrichment job's `daily_cap`; may only be lowered |
 | `PROFILE_LOADS_MAX` | `80` | Profile page loads per rolling 24 h; may only be lowered |
 | `SEARCH_PAGES_MAX` | `60` | Search result pages per rolling 24 h; may only be lowered |
-| `INVITES_MAX` / `INVITES_WEEKLY_MAX` | `20` / `100` | Invitations per rolling 24 h / 7 d; may only be lowered |
+| `INVITES_MAX` / `INVITES_WEEKLY_MAX` | `20` / `160` | Invitations per rolling 24 h / 7 d; `INVITES_MAX` may be raised or lowered, `INVITES_WEEKLY_MAX` (LinkedIn's own limit) may only be lowered |
 | `MESSAGES_MAX` | `50` | Messages per rolling 24 h; may only be lowered |
 | `WORKING_HOURS_DISABLED` | off | `1` lets invitations and messages go outside working hours and lifts the halved read caps |
 | `DAILY_ACTIONS_DEFAULT` | `100` | `daily_cap` when a job does not set one |

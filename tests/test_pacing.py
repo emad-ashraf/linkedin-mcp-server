@@ -773,19 +773,19 @@ class TestPerKindCaps:
 
     def test_invites_are_also_capped_per_week(self):
         budget = _budget()
-        # 20 a day on each of the last five days: none today, 100 this week.
-        for day in range(5):
-            _spend(budget, INVITES, 20, WED_10AM - timedelta(days=day + 1))
+        # 40 a day on each of the last four days: none today, 160 this week.
+        for day in range(4):
+            _spend(budget, INVITES, 40, WED_10AM - timedelta(days=day + 1))
         now = WED_10AM + timedelta(hours=1)
         assert budget.ledger.spent_kind(INVITES, now) == 0
 
         with pytest.raises(ActionLimitError) as excinfo:
             refuse_if_limited(budget, INVITES, now)
 
-        assert excinfo.value.limit == 100
+        assert excinfo.value.limit == 160
         assert excinfo.value.window == "7 d"
-        # The oldest twenty were sent five days ago and free up two days on.
-        assert excinfo.value.resume_at == WED_10AM - timedelta(days=5) + timedelta(
+        # The oldest forty were sent four days ago and free up three days on.
+        assert excinfo.value.resume_at == WED_10AM - timedelta(days=4) + timedelta(
             days=7
         )
 
@@ -816,7 +816,6 @@ class TestPerKindCaps:
         [
             (EnvironmentKeys.PROFILE_LOADS_MAX, PROFILE, 80),
             (EnvironmentKeys.SEARCH_PAGES_MAX, SEARCH, 60),
-            (EnvironmentKeys.INVITES_MAX, INVITES, 20),
             (EnvironmentKeys.MESSAGES_MAX, MESSAGES, 50),
         ],
     )
@@ -834,6 +833,16 @@ class TestPerKindCaps:
         assert excinfo.value.limit == default
         assert any(key in r.getMessage() for r in caplog.records)
 
+    def test_the_environment_can_raise_the_daily_invite_cap(self, monkeypatch):
+        monkeypatch.setenv(EnvironmentKeys.INVITES_MAX, "40")
+        budget = _budget()
+        _spend(budget, INVITES, 39, WED_10AM)
+        refuse_if_limited(budget, INVITES, WED_10AM)  # the 40th is allowed
+        budget.ledger.record_kind(INVITES, WED_10AM)
+        with pytest.raises(ActionLimitError) as excinfo:
+            refuse_if_limited(budget, INVITES, WED_10AM)
+        assert (excinfo.value.limit, excinfo.value.window) == (40, "24 h")
+
     def test_the_weekly_invite_cap_lowers_but_never_raises(self, monkeypatch, caplog):
         monkeypatch.setenv(EnvironmentKeys.INVITES_WEEKLY_MAX, "30")
         budget = _budget()
@@ -843,13 +852,13 @@ class TestPerKindCaps:
         assert (excinfo.value.limit, excinfo.value.window) == (30, "7 d")
 
         monkeypatch.setenv(EnvironmentKeys.INVITES_WEEKLY_MAX, "300")
-        _spend(budget, INVITES, 70, WED_10AM - timedelta(days=2))
+        _spend(budget, INVITES, 130, WED_10AM - timedelta(days=2))
         with (
             caplog.at_level(logging.WARNING),
             pytest.raises(ActionLimitError) as excinfo,
         ):
             refuse_if_limited(budget, INVITES, WED_10AM)
-        assert excinfo.value.limit == 100
+        assert excinfo.value.limit == 160
         assert any(
             EnvironmentKeys.INVITES_WEEKLY_MAX in r.getMessage() for r in caplog.records
         )
@@ -966,7 +975,7 @@ class TestKindHeadroom:
 
     def test_the_weekly_invite_cap_can_be_the_tight_one(self):
         budget = _budget()
-        _spend(budget, INVITES, 95, WED_10AM - timedelta(days=3))
+        _spend(budget, INVITES, 155, WED_10AM - timedelta(days=3))
         headroom, wait = kind_headroom(budget, INVITES, WED_10AM)
         assert headroom == 5
         assert wait == pytest.approx(4 * 24 * 3600, abs=1)

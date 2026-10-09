@@ -93,10 +93,12 @@ DEFAULT_DAILY_ACTIONS = 100
 # each (#58). The variable next to each may lower it and never raise it:
 # these are the ceiling, and the daily cap above used to be raisable from the
 # environment, which is how a live ledger came to read ``daily_cap: 250``.
+# INVITES_MAX is the exception: its 20 is only a conservative default, and
+# LinkedIn's real limit is the weekly one (160 per 7 d), which still bounds it.
 PROFILE_LOADS_MAX = 80  # PROFILE_LOADS_MAX, per 24 h
 SEARCH_PAGES_MAX = 60  # SEARCH_PAGES_MAX, per 24 h
 INVITES_MAX = 20  # INVITES_MAX, per 24 h
-INVITES_WEEKLY_MAX = 100  # INVITES_WEEKLY_MAX, per 7 d
+INVITES_WEEKLY_MAX = 160  # INVITES_WEEKLY_MAX, per 7 d
 MESSAGES_MAX = 50  # MESSAGES_MAX, per 24 h
 
 # Kinds a navigation is filed under, by URL. Only ``profile`` and ``search``
@@ -209,7 +211,10 @@ def kind_caps(kind: str) -> tuple[tuple[int, int], ...]:
         )
     if kind == INVITES:
         return (
-            (_env_at_most(EnvironmentKeys.INVITES_MAX, INVITES_MAX), WINDOW_SECONDS),
+            (
+                env_int(EnvironmentKeys.INVITES_MAX, INVITES_MAX, minimum=1),
+                WINDOW_SECONDS,
+            ),
             (
                 _env_at_most(EnvironmentKeys.INVITES_WEEKLY_MAX, INVITES_WEEKLY_MAX),
                 WEEK_SECONDS,
