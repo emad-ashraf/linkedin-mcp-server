@@ -76,6 +76,64 @@ This MCP server is **free** and **open source**, supported by [**Unipile**](http
 <br/>
 <br/>
 
+### Structured messaging output
+
+`get_conversation` preserves `url`, rendered `sections.conversation` and
+`references.conversation`, and adds a `conversation` object:
+
+```json
+{
+  "id": "2-example",
+  "participants": [{"name": "Ada Lovelace", "profileUrl": "/in/ada/"}],
+  "participantCoverage": {"status": "resolved", "sourceCount": 1, "unresolvedCount": 0},
+  "messages": [{"id": "urn:li:msg_message:example", "sentAt": "2026-10-19T14:00:00.123+00:00", "body": "Hello", "sender": {"profileUrl": "/in/ada/"}}],
+  "timestampSource": "deliveredAt_unix_ms",
+  "history": {"scope": "bounded_thread", "exhaustion": "unknown", "stopReason": "short_batch", "pagesFetched": 1, "messageCount": 1, "pageSize": 20, "maxOlderPages": 3}
+}
+```
+
+The ID comes from the verified conversation's thread URL. Participant fields
+come only from its participant records; `sender` comes from the message's own
+sender. `providerIdentity` is included when a participant record supplies a
+provider URN. Message IDs are the first supplied nonblank `entityUrn`,
+`backendUrn` or `messageUrn`, unchanged. Unknown fields are omitted; IDs are
+never derived from message text. The message list may contain partial records,
+and unsupported participant records remain empty objects (`{}`), preserving
+the captured participant count without inventing identity.
+`participantCoverage` reports `status` (`resolved`, `partial` or `unavailable`),
+with `sourceCount` and `unresolvedCount` when the provider supplied a list.
+Unresolved counts include unsupported records and name-only participants.
+This describes the captured participant records; `partial`/`unavailable` cannot
+establish a two-person conversation. Attachment
+links and conversation titles do not establish membership. Only the provider's
+message body becomes `body`; fallback event text remains in the rendered section.
+
+`sentAt` represents LinkedIn's `deliveredAt` Unix milliseconds, converted to UTC
+with millisecond precision. It does not infer the sender's local timezone or a
+separate authoring time. Conversation references from passive inbox/search
+payloads also include `last_activity_at` when a valid `lastActivityAt` is present,
+using the same UTC representation.
+
+History reports successful fetched batches (including an empty older batch),
+returned message count, and the existing acquisition limits: one initial batch
+and at most three older requests with `countBefore=20`. `pageSize` is the
+older-request size and the threshold for considering history; it does not prove
+that the initial provider batch contained 20 messages. `stopReason` is `short_batch`,
+`empty_batch`, `history_template_unavailable`, `no_timestamp`, `no_progress`, or
+`page_limit`. None proves provider history exhaustion: `exhaustion` remains
+`unknown`, and these per-thread bounds establish no inbox population coverage.
+The reader never discovers history by opening a row. Automatic read-flag and
+badge POSTs are blocked for the duration of inbox, conversation and search reads.
+The two route handlers are registered once per page and reused across reads.
+Read cleanup avoids interception reconfiguration against busy frames. Protection
+remains latched for late request events until the existing writer verifies an
+explicit compose target. A POST already observed while protected stays blocked
+even if its route callback runs after that transition. GETs always fall through.
+An interrupted registration is completed once without duplicate handlers; an
+unsuccessful registration fails closed on that page.
+
+
+
 ## 🚀 uvx Setup (Recommended - Universal)
 
 **Prerequisites:** [Install uv](https://docs.astral.sh/uv/getting-started/installation/).

@@ -528,13 +528,22 @@ class ScriptedPage:
         for callback in callbacks:
             callback(value)
 
-    def assert_clean(self) -> None:
+    def assert_clean(self, *, retained_read_guard: bool = False) -> None:
         remaining = {
             name: len(values) for name, values in self.listeners.items() if values
         }
-        assert not remaining, f"{self.recorder.scenario}: listeners remain: {remaining}"
         routed = {name: len(values) for name, values in self.routes.items() if values}
-        assert not routed, f"{self.recorder.scenario}: routes remain: {routed}"
+        if retained_read_guard:
+            assert remaining == {"request": 1}, remaining
+            assert routed == {
+                "**/voyager/api/voyagerMessagingDashMessengerConversations*": 1,
+                "**/voyager/api/voyagerMessagingDashMessagingBadge*": 1,
+            }, routed
+        else:
+            assert not remaining, (
+                f"{self.recorder.scenario}: listeners remain: {remaining}"
+            )
+            assert not routed, f"{self.recorder.scenario}: routes remain: {routed}"
         unused = {
             name: len(script.values)
             for name, script in self.scripts.items()

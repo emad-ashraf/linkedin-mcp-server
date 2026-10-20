@@ -14,6 +14,8 @@ import anyio.lowlevel
 from linkedin_mcp_server.core.exceptions import LinkedInScraperException
 from linkedin_mcp_server.pacing import note_throttle_signal
 from linkedin_mcp_server.scraping.messaging_payload import (
+    HistoryStopReason,
+    MessageHistory,
     build_message_page_url,
     conversation_elements,
     merge_message_elements,
@@ -99,6 +101,7 @@ class MessagingApiCapture:
     def __init__(self, page: Any):
         self._page = page
         self.payloads: list[dict[str, Any]] = []
+        self.history: MessageHistory
         self._request_template: _RequestTemplate | None = None
         self._history_template: _RequestTemplate | None = None
         self._payload_event = asyncio.Event()
@@ -357,11 +360,14 @@ class MessagingApiCapture:
         """Read the current batch plus up to three bounded older batches."""
         initial = await self.fetch_messages(target, conversations=conversations)
         pages = [message_elements(initial)]
+        pages_fetched = 1
         if len(pages[0]) < _MESSAGE_PAGE_SIZE:
-            return pages[0]
+            return self._history_result(pages[0], "short_batch", pages_fetched)
 
         if self._history_template is None:
-            return pages[0]
+            return self._history_result(
+                pages[0], "history_template_unavailable", pages_fetched
+            )
         history_template = await self._wait_for_history_template()
         source = self._identity_for_template(conversations, history_template.url)
         if source is None:
@@ -388,6 +394,7 @@ class MessagingApiCapture:
         )
         headers = history_template.headers
         oldest_seen: int | None = None
+        stop_reason: HistoryStopReason = "page_limit"
         for _ in range(_MAX_OLDER_PAGES):
             timestamps = [
                 value
@@ -395,9 +402,11 @@ class MessagingApiCapture:
                 if isinstance((value := item.get("deliveredAt")), int)
             ]
             if not timestamps:
+                stop_reason = "no_timestamp"
                 break
             oldest = min(timestamps)
             if oldest_seen is not None and oldest >= oldest_seen:
+                stop_reason = "no_progress"
                 break
             oldest_seen = oldest
             page_url = build_message_page_url(
@@ -427,14 +436,33 @@ class MessagingApiCapture:
                 raise LinkedInScraperException(
                     "LinkedIn returned unverified conversation history data."
                 )
+            pages_fetched += 1
             older = message_elements(payload)
             if not older:
+                stop_reason = "empty_batch"
                 break
             pages.append(older)
             if len(older) < _MESSAGE_PAGE_SIZE:
+                stop_reason = "short_batch"
                 break
 
-        return merge_message_elements(pages)
+        return self._history_result(
+            merge_message_elements(pages), stop_reason, pages_fetched
+        )
+
+    def _history_result(
+        self, messages: list[dict[str, Any]], reason: HistoryStopReason, pages: int
+    ) -> list[dict[str, Any]]:
+        self.history = {
+            "scope": "bounded_thread",
+            "exhaustion": "unknown",
+            "stopReason": reason,
+            "pagesFetched": pages,
+            "messageCount": len(messages),
+            "pageSize": _MESSAGE_PAGE_SIZE,
+            "maxOlderPages": _MAX_OLDER_PAGES,
+        }
+        return messages
 
     async def _drain_pending(self) -> None:
         if not self._pending:

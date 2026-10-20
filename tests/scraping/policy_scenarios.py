@@ -1106,7 +1106,7 @@ async def _conversation_scenario(method: str) -> dict[str, Any]:
                 result = await extractor.search_conversations("engine", limit=10)
             else:
                 raise AssertionError(method)
-    page.assert_clean()
+    page.assert_clean(retained_read_guard=True)
     return recorder.trace(
         {"method": method, "arguments": arguments},
         _complete_mapping_result(result, section_names=list(result["sections"])),

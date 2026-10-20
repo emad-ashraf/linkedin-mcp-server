@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import contextlib
-from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import quote_plus
 
 import logging
 
-from patchright.async_api import Route
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from linkedin_mcp_server.core.exceptions import (
@@ -33,26 +30,19 @@ from linkedin_mcp_server.scraping.messaging_api import MessagingApiCapture
 from linkedin_mcp_server.scraping.messaging_payload import (
     build_conversation_references,
     build_message_references,
+    build_structured_conversation,
     conversation_matches_username,
     conversation_thread_path,
     find_conversation_by_thread_id,
     format_message_elements,
 )
+from linkedin_mcp_server.scraping.messaging_read_state import without_read_state_writes
 from linkedin_mcp_server.scraping.navigation import PageNavigator
 from linkedin_mcp_server.scraping.profile_page import ProfilePageReader
 from linkedin_mcp_server.scraping.session import ScrapingSession
 from linkedin_mcp_server.scraping.text import strip_linkedin_noise
 
 logger = logging.getLogger(__name__)
-
-# ponytail: LinkedIn's /messaging/ page redirects to the newest thread and
-# POSTs its read flag here (measured 2026-09-20, same call as the "Mark as
-# unread" menu); aborting the POST keeps the user's unread state, GETs still
-# flow so the passive capture works
-_READ_STATE_WRITE_ROUTES = (
-    "**/voyager/api/voyagerMessagingDashMessengerConversations*",
-    "**/voyager/api/voyagerMessagingDashMessagingBadge*",
-)
 
 
 class ConversationReader:
@@ -167,25 +157,8 @@ class ConversationReader:
         await capture.settle()
         return offset
 
-    @staticmethod
-    async def _abort_read_state_write(route: Route) -> None:
-        if route.request.method == "POST":
-            await route.abort()
-        else:
-            await route.continue_()
-
-    @contextlib.asynccontextmanager
-    async def _without_read_state_writes(self) -> AsyncIterator[None]:
-        """Run a messaging workflow with LinkedIn's read-flag POSTs aborted."""
-        page = self._session.page
-        handler = self._abort_read_state_write
-        for pattern in _READ_STATE_WRITE_ROUTES:
-            await page.route(pattern, handler)
-        try:
-            yield
-        finally:
-            for pattern in _READ_STATE_WRITE_ROUTES:
-                await page.unroute(pattern, handler)
+    def _without_read_state_writes(self):
+        return without_read_state_writes(self._session.page)
 
     @staticmethod
     def _unique_conversations(
@@ -359,12 +332,16 @@ class ConversationReader:
                 if cleaned
                 else []
             )
-            return self._single_section_result(
+            result = self._single_section_result(
                 messaging_thread_url(normalized_thread_id, "/"),
                 "conversation",
                 cleaned,
                 references=references,
             )
+            result["conversation"] = build_structured_conversation(
+                target, messages, history=capture.history
+            )
+            return result
 
     async def search_conversations(
         self, keywords: str, limit: int = 20

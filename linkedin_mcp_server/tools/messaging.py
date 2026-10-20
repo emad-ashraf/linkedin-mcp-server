@@ -123,7 +123,9 @@ def register_messaging_tools(
                 thread IDs first, call search_conversations.
 
         Returns:
-            Dict with url, sections (conversation -> raw text), and optional references.
+            Dict with url, sections (conversation -> raw text), optional references,
+            and an additive conversation object with provider message/participant
+            facts and bounded history metadata (exhaustion remains unknown).
         """
         if not linkedin_username and not thread_id:
             raise_tool_error(

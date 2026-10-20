@@ -108,6 +108,17 @@ class FakeCapture:
         self.payloads: list[dict[str, Any]] = []
         self._queued = list(payloads)
         self.messages = messages or _messages("Hello")
+        self.history = {
+            "scope": "bounded_thread",
+            "exhaustion": "unknown",
+            "stopReason": "short_batch",
+            "pagesFetched": 1,
+            "messageCount": len(
+                self.messages["data"]["messengerMessagesBySyncToken"]["elements"]
+            ),
+            "pageSize": 20,
+            "maxOlderPages": 3,
+        }
         self.has_message_template = has_message_template
         self.fetch_calls: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
 
@@ -266,33 +277,33 @@ class TestReadStateWrites:
             else:
                 await reader.get_inbox(limit=5)
 
-        handler = ConversationReader._abort_read_state_write
+        handler = calls[0][2]
         conversations = "**/voyager/api/voyagerMessagingDashMessengerConversations*"
         badge = "**/voyager/api/voyagerMessagingDashMessagingBadge*"
         assert calls == [
             ("route", conversations, handler),
             ("route", badge, handler),
             ("navigate", "https://www.linkedin.com/messaging/"),
-            ("unroute", conversations, handler),
-            ("unroute", badge, handler),
-        ], "both read-flag routes are aborted around the navigation and removed after"
+        ], "read-flag routes remain page-scoped after navigation"
 
     @pytest.mark.parametrize(
         ("method", "aborted"), [("POST", True), ("GET", False), ("OPTIONS", False)]
     )
-    async def test_handler_aborts_only_post(self, method, aborted):
+    async def test_handler_aborts_only_post(self, mock_page, method, aborted):
         route = SimpleNamespace(
             request=SimpleNamespace(method=method),
             abort=AsyncMock(),
-            continue_=AsyncMock(),
+            fallback=AsyncMock(),
         )
 
-        await ConversationReader._abort_read_state_write(cast(Route, route))
+        async with _reader(mock_page)._without_read_state_writes():
+            handler = mock_page.route.await_args_list[0].args[1]
+            await handler(cast(Route, route))
 
         assert route.abort.await_count == (1 if aborted else 0), (
             f"{method} read-flag request abort count"
         )
-        assert route.continue_.await_count == (0 if aborted else 1), (
+        assert route.fallback.await_count == (0 if aborted else 1), (
             f"{method} read-flag request continue count"
         )
 

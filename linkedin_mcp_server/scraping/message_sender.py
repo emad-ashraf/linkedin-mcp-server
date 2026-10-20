@@ -21,6 +21,9 @@ from linkedin_mcp_server.scraping.identifiers import (
     normalize_profile_urn,
     person_profile_url,
 )
+from linkedin_mcp_server.scraping.messaging_read_state import (
+    allow_explicit_message_write,
+)
 from linkedin_mcp_server.scraping.navigation import PageNavigator
 from linkedin_mcp_server.scraping.session import ScrapingSession
 
@@ -1597,6 +1600,7 @@ class MessageSender:
         # recipient boundary. LinkedIn may strip the query and expose no local
         # identity, so capture the final route now and fail on any later change or
         # visible contradiction. Do not replace this with a Voyager/private API.
+        allow_explicit_message_write(self._page)
         await self._navigator._navigate_to_page(target.compose_url)
         expected_route = self._page.url
         if not _message_page_url_is_safe(expected_route, target.profile_urn):

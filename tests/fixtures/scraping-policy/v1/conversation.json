@@ -9,34 +9,41 @@
     {
       "call": "get_conversation",
       "callback_id": "callback-1",
-      "kind": "route.add",
-      "pattern": "**/voyager/api/voyagerMessagingDashMessengerConversations*",
-      "section": "conversation"
-    },
-    {
-      "call": "get_conversation",
-      "callback_id": "callback-1",
-      "kind": "route.add",
-      "pattern": "**/voyager/api/voyagerMessagingDashMessagingBadge*",
-      "section": "conversation"
-    },
-    {
-      "call": "get_conversation",
-      "callback_id": "callback-2",
-      "event": "response",
-      "kind": "listener.add",
-      "section": "conversation"
-    },
-    {
-      "call": "get_conversation",
-      "callback_id": "callback-3",
       "event": "request",
       "kind": "listener.add",
       "section": "conversation"
     },
     {
       "call": "get_conversation",
+      "callback_id": "callback-2",
+      "kind": "route.add",
+      "pattern": "**/voyager/api/voyagerMessagingDashMessengerConversations*",
+      "section": "conversation"
+    },
+    {
+      "call": "get_conversation",
+      "callback_id": "callback-2",
+      "kind": "route.add",
+      "pattern": "**/voyager/api/voyagerMessagingDashMessagingBadge*",
+      "section": "conversation"
+    },
+    {
+      "call": "get_conversation",
+      "callback_id": "callback-3",
+      "event": "response",
+      "kind": "listener.add",
+      "section": "conversation"
+    },
+    {
+      "call": "get_conversation",
       "callback_id": "callback-4",
+      "event": "request",
+      "kind": "listener.add",
+      "section": "conversation"
+    },
+    {
+      "call": "get_conversation",
+      "callback_id": "callback-5",
       "event": "framenavigated",
       "kind": "listener.add",
       "section": "conversation"
@@ -69,7 +76,7 @@
     },
     {
       "call": "get_conversation",
-      "count": 1,
+      "count": 2,
       "event": "request",
       "kind": "listener.emit",
       "section": "conversation"
@@ -107,7 +114,7 @@
     },
     {
       "call": "get_conversation",
-      "callback_id": "callback-4",
+      "callback_id": "callback-5",
       "event": "framenavigated",
       "kind": "listener.remove",
       "section": "conversation"
@@ -167,34 +174,45 @@
     },
     {
       "call": "get_conversation",
-      "callback_id": "callback-2",
+      "callback_id": "callback-3",
       "event": "response",
       "kind": "listener.remove",
       "section": "conversation"
     },
     {
       "call": "get_conversation",
-      "callback_id": "callback-3",
+      "callback_id": "callback-4",
       "event": "request",
       "kind": "listener.remove",
-      "section": "conversation"
-    },
-    {
-      "call": "get_conversation",
-      "callback_id": "callback-1",
-      "kind": "route.remove",
-      "pattern": "**/voyager/api/voyagerMessagingDashMessengerConversations*",
-      "section": "conversation"
-    },
-    {
-      "call": "get_conversation",
-      "callback_id": "callback-1",
-      "kind": "route.remove",
-      "pattern": "**/voyager/api/voyagerMessagingDashMessagingBadge*",
       "section": "conversation"
     }
   ],
   "result": {
+    "conversation": {
+      "history": {
+        "exhaustion": "unknown",
+        "maxOlderPages": 3,
+        "messageCount": 1,
+        "pageSize": 20,
+        "pagesFetched": 1,
+        "scope": "bounded_thread",
+        "stopReason": "short_batch"
+      },
+      "id": "2-abc",
+      "messages": [
+        {
+          "body": "Policy message",
+          "sentAt": "1970-01-01T00:00:00.001+00:00"
+        }
+      ],
+      "participantCoverage": {
+        "sourceCount": 0,
+        "status": "resolved",
+        "unresolvedCount": 0
+      },
+      "participants": [],
+      "timestampSource": "deliveredAt_unix_ms"
+    },
     "section_names": [
       "conversation"
     ],

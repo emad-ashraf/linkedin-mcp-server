@@ -28,6 +28,7 @@ class Reference(TypedDict):
     text: NotRequired[str]
     context: NotRequired[str]
     value: NotRequired[str]
+    last_activity_at: NotRequired[str]
 
 
 class RawReference(TypedDict, total=False):
@@ -466,7 +467,11 @@ def _choose_better_reference(existing: Reference, new: Reference) -> Reference:
     """Keep the cleaner, richer of two duplicate-url references."""
     existing_score = _reference_score(existing)
     new_score = _reference_score(new)
-    return new if new_score > existing_score else existing
+    chosen = new if new_score > existing_score else existing
+    activity = existing.get("last_activity_at") or new.get("last_activity_at")
+    if chosen["kind"] == "conversation" and activity is not None:
+        return {**chosen, "last_activity_at": activity}
+    return chosen
 
 
 def dedupe_references(
