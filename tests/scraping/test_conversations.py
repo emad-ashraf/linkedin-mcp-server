@@ -107,6 +107,17 @@ class FakeCapture:
         self.payloads: list[dict[str, Any]] = []
         self._queued = list(payloads)
         self.messages = messages or _messages("Hello")
+        self.history = {
+            "scope": "bounded_thread",
+            "exhaustion": "unknown",
+            "stopReason": "short_batch",
+            "pagesFetched": 1,
+            "messageCount": len(
+                self.messages["data"]["messengerMessagesBySyncToken"]["elements"]
+            ),
+            "pageSize": 20,
+            "maxOlderPages": 3,
+        }
         self.has_message_template = has_message_template
         self.fetch_calls: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
 

@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime, tzinfo
-from typing import Any
+from datetime import UTC, datetime, timedelta, tzinfo
+from typing import Any, Literal, NotRequired, TypedDict
 from urllib.parse import quote, urlparse
 
 import re
@@ -122,6 +122,9 @@ def build_conversation_references(
                 "url": path,
                 "context": context,
             }
+            last_activity = provider_timestamp(item.get("lastActivityAt"))
+            if last_activity is not None:
+                reference["last_activity_at"] = last_activity
             title = _conversation_title(item)
             if title:
                 reference["text"] = title
@@ -210,17 +213,12 @@ def build_message_page_url(
     )
 
 
-def _message_identity(item: dict[str, Any]) -> tuple[Any, ...]:
+def _message_identity(item: dict[str, Any]) -> tuple[Any, ...] | None:
     for key in ("entityUrn", "backendUrn", "messageUrn"):
         value = item.get(key)
         if isinstance(value, str) and value:
             return (key, value)
-    return (
-        "content",
-        item.get("deliveredAt"),
-        _participant_name(item.get("sender")),
-        _rich_text(item.get("body")),
-    )
+    return None
 
 
 def merge_message_elements(
@@ -230,7 +228,11 @@ def merge_message_elements(
     unique: dict[tuple[Any, ...], dict[str, Any]] = {}
     for page in pages:
         for item in page:
-            unique.setdefault(_message_identity(item), item)
+            identity = _message_identity(item)
+            # Equal text and delivery time do not prove equal message identity.
+            unique.setdefault(
+                identity if identity is not None else ("unknown", len(unique)), item
+            )
     return sorted(
         unique.values(),
         key=lambda item: (
@@ -392,3 +394,156 @@ def format_message_elements(
         )
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
+
+
+class MessagingParticipant(TypedDict, total=False):
+    """Facts from a conversation participant or message sender, never links in bodies."""
+
+    name: str
+    profileUrl: str
+    providerIdentity: str
+
+
+class StructuredMessage(TypedDict, total=False):
+    """Provider message facts; missing facts remain absent."""
+
+    id: str
+    sentAt: str
+    body: str
+    sender: MessagingParticipant
+
+
+HistoryStopReason = Literal[
+    "short_batch",
+    "empty_batch",
+    "history_template_unavailable",
+    "no_timestamp",
+    "no_progress",
+    "page_limit",
+]
+
+
+class MessageHistory(TypedDict):
+    """Observed acquisition bounds, without a provider completeness claim."""
+
+    scope: Literal["bounded_thread"]
+    exhaustion: Literal["unknown"]
+    stopReason: HistoryStopReason
+    pagesFetched: int
+    messageCount: int
+    pageSize: int
+    maxOlderPages: int
+
+
+class ParticipantCoverage(TypedDict):
+    """Resolution of captured participant records, not inbox population coverage."""
+
+    status: Literal["resolved", "partial", "unavailable"]
+    sourceCount: NotRequired[int]
+    unresolvedCount: NotRequired[int]
+
+
+class StructuredConversation(TypedDict):
+    """Additive machine-readable supplement to the rendered conversation section."""
+
+    id: NotRequired[str]
+    participants: list[MessagingParticipant]
+    participantCoverage: ParticipantCoverage
+    messages: list[StructuredMessage]
+    timestampSource: Literal["deliveredAt_unix_ms"]
+    history: MessageHistory
+
+
+def provider_timestamp(value: Any) -> str | None:
+    """Convert a provider Unix-millisecond instant without local timezone inference."""
+    if type(value) is not int or value < 0:
+        return None
+    try:
+        instant = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=value)
+    except (OverflowError, ValueError):
+        return None
+    return instant.isoformat(timespec="milliseconds")
+
+
+def _provider_identity(item: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    return next(
+        (
+            value
+            for key in keys
+            if isinstance(value := item.get(key), str) and value.strip()
+        ),
+        None,
+    )
+
+
+def _structured_participant(value: Any) -> MessagingParticipant:
+    participant = _mapping(value)
+    if participant is None:
+        return {}
+    member = _nested_mapping(participant, "participantType", "member")
+    if member is None:
+        return {}
+    result: MessagingParticipant = {}
+    name = _participant_name(participant)
+    if name:
+        result["name"] = name
+    profile_url = member.get("profileUrl")
+    if isinstance(profile_url, str):
+        classified = classify_link(profile_url)
+        if classified is not None and classified[0] == "person":
+            result["profileUrl"] = classified[1]
+    identity = _provider_identity(participant, ("entityUrn", "backendUrn"))
+    if identity is not None:
+        result["providerIdentity"] = identity
+    return result
+
+
+def build_structured_conversation(
+    conversation: dict[str, Any],
+    elements: Iterable[dict[str, Any]],
+    *,
+    history: MessageHistory,
+) -> StructuredConversation:
+    """Retain verified provider fields discarded by the legacy text renderer."""
+    participants = conversation.get("conversationParticipants")
+    result: StructuredConversation = {
+        "participants": [_structured_participant(item) for item in participants]
+        if isinstance(participants, list)
+        else [],
+        "participantCoverage": {"status": "unavailable"},
+        "messages": [],
+        "timestampSource": "deliveredAt_unix_ms",
+        "history": history.copy(),
+    }
+    if isinstance(participants, list):
+        unresolved = sum(
+            not (parsed.get("profileUrl") or parsed.get("providerIdentity"))
+            for item in participants
+            for parsed in [_structured_participant(item)]
+        )
+        result["participantCoverage"] = {
+            "status": "partial" if unresolved else "resolved",
+            "sourceCount": len(participants),
+            "unresolvedCount": unresolved,
+        }
+    path = conversation_thread_path(conversation)
+    if path is not None:
+        result["id"] = path.removeprefix("/messaging/thread/").removesuffix("/")
+    for item in elements:
+        message: StructuredMessage = {}
+        identity = _provider_identity(item, ("entityUrn", "backendUrn", "messageUrn"))
+        if identity is not None:
+            message["id"] = identity
+        timestamp = provider_timestamp(item.get("deliveredAt"))
+        if timestamp is not None:
+            message["sentAt"] = timestamp
+        body = item.get("body")
+        if isinstance(body, dict):
+            body = body.get("text")
+        if isinstance(body, str) and body.strip():
+            message["body"] = body
+        sender = _structured_participant(item.get("sender"))
+        if sender:
+            message["sender"] = sender
+        result["messages"].append(message)
+    return result
