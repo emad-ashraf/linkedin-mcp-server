@@ -349,7 +349,9 @@ class PersonScraper:
                                 )
                             )
                         else:
-                            profile_urn = await self._profile_page._extract_profile_urn()
+                            profile_urn = (
+                                await self._profile_page._extract_profile_urn()
+                            )
                 except LinkedInScraperException:
                     raise
                 except TargetClosedError:

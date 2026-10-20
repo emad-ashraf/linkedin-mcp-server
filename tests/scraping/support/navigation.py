@@ -32,6 +32,8 @@ def mock_page():
     # recording looking correct here however broken it was.
     page.main_frame = SimpleNamespace(url=page.url)
     page.wait_for_load_state = AsyncMock()
+    page.route = AsyncMock()
+    page.unroute = AsyncMock()
     # Real listeners, so that a double can navigate the way the browser does.
     # A reload leaves `page.url` untouched, so the event is the only thing that
     # says the document was replaced, and a double that only assigns the URL

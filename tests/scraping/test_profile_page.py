@@ -30,9 +30,12 @@ class TestExtractProfileUrn:
             }
         )
 
-        assert await _reader(mock_page)._extract_profile_urn(
-            expected_loaded_url="https://www.linkedin.com/in/ada-buyer/"
-        ) == member_id
+        assert (
+            await _reader(mock_page)._extract_profile_urn(
+                expected_loaded_url="https://www.linkedin.com/in/ada-buyer/"
+            )
+            == member_id
+        )
 
     async def test_rejects_conflicting_profile_topcards(self, mock_page):
         first = "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo"
@@ -47,9 +50,12 @@ class TestExtractProfileUrn:
             }
         )
 
-        assert await _reader(mock_page)._extract_profile_urn(
-            expected_loaded_url="https://www.linkedin.com/in/ada-buyer/"
-        ) is None
+        assert (
+            await _reader(mock_page)._extract_profile_urn(
+                expected_loaded_url="https://www.linkedin.com/in/ada-buyer/"
+            )
+            is None
+        )
 
     async def test_rejects_topcard_after_page_url_changes(self, mock_page):
         member_id = "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo"
@@ -60,9 +66,12 @@ class TestExtractProfileUrn:
             }
         )
 
-        assert await _reader(mock_page)._extract_profile_urn(
-            expected_loaded_url="https://www.linkedin.com/in/ada-buyer/"
-        ) is None
+        assert (
+            await _reader(mock_page)._extract_profile_urn(
+                expected_loaded_url="https://www.linkedin.com/in/ada-buyer/"
+            )
+            is None
+        )
 
     async def test_returns_urn_from_atomic_top_card_snapshot(self, mock_page):
         mock_page.evaluate = AsyncMock(
