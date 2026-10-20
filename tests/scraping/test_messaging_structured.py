@@ -546,7 +546,6 @@ async def test_cancelled_registration_is_reused_without_duplicate_handlers(mock_
 async def test_guard_exits_with_busy_iframe_and_context_routes_without_accumulation():
     import asyncio
     from patchright.async_api import async_playwright
-    from linkedin_mcp_server.scraping.extractor import LinkedInExtractor
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(channel="chromium", headless=True)
@@ -575,7 +574,7 @@ async def test_guard_exits_with_busy_iframe_and_context_routes_without_accumulat
                 return await original(pattern, handler)
 
             page.route = register
-            reader = LinkedInExtractor(page)._conversations
+            reader = _reader(page)
             for _ in range(3):
                 async with reader._without_read_state_writes():
                     for endpoint in (
@@ -619,9 +618,7 @@ async def test_guard_exits_with_busy_iframe_and_context_routes_without_accumulat
             await other_context.route("**/*", serve)
             other_page = await other_context.new_page()
             await other_page.goto("https://www.linkedin.com/messaging/")
-            async with LinkedInExtractor(
-                other_page
-            )._conversations._without_read_state_writes():
+            async with _reader(other_page)._without_read_state_writes():
                 assert await other_page.evaluate(
                     "async()=>{try{await fetch('/voyager/api/voyagerMessagingDashMessagingBadge',{method:'POST'});return false;}catch(_){return true;}}"
                 )
@@ -686,7 +683,6 @@ async def test_only_verified_compose_navigation_releases_read_latch(
     mock_page, verified
 ):
     from types import SimpleNamespace
-    from linkedin_mcp_server.scraping.extractor import LinkedInExtractor
     from linkedin_mcp_server.scraping.session import ScrapingSession
 
     class Request:
@@ -696,7 +692,11 @@ async def test_only_verified_compose_navigation_releases_read_latch(
     async with _reader(mock_page)._without_read_state_writes():
         pass
     handler = mock_page.route.await_args_list[0].args[1]
-    sender = LinkedInExtractor(mock_page)._message_sender
+    from linkedin_mcp_server.scraping.message_sender import MessageSender
+    from linkedin_mcp_server.scraping.navigation import PageNavigator
+
+    session = ScrapingSession(mock_page)
+    sender = MessageSender(session, PageNavigator(session))
     compose = "https://www.linkedin.com/messaging/compose/?profileUrn=ACo" + "A" * 24
     target = SimpleNamespace(profile_urn="ACo" + "A" * 24, compose_url=compose)
 
