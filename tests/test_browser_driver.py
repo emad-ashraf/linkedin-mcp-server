@@ -81,10 +81,11 @@ def _make_mock_browser() -> MagicMock:
     browser.page.locator = MagicMock(return_value=locator)
     browser.page.context.cookies = AsyncMock(
         return_value=[
-            {"name": "li_at", "value": "li-at-value"},
+            {"name": "li_at", "value": "li-at-value", "domain": ".linkedin.com"},
             {"name": "JSESSIONID", "value": "ajax:1"},
         ]
     )
+    browser.context = browser.page.context
     browser.import_cookies = AsyncMock(return_value=False)
     browser.export_cookies = AsyncMock(return_value=False)
     browser.export_storage_state = AsyncMock(return_value=True)

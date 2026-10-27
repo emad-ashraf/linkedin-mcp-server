@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import asyncio
 import logging
 import time
 
@@ -239,9 +240,8 @@ class JobScraper:
             # per-page cap is twelve seconds and the whole search gets
             # `tool_timeout` times the fraction above, so a caller passing ten
             # seconds had the first scroll alone allowed to outlast the call
-            # and take every page gathered with it. Scrolling is the one part
-            # already told how long it may run, so it is the one part this can
-            # bound without handing the budget down into navigation.
+            # and take every page gathered with it. The whole page below also
+            # answers to the remaining search budget.
             scroll_deadline = min(
                 SCROLL_DEADLINE_MAX,
                 scroll_budget_left,
@@ -249,11 +249,15 @@ class JobScraper:
             )
 
             try:
-                capture = await self._pages._extract_search_page(
-                    url,
-                    section_name="search_results",
-                    scroll_deadline=scroll_deadline,
-                )
+                # Bound the whole page, including navigation and shared retry backoff.
+                page_timeout = max(0.0, budget - (time.monotonic() - started))
+                async with asyncio.timeout(page_timeout):
+                    capture = await self._pages._extract_search_page(
+                        url,
+                        section_name="search_results",
+                        scroll_deadline=scroll_deadline,
+                        page_deadline=started + budget,
+                    )
                 extracted = capture.section
                 slowest_page = max(slowest_page, time.monotonic() - page_started)
                 scroll_budget_left = max(

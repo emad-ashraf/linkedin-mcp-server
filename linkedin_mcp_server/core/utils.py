@@ -6,7 +6,8 @@ import time
 
 from patchright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
-from .exceptions import RateLimitError
+from .auth import barrier_confirmed, raise_if_auth_route
+from .exceptions import AuthenticationError, RateLimitError, TransientBarrierError
 from .humanize import jitter
 
 logger = logging.getLogger(__name__)
@@ -113,7 +114,7 @@ async def detect_rate_limit(page: Page) -> None:
     """Detect if LinkedIn has rate-limited or security-challenged the session.
 
     Checks (in order):
-    1. URL contains /checkpoint or /authwall (security challenge)
+    1. URL is a login, authwall or checkpoint route (security challenge)
     2. Body text contains rate-limit phrases on error-shaped pages (throttling)
 
     The body-text heuristic only runs on pages without a ``<main>`` element
@@ -122,26 +123,23 @@ async def detect_rate_limit(page: Page) -> None:
     that happens to contain phrases like "slow down" or "try again later".
 
     Raises:
-        RateLimitError: If any rate-limiting or security challenge is detected
+        AuthenticationError: If interactive authentication is required
+        AccountRestrictedError: If the account is restricted
+        RateLimitError: If a throttling page is detected
     """
     # Imported here: ``pacing`` imports the top-level ``exceptions`` module,
     # which imports this package, so a module-level import would be a cycle.
     from linkedin_mcp_server.pacing import note_throttle_signal
 
-    # Check URL for security challenges
-    current_url = page.url
-    if "linkedin.com/checkpoint" in current_url:
-        # Recorded before raising, so every other session sees the pause
-        # while this one's error is still on its way to the client.
-        note_throttle_signal("checkpoint")
-    if "linkedin.com/checkpoint" in current_url or "authwall" in current_url:
-        # An authwall is not recorded: it is the session having ended, not
-        # LinkedIn throttling it, and a pause would only delay the re-login.
-        raise RateLimitError(
-            "LinkedIn security checkpoint detected. "
-            "You may need to verify your identity or wait before continuing.",
-            suggested_wait_time=30,
-        )
+    try:
+        raise_if_auth_route(page.url)
+    except AuthenticationError:
+        if await barrier_confirmed(page, "authentication route"):
+            raise
+        raise TransientBarrierError(
+            "A LinkedIn authentication interstitial cleared on the next load. "
+            "Retry the call; the saved LinkedIn session was not changed."
+        ) from None
 
     # Check for rate limit messages — only on error-shaped pages.
     # Real rate-limit pages have no <main> element and short body text.

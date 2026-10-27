@@ -806,7 +806,7 @@ when the oldest action ages out. A cap below what one call costs (a profile
 with extra sections, a deep company fetch with jobs) is answered as
 `hourly_cap_below_cost`, naming the variable, since no wait would fix it.
 
-When LinkedIn pushes back — an HTTP 429, a `/checkpoint` redirect, a
+When LinkedIn pushes back — an HTTP 429, a
 rate-limit page, an About or search page that comes back as an empty shell,
 two consecutive empty profiles in a bunch — the account is paused for every
 session: 30 minutes for the first signal, then 2, 4 and 8 hours for each

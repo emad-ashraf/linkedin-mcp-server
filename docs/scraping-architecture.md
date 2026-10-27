@@ -65,7 +65,7 @@ a page-owning collaborator.
 - `feed_payload` -> `link_metadata`
 - `fields` -> `capture`
 - `identifiers` -> _(none)_
-- `job_pages` -> `content`, `contracts`, `job_policy`, `link_metadata`, `navigation`, `session`, `text`
+- `job_pages` -> `content`, `contracts`, `job_policy`, `link_metadata`, `navigation`, `rate_limit`, `session`, `text`
 - `job_policy` -> `link_metadata`
 - `jobs` -> `capture`, `contracts`, `identifiers`, `job_pages`, `job_policy`, `link_metadata`, `navigation`, `search_urls`, `session`, `text`
 - `link_metadata` -> _(none)_

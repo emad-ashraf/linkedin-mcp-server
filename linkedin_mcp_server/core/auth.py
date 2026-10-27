@@ -338,6 +338,19 @@ def _raise_if_account_restricted(url: str) -> None:
         raise AccountRestrictedError()
 
 
+def raise_if_auth_route(url: str) -> None:
+    """Classify LinkedIn authentication routes without recording a throttle."""
+    host = (urlparse(url).hostname or "").lower()
+    if host != "linkedin.com" and not host.endswith(".linkedin.com"):
+        return
+    _raise_if_account_restricted(url)
+    if _is_auth_blocker_url(url):
+        raise AuthenticationError(
+            "LinkedIn requires interactive re-authentication. "
+            "Run with --login and complete the account selection/sign-in flow."
+        )
+
+
 def _is_auth_blocker_url(url: str) -> bool:
     """Return True only for real auth routes, not arbitrary slug substrings."""
     path = urlparse(url).path or "/"

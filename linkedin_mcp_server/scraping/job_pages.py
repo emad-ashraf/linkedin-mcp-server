@@ -39,6 +39,7 @@ from linkedin_mcp_server.scraping.job_policy import (
 from linkedin_mcp_server.scraping.link_metadata import build_references
 from linkedin_mcp_server.scraping.navigation import PageNavigator
 from linkedin_mcp_server.scraping.session import ScrapingSession
+from linkedin_mcp_server.scraping.rate_limit import rate_limit_retry_delay
 from linkedin_mcp_server.scraping.text import (
     filter_linkedin_noise_lines,
     truncate_linkedin_noise,
@@ -250,6 +251,7 @@ class JobPageReader:
         url: str,
         section_name: str,
         scroll_deadline: float = SCROLL_DEADLINE_MAX,
+        page_deadline: float | None = None,
     ) -> JobPageCapture:
         """Extract innerText from a job search page with soft rate-limit retry.
 
@@ -273,6 +275,14 @@ class JobPageReader:
             if result.text != RATE_LIMITED_SECTION_TEXT:
                 return self._captured(result, charge.seconds)
 
+            if page_deadline is not None:
+                retry_delay = (
+                    rate_limit_retry_delay()
+                    * 2**self._session.rate_limit.soft_retries_used
+                )
+                # Upstream's measured page allowance; the caller also bounds jitter and I/O.
+                if page_deadline - time.monotonic() < retry_delay + 6.5:
+                    return self._captured(result, charge.seconds)
             if not await self._session.claim_soft_retry(url):
                 return self._captured(result, charge.seconds)
             result = await self._extract_search_page_once(

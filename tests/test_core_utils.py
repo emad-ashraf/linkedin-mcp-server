@@ -1,10 +1,10 @@
 """Tests for core utility functions (rate-limit detection, scrolling, modals)."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from linkedin_mcp_server.core.exceptions import RateLimitError
+from linkedin_mcp_server.core.exceptions import AuthenticationError, RateLimitError
 from linkedin_mcp_server.core.utils import detect_rate_limit, scroll_job_sidebar
 from linkedin_mcp_server.pacing import JobStore, read_account_cooldown
 
@@ -31,15 +31,22 @@ def mock_page():
 class TestDetectRateLimit:
     async def test_checkpoint_url_raises(self, mock_page, tmp_path):
         mock_page.url = "https://www.linkedin.com/checkpoint/challenge/123"
-        with pytest.raises(RateLimitError, match="security checkpoint"):
-            await detect_rate_limit(mock_page)
-        # And pauses the account, so no session retries into the challenge.
-        assert _last_signal(tmp_path) == "checkpoint"
+        with patch(
+            "linkedin_mcp_server.core.utils.barrier_confirmed",
+            AsyncMock(return_value=True),
+        ):
+            with pytest.raises(AuthenticationError, match="re-authentication"):
+                await detect_rate_limit(mock_page)
+        assert _last_signal(tmp_path) is None
 
     async def test_authwall_url_raises(self, mock_page, tmp_path):
         mock_page.url = "https://www.linkedin.com/authwall?trk=login"
-        with pytest.raises(RateLimitError, match="security checkpoint"):
-            await detect_rate_limit(mock_page)
+        with patch(
+            "linkedin_mcp_server.core.utils.barrier_confirmed",
+            AsyncMock(return_value=True),
+        ):
+            with pytest.raises(AuthenticationError, match="re-authentication"):
+                await detect_rate_limit(mock_page)
         # But records nothing: an authwall is the session having ended, not
         # LinkedIn throttling it, and a pause would only delay the re-login.
         assert _last_signal(tmp_path) is None

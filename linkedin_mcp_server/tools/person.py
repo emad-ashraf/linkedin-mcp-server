@@ -322,10 +322,6 @@ def register_person_tools(
 
             return result
 
-        except ToolError:
-            # Already a properly formatted client-facing error; do not
-            # log it as "Unexpected error" via raise_tool_error.
-            raise
         except AuthenticationError as e:
             try:
                 await handle_auth_error(e, ctx)
