@@ -112,6 +112,8 @@ def register_person_tools(
             is found, the section is omitted and section_errors explains the failure;
             underlying profile text and links are never substituted. Existing suspected
             rate-limit retry and stop behavior is retained.
+            Includes public_profile_url when the loaded page resolves to a public profile;
+            opaque member IDs require a matching top-card member identity first.
             Includes unknown_sections when unrecognised names are passed.
             The LLM should parse the raw text in each section.
         """

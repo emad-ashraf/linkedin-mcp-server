@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import urlparse
 
 import logging
 import re
@@ -11,7 +11,10 @@ import re
 from patchright._impl._errors import TargetClosedError
 from patchright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from linkedin_mcp_server.core.exceptions import LinkedInScraperException
+from linkedin_mcp_server.core.exceptions import (
+    InvalidReferenceError,
+    LinkedInScraperException,
+)
 from linkedin_mcp_server.exceptions import ActionLimitError
 from linkedin_mcp_server.error_diagnostics import build_issue_diagnostics
 from linkedin_mcp_server.scraping.capture import CaptureMode, SectionCapture
@@ -55,22 +58,16 @@ _OPAQUE_MEMBER_PATH_RE = re.compile(r"^ACo[A-Za-z0-9_-]{20,}$")
 def _public_profile_url(loaded_url: str) -> str | None:
     """Return a public person URL only from the loaded profile's actual URL."""
     parsed = urlparse(loaded_url)
-    host = (parsed.hostname or "").casefold().removeprefix("www.")
     parts = [part for part in parsed.path.split("/") if part]
-    slug = unquote(parts[1]) if len(parts) == 2 else ""
-    if (
-        parsed.scheme != "https"
-        or host != "linkedin.com"
-        or len(parts) != 2
-        or parts[0].casefold() != "in"
-        or not slug
-        or len(slug) > 100
-        or not slug[0].isalnum()
-        or any(not (character.isalnum() or character in "-_") for character in slug)
-        or _OPAQUE_MEMBER_PATH_RE.fullmatch(slug)
-    ):
+    if parsed.scheme != "https" or len(parts) != 2 or parts[0].lower() != "in":
         return None
-    return f"https://www.linkedin.com/in/{quote(slug, safe='-_')}/"
+    try:
+        slug = normalize_person_identifier(loaded_url)
+    except InvalidReferenceError:
+        return None
+    if _OPAQUE_MEMBER_PATH_RE.fullmatch(slug):
+        return None
+    return person_profile_url(slug, "/")
 
 
 def _js_literal(value: str, quote: str) -> str:
@@ -400,10 +397,8 @@ class PersonScraper:
         }
         if profile_urn:
             result["profile_urn"] = profile_urn
-        if (
-            public_profile_url
-            and _OPAQUE_MEMBER_PATH_RE.fullmatch(username)
-            and profile_urn == username
+        if public_profile_url and (
+            not _OPAQUE_MEMBER_PATH_RE.fullmatch(username) or profile_urn == username
         ):
             result["public_profile_url"] = public_profile_url
         if references:

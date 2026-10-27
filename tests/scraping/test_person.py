@@ -1359,6 +1359,46 @@ class TestScrapePersonProfileUrn:
                 None,
             ),
             ("https://www.linkedin.com/in/ada-buyer/", None, None),
+            (
+                "https://evil.example/in/ada-buyer/",
+                "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo",
+                None,
+            ),
+            (
+                "https://www.linkedin.com:444/in/ada-buyer/",
+                "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo",
+                None,
+            ),
+            (
+                "http://www.linkedin.com/in/ada-buyer/",
+                "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo",
+                None,
+            ),
+            (
+                "https://www.linkedin.com/in/ada-buyer/details/experience/",
+                "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo",
+                None,
+            ),
+            (
+                "https://www.linkedin.com/in/%6de/",
+                "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo",
+                None,
+            ),
+            (
+                "https://www.linkedin.com/in/ada%ZZ/",
+                "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo",
+                None,
+            ),
+            (
+                "https://www.linkedin.com/in/me/",
+                "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo",
+                None,
+            ),
+            (
+                "https://de.linkedin.com/in/ada-buyer/",
+                "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo",
+                "https://www.linkedin.com/in/ada-buyer/",
+            ),
         ],
     )
     async def test_public_profile_url_uses_loaded_redirect(
@@ -1386,6 +1426,24 @@ class TestScrapePersonProfileUrn:
 
         assert result.get("public_profile_url") == expected
         extract_urn.assert_awaited_once_with(expected_loaded_url=loaded_url)
+
+    async def test_public_profile_url_is_returned_for_vanity_input(self, mock_page):
+        mock_page.url = "https://www.linkedin.com/in/ada-buyer/"
+        scraper = _scraper(mock_page)
+        with (
+            patch.object(
+                scraper._capture,
+                "capture",
+                AsyncMock(return_value=extracted("profile text")),
+            ),
+            patch.object(
+                scraper._profile_page,
+                "_extract_profile_urn",
+                AsyncMock(return_value=None),
+            ),
+        ):
+            result = await scraper.scrape_person("ada-buyer", {"main_profile"})
+        assert result["public_profile_url"] == "https://www.linkedin.com/in/ada-buyer/"
 
     async def test_includes_profile_urn_in_result_when_found(self, mock_page):
         """scrape_person includes profile_urn in result when _extract_profile_urn returns a value."""

@@ -21,6 +21,7 @@ from linkedin_mcp_server.scraping.message_sender import (
     _ProfileMessageTarget,
 )
 from linkedin_mcp_server.scraping.navigation import PageNavigator
+from linkedin_mcp_server.scraping.profile_page import ProfilePageReader
 from linkedin_mcp_server.scraping.session import ScrapingSession
 
 
@@ -1171,3 +1172,36 @@ class TestMessageComposerDom:
             is None
         )
         assert await dom_page.evaluate("document.body.dataset.foreignKey") is None
+
+
+@pytest.mark.parametrize(
+    "topcards,expected",
+    [(1, "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo"), (0, None), (2, None)],
+)
+async def test_public_profile_identity_reads_actual_topcard_dom(
+    dom_page, topcards, expected
+):
+    await dom_page.route("**/*", lambda route: route.abort())
+    member_id = "ACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLo"
+    card = f'<div id="com.linkedin.sdui.profile.card.ref{member_id}Topcard">Ada</div>'
+    await dom_page.set_content(f"<main>{card * topcards}</main>{card}")
+    read_message_target = AsyncMock()
+    reader = ProfilePageReader(ScrapingSession(dom_page), read_message_target)
+    assert (
+        await reader._extract_profile_urn(expected_loaded_url=dom_page.url) == expected
+    )
+    read_message_target.assert_not_awaited()
+
+
+async def test_public_profile_identity_refuses_a_changed_document(dom_page):
+    await dom_page.route("**/*", lambda route: route.abort())
+    await dom_page.set_content(
+        '<main><div id="com.linkedin.sdui.profile.card.refACoAAB91xT4BTcf4q-0oE-hYgThlfqU_4DAFGLoTopcard">Ada</div></main>'
+    )
+    reader = ProfilePageReader(ScrapingSession(dom_page), AsyncMock())
+    assert (
+        await reader._extract_profile_urn(
+            expected_loaded_url="https://www.linkedin.com/in/another-person/"
+        )
+        is None
+    )
