@@ -28,6 +28,7 @@ class _PageGuard:
         self.registered: set[str] = set()
         self.listening = False
         self.registration: asyncio.Task[None] | None = None
+        self.registration_failed = False
         self.protected: WeakSet[Any] = WeakSet()
         # Store stable callback identities; readers are recreated for each tool.
         self.request_listener = self.observe
@@ -53,14 +54,20 @@ class _PageGuard:
             await route.fallback()
 
     async def install(self, page: Any) -> None:
+        if self.registration_failed:
+            raise LinkedInScraperException("Read-state protection registration failed.")
         if self.registration is None:
             self.registration = asyncio.create_task(self._install(page))
-            self.registration.add_done_callback(
-                lambda task: task.exception() if not task.cancelled() else None
-            )
+            self.registration.add_done_callback(self._registration_finished)
         # A cancelled caller must not leave a half-registered route that a
         # later caller registers again. The registration itself makes no reads.
         await asyncio.shield(self.registration)
+
+    def _registration_finished(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled() or task.exception() is not None:
+            self.registration_failed = True
+            # A failed task's traceback retains the page through this weak-map value.
+            self.registration = None
 
     async def _install(self, page: Any) -> None:
         if not self.listening:

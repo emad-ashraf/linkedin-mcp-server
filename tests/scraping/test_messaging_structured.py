@@ -386,7 +386,11 @@ async def test_partial_guard_registration_fails_closed_without_duplicates(mock_p
         async with reader._without_read_state_writes():
             pytest.fail("must not enter partially guarded workflow")
     mock_page.unroute.assert_not_awaited()
-    with pytest.raises(RuntimeError, match="registration failed"):
+    from linkedin_mcp_server.core.exceptions import LinkedInScraperException
+
+    with pytest.raises(
+        LinkedInScraperException, match="protection registration failed"
+    ):
         async with reader._without_read_state_writes():
             pytest.fail("must not guess whether registration succeeded")
     assert mock_page.route.await_count == 2
@@ -777,5 +781,45 @@ async def test_page_guard_does_not_retain_closed_page_objects():
         pass
     reference = weakref.ref(page)
     del page
+    gc.collect()
+    assert reference() is None
+
+
+@pytest.mark.parametrize("failed_route", [1, 2])
+async def test_failed_registration_does_not_retain_the_page(failed_route):
+    import asyncio
+    import gc
+    import weakref
+    from linkedin_mcp_server.core.exceptions import LinkedInScraperException
+    from linkedin_mcp_server.scraping.messaging_read_state import (
+        without_read_state_writes,
+    )
+
+    class Page:
+        def __init__(self):
+            self.routes = []
+            self.listeners = []
+
+        async def route(self, pattern, handler):
+            self.routes.append(handler)
+            if len(self.routes) == failed_route:
+                raise RuntimeError("registration failed")
+
+        def on(self, event, callback):
+            self.listeners.append(callback)
+
+    page = Page()
+    with pytest.raises(RuntimeError, match="registration failed"):
+        async with without_read_state_writes(page):
+            pytest.fail("must not enter a partially guarded read")
+    with pytest.raises(
+        LinkedInScraperException, match="protection registration failed"
+    ):
+        async with without_read_state_writes(page):
+            pytest.fail("a failed registration must remain fail-closed")
+    assert len(page.routes) == failed_route
+    reference = weakref.ref(page)
+    del page
+    await asyncio.sleep(0)
     gc.collect()
     assert reference() is None
